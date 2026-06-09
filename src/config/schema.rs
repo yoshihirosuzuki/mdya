@@ -1,0 +1,324 @@
+//! YAML schema types for `~/.mdya/config.yml`.
+//!
+//! `Config` is an information holder; `ConfigStore` (sibling module) carries
+//! the load/save behavior. Chunking is fixed in source rather than user-
+//! configurable, so the schema has no `chunking` section. The remaining
+//! sections are `collections` / `embedding` / `runtime`.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::embedding::RURI_V3_30M_MODEL_ID;
+
+/// Default for `runtime.memory_limit_mb`. 8192 MB caps a 16-32 GB
+/// development machine at roughly half its RAM, leaving headroom for
+/// the OS and other processes so the watchdog kicks in before swap
+/// thrashing hangs the box.
+pub const DEFAULT_MEMORY_LIMIT_MB: u64 = 8192;
+
+/// Default for `runtime.embed_parallelism`. 8 in-flight files is a
+/// conservative starting point — tune up or down to match available
+/// cores and `memory_limit_mb`. The product
+/// `embed_parallelism × per-file embed peak (≈ 1.5 GB worst case)`
+/// should stay under `memory_limit_mb`; the memory watchdog kills
+/// the process otherwise. `0` disables file parallelism (sequential
+/// path).
+pub const DEFAULT_EMBED_PARALLELISM: usize = 8;
+
+/// Root of `config.yml`. See `docs/manual/en/configuration.md` for the
+/// user-facing field reference.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Config {
+    /// Collection name (free string) → entry. `BTreeMap` keeps `mdya init`
+    /// output deterministic (alphabetical key order in YAML).
+    #[serde(default)]
+    pub collections: BTreeMap<String, CollectionEntry>,
+
+    pub embedding: EmbeddingConfig,
+
+    /// Runtime policy. The whole section is `#[serde(default)]` so a
+    /// `config.yml` without `runtime:` still gets the 8192 MB cap applied
+    /// silently on next load. `0` disables the guard.
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+}
+
+/// One row under `collections`. `path` stays as the user-typed string
+/// (possibly `~/`) and is resolved at read time, not at parse time, so the
+/// YAML round-trips losslessly when `mdya collection add` rewrites the file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectionEntry {
+    pub path: String,
+
+    /// Set via `mdya collection add --description`. Surfaced by
+    /// `mdya collection list` and `mdya status`. Kept off the YAML
+    /// when unset; the file stays clean for collections without
+    /// descriptions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingConfig {
+    pub model: String,
+}
+
+/// Process-level runtime policy. Holds the safety knobs
+/// that bound how much the ingest pipeline is allowed to consume — memory
+/// (`memory_limit_mb`) and concurrent embed work (`embed_parallelism`).
+/// Future runtime knobs land here without disturbing other top-level keys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    /// Resident-set memory cap in MB. `0` disables the watchdog entirely
+    /// (POSIX `ulimit 0` convention). When omitted from YAML the struct-level
+    /// `Default` applies, which yields [`DEFAULT_MEMORY_LIMIT_MB`].
+    #[serde(default = "default_memory_limit_mb")]
+    pub memory_limit_mb: u64,
+
+    /// Number of files embedded in parallel during `mdya update-all`. `0`
+    /// disables file parallelism and runs the sequential path. The product
+    /// of `embed_parallelism × per-file embed peak (≈ 1.5 GB worst case,
+    /// writer.rs::EMBED_BATCH_SIZE comment)` should stay under
+    /// `memory_limit_mb`; the watchdog kills the process otherwise.
+    #[serde(default = "default_embed_parallelism")]
+    pub embed_parallelism: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit_mb: DEFAULT_MEMORY_LIMIT_MB,
+            embed_parallelism: DEFAULT_EMBED_PARALLELISM,
+        }
+    }
+}
+
+fn default_memory_limit_mb() -> u64 {
+    DEFAULT_MEMORY_LIMIT_MB
+}
+
+fn default_embed_parallelism() -> usize {
+    DEFAULT_EMBED_PARALLELISM
+}
+
+impl Config {
+    /// The `chunking` section is intentionally absent because chunking is
+    /// fixed in source rather than user-configurable.
+    pub fn init_template() -> Self {
+        Self {
+            collections: BTreeMap::new(),
+            embedding: EmbeddingConfig {
+                model: RURI_V3_30M_MODEL_ID.to_string(),
+            },
+            runtime: RuntimeConfig::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_template_pins_the_default_embedding_model() {
+        let cfg = Config::init_template();
+        assert_eq!(cfg.embedding.model, "cl-nagoya/ruri-v3-30m");
+        assert!(cfg.collections.is_empty());
+    }
+
+    #[test]
+    fn init_template_omits_chunking_section() {
+        // chunking is fixed in source; surfacing a `chunking:` key in the
+        // template would mislead users into expecting a knob that does not
+        // exist.
+        let cfg = Config::init_template();
+        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        assert!(
+            !yaml.contains("chunking"),
+            "init template must not mention chunking; got:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn yaml_round_trip_preserves_tilde_path_as_string() {
+        let mut cfg = Config::init_template();
+        cfg.collections.insert(
+            "notes".to_string(),
+            CollectionEntry {
+                path: "~/notes".to_string(),
+                description: None,
+            },
+        );
+
+        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        let back: Config = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+
+        assert_eq!(back.collections["notes"].path, "~/notes");
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn collection_entry_without_description_omits_the_key_from_yaml() {
+        let mut cfg = Config::init_template();
+        cfg.collections.insert(
+            "notes".to_string(),
+            CollectionEntry {
+                path: "~/notes".to_string(),
+                description: None,
+            },
+        );
+        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        assert!(
+            !yaml.contains("description"),
+            "unset description must not appear in YAML; got:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn collection_entry_description_round_trips() {
+        let mut cfg = Config::init_template();
+        cfg.collections.insert(
+            "notes".to_string(),
+            CollectionEntry {
+                path: "~/notes".to_string(),
+                description: Some("個人メモ".to_string()),
+            },
+        );
+        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        let back: Config = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+        assert_eq!(
+            back.collections["notes"].description.as_deref(),
+            Some("個人メモ")
+        );
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn legacy_collection_without_description_deserialises_to_none() {
+        let yaml = "\
+collections:
+  notes:
+    path: ~/notes
+embedding:
+  model: cl-nagoya/ruri-v3-30m
+";
+        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        assert_eq!(cfg.collections["notes"].description, None);
+    }
+
+    #[test]
+    fn init_template_pins_the_default_memory_limit() {
+        let cfg = Config::init_template();
+        assert_eq!(cfg.runtime.memory_limit_mb, 8192);
+    }
+
+    #[test]
+    fn yaml_without_runtime_section_falls_back_to_struct_default() {
+        // Loading a config.yml without `runtime:` must still pin the 8192 cap
+        // so the PC-hang guard is on by default, even when the user has not
+        // opted in explicitly.
+        let yaml = "\
+collections: {}
+embedding:
+  model: cl-nagoya/ruri-v3-30m
+";
+        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        assert_eq!(cfg.runtime.memory_limit_mb, 8192);
+    }
+
+    #[test]
+    fn yaml_with_memory_limit_zero_round_trips_as_disable_sentinel() {
+        // Users disable the guard by setting `memory_limit_mb: 0`; that
+        // edit must survive a write-read cycle.
+        let mut cfg = Config::init_template();
+        cfg.runtime.memory_limit_mb = 0;
+
+        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        let back: Config = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+
+        assert_eq!(back.runtime.memory_limit_mb, 0);
+    }
+
+    #[test]
+    fn yaml_with_explicit_memory_limit_overrides_struct_default() {
+        let yaml = "\
+collections: {}
+embedding:
+  model: cl-nagoya/ruri-v3-30m
+runtime:
+  memory_limit_mb: 16384
+";
+        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        assert_eq!(cfg.runtime.memory_limit_mb, 16384);
+    }
+
+    #[test]
+    fn init_template_pins_the_embed_parallelism_default() {
+        let cfg = Config::init_template();
+        assert_eq!(cfg.runtime.embed_parallelism, 8);
+    }
+
+    #[test]
+    fn yaml_without_embed_parallelism_falls_back_to_struct_default() {
+        // `embed_parallelism`'s missing-key default must apply silently, the
+        // same way `memory_limit_mb` does.
+        let yaml = "\
+collections: {}
+embedding:
+  model: cl-nagoya/ruri-v3-30m
+runtime: {}
+";
+        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        assert_eq!(cfg.runtime.embed_parallelism, 8);
+    }
+
+    #[test]
+    fn yaml_with_embed_parallelism_zero_round_trips_as_disable_sentinel() {
+        // Users disable parallelism by setting `embed_parallelism: 0`; that
+        // edit must survive a write-read cycle.
+        let mut cfg = Config::init_template();
+        cfg.runtime.embed_parallelism = 0;
+
+        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        let back: Config = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+
+        assert_eq!(back.runtime.embed_parallelism, 0);
+    }
+
+    #[test]
+    fn yaml_with_explicit_embed_parallelism_overrides_struct_default() {
+        let yaml = "\
+collections: {}
+embedding:
+  model: cl-nagoya/ruri-v3-30m
+runtime:
+  memory_limit_mb: 8192
+  embed_parallelism: 16
+";
+        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        assert_eq!(cfg.runtime.embed_parallelism, 16);
+    }
+
+    #[test]
+    fn yaml_with_legacy_chunking_section_is_silently_ignored() {
+        // The schema must tolerate extra unknown keys (e.g. an unused
+        // `chunking:` section); strict deserialization would break configs
+        // that drift from the current shape.
+        let yaml = "\
+collections: {}
+embedding:
+  model: cl-nagoya/ruri-v3-30m
+chunking:
+  strategy: fixed-window-by-bytes
+  params:
+    window_size: 512
+    overlap: 64
+runtime:
+  memory_limit_mb: 8192
+";
+        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        assert_eq!(cfg.embedding.model, "cl-nagoya/ruri-v3-30m");
+        assert_eq!(cfg.runtime.memory_limit_mb, 8192);
+    }
+}

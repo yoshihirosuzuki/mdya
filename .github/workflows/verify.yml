@@ -1,0 +1,89 @@
+# Manual 3-platform build + link verification.
+#
+# Trigger: `workflow_dispatch` ONLY — there is intentionally no `push` /
+# `pull_request` trigger.
+#
+# Each runner builds natively (ubuntu/windows are x86_64, macOS is arm64),
+# which sidesteps the `lance-linalg` `-march=native` cross-compile breakage.
+# The link check enforces the structural requirement that the binary must
+# NOT dynamically link ORT / libtokenizers / libsqlite.
+# `onig_sys` (C oniguruma, via candle's tokenizers) is statically linked and
+# is a known exception, so it is not in the forbidden set.
+
+name: verify-3-platform
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-link-check:
+    name: build + link check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # `@stable` is a channel ref by design (tracks latest stable Rust),
+      # so it is intentionally not SHA-pinned unlike the actions above.
+      - uses: dtolnay/rust-toolchain@stable
+
+      # `lance-encoding`'s build script invokes `protoc`; the runners do not
+      # ship it. Installed via each OS package manager rather than a
+      # third-party action to keep the dependency surface minimal.
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install protoc -y
+
+      - name: Build release
+        run: cargo build --release --verbose
+
+      - name: Link check (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          ldd target/release/mdya | tee deps.txt
+          if grep -iE 'onnxruntime|libtokenizers|libsqlite|sqlite3' deps.txt; then
+            echo "::error::forbidden dynamic library linked (ORT/libtokenizers/libsqlite)"
+            exit 1
+          fi
+          echo "OK: no ORT / libtokenizers / libsqlite dynamic link"
+
+      - name: Link check (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          otool -L target/release/mdya | tee deps.txt
+          if grep -iE 'onnxruntime|libtokenizers|libsqlite|sqlite3' deps.txt; then
+            echo "::error::forbidden dynamic library linked (ORT/libtokenizers/libsqlite)"
+            exit 1
+          fi
+          echo "OK: no ORT / libtokenizers / libsqlite dynamic link"
+
+      # dumpbin ships with MSVC but is not on PATH by default; this action
+      # loads the developer environment so `dumpbin` resolves.
+      - name: Set up MSVC dev environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - name: Link check (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dumpbin /dependents target\release\mdya.exe | Tee-Object deps.txt
+          if (Select-String -Path deps.txt -Pattern 'onnxruntime|tokenizers|sqlite' -Quiet) {
+            Write-Error "forbidden dynamic library linked (ORT/libtokenizers/libsqlite)"
+            exit 1
+          }
+          Write-Output "OK: no ORT / libtokenizers / libsqlite dynamic link"

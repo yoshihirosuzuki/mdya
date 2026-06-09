@@ -1,0 +1,164 @@
+[workspace]
+members = [
+    ".",
+    "xtask/generate-tiny-bert",
+    "xtask/generate-tiny-modernbert",
+    "xtask/generate-test-pdfs",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yoshihirosuzuki/mdya"
+
+[package]
+name = "mdya"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local Markdown retrieval primitive (BM25 + on-device vector + MCP). Rust rewrite of yoshihirosuzuki/mdya."
+
+[[bin]]
+name = "mdya"
+path = "src/main.rs"
+
+[lib]
+name = "mdya"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+arrow-array = "58"
+arrow-schema = "58"
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "process", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+dirs = "6"
+shellexpand = "3"
+lancedb = { version = "=0.29.0", default-features = false }
+# Embedded IPADIC dictionary for Lance's FTS `lindera/ipadic` tokenizer.
+# The `ipadic` feature triggers `lindera-ipadic`'s build.rs to fetch
+# `mecab-ipadic-2.7.0-20070801.tar.gz` from Lindera.dev (md5-verified)
+# and `include_bytes!` the compiled dictionary into the rlib. At run
+# time mdya redirects Lance's `language_model_home` via the
+# `LANCE_LANGUAGE_MODEL_HOME` env var into `~/.mdya/lance-models/` and
+# writes a tiny `config.yml` whose `segmenter.dictionary.kind: ipadic`
+# makes Lance read the embedded dictionary through
+# `lindera_ipadic::ipadic::load()` — no foreign disk write, no `*-sys`.
+# Pinned exact-version to mirror the `lindera v0.44.1` already present
+# transitively via `lance-tokenizer`. Verified in
+# `tests/verify_lindera_ipadic.rs`.
+lindera = { version = "=0.44.1", default-features = false, features = ["ipadic", "compress", "mmap"] }
+# Exact-pinned to 0.10.1: crates.io candle-core 0.10.2 was published without
+# a matching git tag (huggingface/candle has tags up to 0.10.1 only), so we
+# stay on the last verifiably tagged release. Bump only after the upstream
+# tag catches up or the discrepancy is explained.
+candle-core = { version = "=0.10.1", default-features = false }
+candle-nn = { version = "=0.10.1", default-features = false }
+candle-transformers = { version = "=0.10.1", default-features = false }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
+# HTTP client for the optional `ollama:<model>` embedding backend.
+# reqwest is already a prod-tree dependency (pulled by hf-hub for
+# model downloads and by lancedb's namespace client), so this direct entry
+# adds no new top-level dependency — it only pins the version/features mdya
+# relies on. `default-features = false` drops `default-tls` (native-tls =
+# OpenSSL C) and `http2`; `rustls-tls` reuses the ring/rustls stack already
+# present, `json` enables the `/api/embed` (de)serialization. The Ollama
+# endpoint is plain HTTP/1 loopback, so http2/native-tls are unnecessary.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "1.7", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+# axum HTTP layer hosting rmcp's `StreamableHttpService` as a tower service for
+# the `mdya mcp --http` daemon. `default-features = false` + `http1` +
+# `tokio` is the minimal set rmcp's own example builds against — no multipart,
+# ws, or TLS (the daemon is loopback-only). Pure Rust, no `*-sys`.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# Cross-platform advisory file lock for the MCP HTTP daemon pid file.
+# The daemon holds an exclusive lock on `~/.mdya/mcp.pid` for its
+# whole lifetime so a second instance refuses to start; the OS releases the
+# lock on exit *or* crash, so no stale lock survives a `kill -9`. fd-lock is
+# the rustup project's own locking crate: normal deps are `cfg-if` plus
+# `rustix` (unix) / `windows-sys` (windows), both already in the tree and
+# binding-only (no bundled C / no `cc-rs`). Verified via `cargo tree`.
+fd-lock = "4"
+# `CancellationToken` for the MCP HTTP daemon's graceful shutdown: on
+# Ctrl-C we cancel the token so rmcp's `StreamableHttpService` tears down active
+# SSE sessions instead of letting axum's graceful shutdown wait on never-ending
+# streams. Already in the tree transitively (tokio/lance); lifted to a direct
+# dep with no default features (`CancellationToken` needs none). Pure Rust.
+tokio-util = { version = "0.7", default-features = false }
+# Interactive progress UI for `mdya update-all`.
+indicatif = "0.18"
+# tracing-subscriber Layer that lets `tracing::info!` lines coexist with the
+# indicatif progress bars on stderr without redraw corruption.
+tracing-indicatif = "0.3"
+# RSS polling for the runtime memory guard. Default features
+# (component / disk / network / user) are disabled to keep transitive deps to
+# `system` only — the watchdog reads its own process's RSS and nothing else.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# Markdown event-based parser for heading-aware chunking. Default
+# features (getopts / html) are disabled — chunking only needs the parser,
+# not the CLI or HTML escaping. Pure Rust, no `*-sys` / no `cc-rs`.
+pulldown-cmark = { version = "0.13", default-features = false }
+# Recursive file walker for the ingest pipeline. Pure Rust
+# (`same-file` + `winapi-util` on Windows, both `#[link]`-based, no `*-sys`).
+walkdir = "2"
+# Pure Rust PDF text extractor for `.pdf` ingest.
+# Internally pulls lopdf + adobe-cmap-parser + cff-parser + encoding_rs +
+# euclid + postscript + type1-encoding-parser + unicode-normalization + log
+# + RustCrypto (aes/cbc/ecb for encrypted-PDF read path). Audited via
+# `cargo tree -p pdf-extract --edges normal | grep -E '(-sys$| -sys )'` —
+# no new `*-sys` / C-FFI binding beyond mdya's existing tree.
+pdf-extract = "0.10"
+# SHA-256 for `chunks.source_hash` two-stage incremental judgment.
+# RustCrypto, pure Rust.
+sha2 = "0.10"
+# `chrono::DateTime<Utc>` is the canonical mtime type for the chunks /
+# sources schemas; already present in the tree transitively via lancedb,
+# lifted to a direct dep here so the ingest module owns its semantic
+# version.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# JSON Schema derive for `SearchResponse` / `SearchHit` / `SearchMode`.
+# Already pulled transitively by `rmcp` 1.7 (default +
+# `chrono04` features), lifted to a direct dep so the search module's
+# `#[derive(JsonSchema)]` invocations have an explicit version pin and
+# do not regress if rmcp narrows its feature set later. `derive` is
+# part of `default` (verified against `GREsau/schemars` v1.2.1
+# `Cargo.toml`), so no `features = [...]` override is needed. Pure
+# Rust, no `*-sys`.
+schemars = "1"
+# `FullTextSearchQuery` / `SCORE_COL` for `mdya search fts`.
+# lancedb v0.29's `query.rs` doc example also imports them directly
+# from `lance-index`; lancedb does not re-export them. Pinned to
+# `=6.0.0` to mirror the existing `[dev-dependencies]` pin, which
+# itself matches the transitive version lancedb 0.29 resolves to.
+# Pure Rust, no `*-sys`.
+lance-index = "=6.0.0"
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+
+[dev-dependencies]
+assert_cmd = "2"
+insta = "1"
+predicates = "3"
+rmcp = { version = "1.7", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "process"] }
+anyhow = "1"
+tempfile = "3"
+futures = "0.3"
+arrow-array = "58"
+arrow-schema = "58"
+lance-index = "=6.0.0"

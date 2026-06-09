@@ -1,0 +1,647 @@
+//! Integration smoke tests for the ingest module.
+//!
+//! Each test boots a fresh `~/.mdya/`-style tempdir, materialises the
+//! `chunks` table at the right schema, populates files on disk, and
+//! drives `ingest::update_all_collections` with a deterministic mock
+//! `Embedder` that mirrors the production trait surface.
+//!
+//! `update_all_collections` maintains FTS / vector indices. FTS
+//! `create_index` reads
+//! `<LANCE_LANGUAGE_MODEL_HOME>/lindera/ipadic/config.yml`, and only
+//! `main.rs` (= the binary path) sets that env var; library callers
+//! like these tests have to manage the env themselves. We pin the env
+//! to each test's own tempdir via the shared `tests/common/mod.rs`
+//! helper, serialising the env-critical section through
+//! `LANCE_ENV_LOCK` so parallel `cargo test` threads do not race the
+//! process-global env state.
+
+mod common;
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::Result;
+use arrow_array::cast::AsArray;
+use arrow_array::types::TimestampMicrosecondType;
+use arrow_array::{Array, StringArray};
+use futures::TryStreamExt;
+use lancedb::query::{ExecutableQuery, QueryBase};
+use tempfile::TempDir;
+
+use mdya::embedding::{EmbedError, Embedder};
+use mdya::ingest::{IngestError, NullProgress, update_all_collections};
+use mdya::store::lance_lm::lance_models_dir;
+use mdya::store::{CHUNKS_TABLE_NAME, SOURCES_TABLE_NAME, chunks_schema, sources_schema};
+
+use common::{LANCE_ENV_LOCK, ScopedLanceLanguageModelHome};
+
+const DEFAULT_MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
+const DEFAULT_VECTOR_DIM: usize = 256;
+
+/// Deterministic stand-in for `RuriV3_30m` used by these smokes. Returns
+/// the same fixed vector for every text so tests don't need the real
+/// model download.
+struct MockEmbedder {
+    model_id: String,
+    dim: usize,
+}
+
+impl MockEmbedder {
+    fn pinned() -> Self {
+        Self {
+            model_id: DEFAULT_MODEL_ID.to_string(),
+            dim: DEFAULT_VECTOR_DIM,
+        }
+    }
+
+    fn with_model_id(model_id: &str) -> Self {
+        Self {
+            model_id: model_id.to_string(),
+            dim: DEFAULT_VECTOR_DIM,
+        }
+    }
+}
+
+impl Embedder for MockEmbedder {
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts.iter().map(|_| vec![0.1_f32; self.dim]).collect())
+    }
+
+    fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts.iter().map(|_| vec![0.2_f32; self.dim]).collect())
+    }
+}
+
+/// Create `~/.mdya/index/{chunks,sources}` with the canonical schemas
+/// and return the base config dir (= tempdir root). `update-all` opens
+/// both tables, so both must exist.
+async fn fresh_config_dir(tmp: &TempDir) -> Result<PathBuf> {
+    let base = tmp.path().to_path_buf();
+    let index_dir = base.join("index");
+    std::fs::create_dir_all(&index_dir)?;
+    let db = mdya::store::connect(&index_dir).await?;
+    let schema = chunks_schema(i32::try_from(DEFAULT_VECTOR_DIM)?, DEFAULT_MODEL_ID);
+    db.create_empty_table(CHUNKS_TABLE_NAME, Arc::new(schema))
+        .execute()
+        .await?;
+    db.create_empty_table(SOURCES_TABLE_NAME, Arc::new(sources_schema()))
+        .execute()
+        .await?;
+    Ok(base)
+}
+
+async fn count_chunks(base: &Path, predicate: Option<&str>) -> Result<usize> {
+    let db = mdya::store::connect(base.join("index")).await?;
+    let table = db.open_table(CHUNKS_TABLE_NAME).execute().await?;
+    let mut query = table.query();
+    if let Some(p) = predicate {
+        query = query.only_if(p);
+    }
+    let stream = query.execute().await?;
+    let batches = stream.try_collect::<Vec<_>>().await?;
+    Ok(batches.iter().map(|b| b.num_rows()).sum())
+}
+
+async fn distinct_paths(base: &Path) -> Result<Vec<String>> {
+    let db = mdya::store::connect(base.join("index")).await?;
+    let table = db.open_table(CHUNKS_TABLE_NAME).execute().await?;
+    let stream = table.query().execute().await?;
+    let batches = stream.try_collect::<Vec<_>>().await?;
+    let mut paths = std::collections::BTreeSet::new();
+    for batch in &batches {
+        let col = batch.column_by_name("path").expect("path col").as_string();
+        let strings: &StringArray = col;
+        for i in 0..strings.len() {
+            paths.insert(strings.value(i).to_string());
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn write_md(root: &Path, rel: &str, body: &str) {
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("mkdir");
+    }
+    std::fs::write(&path, body).expect("write");
+}
+
+fn write_bytes(root: &Path, rel: &str, bytes: &[u8]) {
+    let path = root.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("mkdir");
+    }
+    std::fs::write(&path, bytes).expect("write");
+}
+
+/// PDF fixtures generated by `xtask/generate-test-pdfs`.
+/// `include_bytes!` embeds them into the test binary so the smoke test runs
+/// hermetically without touching the on-disk `tests/fixtures/pdfs/` copy at
+/// runtime — the on-disk file only matters as the regenerable source of
+/// truth, not as a runtime dependency.
+const ENGLISH_PDF_FIXTURE: &[u8] = include_bytes!("fixtures/pdfs/english.pdf");
+const JAPANESE_PDF_FIXTURE: &[u8] = include_bytes!("fixtures/pdfs/japanese.pdf");
+
+fn collections_with(name: &str, root: PathBuf) -> BTreeMap<String, PathBuf> {
+    let mut map = BTreeMap::new();
+    map.insert(name.to_string(), root);
+    map
+}
+
+#[tokio::test]
+async fn ingest_new_file_inserts_chunks() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let coll_dir = tmp.path().join("notes");
+    std::fs::create_dir(&coll_dir)?;
+    write_md(&coll_dir, "a.md", "# Heading\n\nBody text.\n");
+
+    let summary = update_all_collections(
+        &collections_with("notes", coll_dir.clone()),
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+
+    assert_eq!(summary.new, 1);
+    assert_eq!(summary.updated, 0);
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(summary.removed, 0);
+    assert_eq!(summary.failed, 0);
+    assert!(count_chunks(&base, None).await? >= 1);
+    Ok(())
+}
+
+/// Exercise the parallel ingest path so the `buffer_unordered` +
+/// `spawn_blocking` chain is covered by `just check` instead of only
+/// the sequential `parallelism = 0` sentinel. Three files keep the
+/// pool exercised at `parallelism = 2`; the deterministic mock
+/// embedder means the summary is verifiable end-to-end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_ingest_with_multiple_files_inserts_all_chunks() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let coll_dir = tmp.path().join("notes");
+    std::fs::create_dir(&coll_dir)?;
+    write_md(&coll_dir, "a.md", "# A\n\nA body.\n");
+    write_md(&coll_dir, "b.md", "# B\n\nB body.\n");
+    write_md(&coll_dir, "c.md", "# C\n\nC body.\n");
+
+    let summary = update_all_collections(
+        &collections_with("notes", coll_dir.clone()),
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        2,
+    )
+    .await?;
+
+    assert_eq!(summary.new, 3);
+    assert_eq!(summary.updated, 0);
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(summary.removed, 0);
+    assert_eq!(summary.failed, 0);
+    assert!(count_chunks(&base, None).await? >= 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn second_ingest_with_no_changes_skips_the_file() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let coll_dir = tmp.path().join("notes");
+    std::fs::create_dir(&coll_dir)?;
+    write_md(&coll_dir, "a.md", "# Heading\n\nBody.\n");
+
+    let collections = collections_with("notes", coll_dir.clone());
+    update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+    let chunks_after_first = count_chunks(&base, None).await?;
+
+    let summary = update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+    assert_eq!(summary.new, 0);
+    assert_eq!(summary.updated, 0);
+    assert_eq!(summary.skipped, 1);
+    assert_eq!(count_chunks(&base, None).await?, chunks_after_first);
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_content_change_updates_chunks() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let coll_dir = tmp.path().join("notes");
+    std::fs::create_dir(&coll_dir)?;
+    write_md(&coll_dir, "a.md", "# Old\n\nOld body.\n");
+
+    let collections = collections_with("notes", coll_dir.clone());
+    update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+
+    // Bump mtime explicitly so the mtime guard does not short-circuit the
+    // hash check (filesystems can preserve the second-resolution mtime
+    // when overwriting immediately).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    write_md(&coll_dir, "a.md", "# Old\n\nUpdated body.\n");
+
+    let summary = update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+    assert_eq!(summary.updated, 1);
+    assert_eq!(summary.new, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn deleting_a_file_triggers_orphan_cleanup_on_next_ingest() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let coll_dir = tmp.path().join("notes");
+    std::fs::create_dir(&coll_dir)?;
+    write_md(&coll_dir, "a.md", "# A\n\nA body.\n");
+    write_md(&coll_dir, "b.md", "# B\n\nB body.\n");
+
+    let collections = collections_with("notes", coll_dir.clone());
+    update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+
+    std::fs::remove_file(coll_dir.join("a.md"))?;
+    let summary = update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+
+    assert_eq!(summary.removed, 1);
+    let paths = distinct_paths(&base).await?;
+    assert_eq!(paths, vec!["b.md".to_string()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn schema_metadata_mismatch_returns_error_before_any_write() -> Result<()> {
+    // The chunks table's Arrow `Schema::metadata` pins
+    // `embedding_model = DEFAULT_MODEL_ID` at create-time (above).
+    // Running `update-all` with a *different* embedder must short-
+    // circuit at the metadata check before any chunk insert fires.
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let coll_dir = tmp.path().join("notes");
+    std::fs::create_dir(&coll_dir)?;
+    write_md(&coll_dir, "a.md", "# A\n\nA body.\n");
+
+    let err = update_all_collections(
+        &collections_with("notes", coll_dir.clone()),
+        &base,
+        Arc::new(MockEmbedder::with_model_id("totally-different-model")),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await
+    .expect_err("schema metadata mismatch should error");
+    match err {
+        IngestError::SchemaMetadataMismatch {
+            declared_model,
+            actual_embedding_model,
+            ..
+        } => {
+            assert_eq!(declared_model, "totally-different-model");
+            assert_eq!(actual_embedding_model, DEFAULT_MODEL_ID);
+        }
+        other => panic!("expected SchemaMetadataMismatch, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_outcomes_are_populated_into_summary_counters() -> Result<()> {
+    // Combined scenario: 1 new + 1 unchanged in the same run after first
+    // ingest establishes the baseline. Exercises the new + skipped paths
+    // in one invocation.
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let coll_dir = tmp.path().join("notes");
+    std::fs::create_dir(&coll_dir)?;
+    write_md(&coll_dir, "old.md", "# Old\n\nOld body.\n");
+
+    let collections = collections_with("notes", coll_dir.clone());
+    update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+    write_md(&coll_dir, "fresh.md", "# Fresh\n\nFresh body.\n");
+
+    let summary = update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+    assert_eq!(summary.new, 1);
+    assert_eq!(summary.skipped, 1);
+    assert_eq!(summary.updated, 0);
+    assert_eq!(summary.removed, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn modified_at_round_trips_as_utc_microseconds() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let coll_dir = tmp.path().join("notes");
+    std::fs::create_dir(&coll_dir)?;
+    let rel_path = "a.md";
+    write_md(&coll_dir, rel_path, "# A\n\nbody\n");
+
+    update_all_collections(
+        &collections_with("notes", coll_dir.clone()),
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+
+    let db = mdya::store::connect(base.join("index")).await?;
+    let tbl = db.open_table(CHUNKS_TABLE_NAME).execute().await?;
+    let stream = tbl.query().execute().await?;
+    let batches = stream.try_collect::<Vec<_>>().await?;
+    let batch = batches.first().expect("at least one batch");
+    let mtimes = batch
+        .column_by_name("modified_at")
+        .expect("modified_at col")
+        .as_primitive::<TimestampMicrosecondType>();
+    assert!(!mtimes.is_empty());
+    let stored = mtimes.value(0);
+
+    // Compare against the actual filesystem mtime; the stored value
+    // must match modulo at most ±1 µs of filesystem rounding.
+    let fs_mtime = std::fs::metadata(coll_dir.join(rel_path))?.modified()?;
+    let expected = chrono::DateTime::<chrono::Utc>::from(fs_mtime).timestamp_micros();
+    assert!(
+        (stored - expected).abs() <= 1,
+        "stored mtime µs {stored} differs from filesystem mtime µs {expected}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn touch_mtime_only_does_not_change_chunk_count() -> Result<()> {
+    // Exercises the `TouchMtime` action end-to-end:
+    // bumping mtime without changing content updates `modified_at` in
+    // the DB but leaves chunks intact. This is also the only smoke
+    // path that hits the `arrow_cast(...)` SQL inside `update_mtime`.
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let coll_dir = tmp.path().join("notes");
+    std::fs::create_dir(&coll_dir)?;
+    write_md(&coll_dir, "a.md", "# A\n\nbody\n");
+
+    let collections = collections_with("notes", coll_dir.clone());
+    update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+    let chunks_before = count_chunks(&base, None).await?;
+
+    // Bump mtime without changing content. Sleeping past 1 s ensures the
+    // mtime crosses a filesystem-resolution boundary even on platforms
+    // that round to 1 s (HFS+ legacy paths).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let path = coll_dir.join("a.md");
+    let content = std::fs::read_to_string(&path)?;
+    std::fs::write(&path, &content)?;
+
+    let summary = update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+    assert_eq!(summary.skipped, 1, "TouchMtime should land in `skipped`");
+    assert_eq!(summary.updated, 0);
+    assert_eq!(summary.new, 0);
+    assert_eq!(
+        count_chunks(&base, None).await?,
+        chunks_before,
+        "TouchMtime must not change chunk count"
+    );
+    Ok(())
+}
+
+/// PDF ingest end-to-end. Drops both fixture PDFs into
+/// a collection root, runs `update_all_collections`, and asserts:
+///
+/// 1. Both files take the `New` outcome (no `Failed` — extraction succeeds).
+/// 2. The `chunks` table holds at least one row per file.
+/// 3. The English `body` column contains the seeded keyword `"smoke fixture"`
+///    (validates the ASCII baseline path: walker → FileFormat dispatch →
+///    pdf-extract → chunker → DB write).
+/// 4. The Japanese `body` column contains the seeded keyword `"フィクスチャ"`
+///    (validates the CJK acceptance gate:
+///    pdf-extract's adobe-cmap-parser correctly decodes ToUnicode for the
+///    krilla-emitted CIDFont subset).
+///
+/// If assertion 4 ever fails, swap `extract_pdf` over to `unpdf 0.7`
+/// (CJK-explicit) — a one-function
+/// substitution because the extractor is hidden behind `ExtractError`.
+#[tokio::test]
+async fn ingest_pdf_fixtures_inserts_chunks_with_extracted_text() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let coll_dir = tmp.path().join("notes");
+    std::fs::create_dir(&coll_dir)?;
+    write_bytes(&coll_dir, "english.pdf", ENGLISH_PDF_FIXTURE);
+    write_bytes(&coll_dir, "japanese.pdf", JAPANESE_PDF_FIXTURE);
+
+    let summary = update_all_collections(
+        &collections_with("notes", coll_dir.clone()),
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+
+    assert_eq!(summary.new, 2, "both PDF fixtures should ingest as New");
+    assert_eq!(
+        summary.failed, 0,
+        "PDF extraction must not fail on the committed fixtures"
+    );
+    assert!(
+        count_chunks(&base, None).await? >= 2,
+        "each fixture should emit at least one chunk row"
+    );
+
+    let combined = concat_chunk_bodies(&base).await?;
+    assert!(
+        combined.contains("smoke fixture"),
+        "english.pdf body should contain seeded keyword 'smoke fixture'; \
+         actual concatenated bodies: {combined}"
+    );
+    assert!(
+        combined.contains("フィクスチャ"),
+        "japanese.pdf body should contain seeded CJK keyword 'フィクスチャ' \
+         (CJK acceptance gate); actual concatenated bodies: {combined}"
+    );
+    Ok(())
+}
+
+/// Concatenate every `chunks.body` value across the test DB. Used by the PDF
+/// smoke to verify extracted text without re-running pdf-extract in the test
+/// (the writer's path is what we're exercising).
+async fn concat_chunk_bodies(base: &Path) -> Result<String> {
+    let db = mdya::store::connect(base.join("index")).await?;
+    let table = db.open_table(CHUNKS_TABLE_NAME).execute().await?;
+    let stream = table.query().execute().await?;
+    let batches = stream.try_collect::<Vec<_>>().await?;
+    let mut combined = String::new();
+    for batch in &batches {
+        let col = batch.column_by_name("body").expect("body col").as_string();
+        let strings: &StringArray = col;
+        for i in 0..strings.len() {
+            combined.push_str(strings.value(i));
+            combined.push('\n');
+        }
+    }
+    Ok(combined)
+}
+
+#[tokio::test]
+async fn shrinking_a_file_removes_stale_chunks_via_merge_insert() -> Result<()> {
+    // Regression guard for the `merge_insert` UPSERT: when a file
+    // shrinks (more chunks → fewer chunks), the previous-version rows at
+    // higher `chunk_sequence` indexes must be deleted, not left behind.
+    //
+    // The legacy delete-then-insert path got this for free by deleting
+    // every `(collection, path)` row up front. `merge_insert` only acts
+    // on rows present in the input batch, so without the
+    // `when_not_matched_by_source_delete(Some(scope_filter))` clause we
+    // would silently retain stale higher-sequence chunks.
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let coll_dir = tmp.path().join("notes");
+    std::fs::create_dir(&coll_dir)?;
+    // 3 heading sections → 3 chunks (heading-aware chunker).
+    write_md(
+        &coll_dir,
+        "a.md",
+        "# Section A\n\nA body.\n\n# Section B\n\nB body.\n\n# Section C\n\nC body.\n",
+    );
+    let collections = collections_with("notes", coll_dir.clone());
+    update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+    let chunks_before = count_chunks(&base, Some("path = 'a.md'")).await?;
+    assert_eq!(
+        chunks_before, 3,
+        "3-section markdown should produce 3 chunks"
+    );
+
+    // Shrink to a single section. Sleep past 1 s so the mtime guard does
+    // not short-circuit the rewrite on coarse-resolution filesystems.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    write_md(&coll_dir, "a.md", "# Section A\n\nA body only.\n");
+    let summary = update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+    assert_eq!(summary.new, 0);
+    assert_eq!(summary.updated, 1);
+    assert_eq!(summary.skipped, 0);
+    assert_eq!(summary.removed, 0);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(
+        count_chunks(&base, Some("path = 'a.md'")).await?,
+        1,
+        "shrinking to 1 section must leave exactly 1 row (stale higher-sequence rows must be deleted)"
+    );
+    Ok(())
+}

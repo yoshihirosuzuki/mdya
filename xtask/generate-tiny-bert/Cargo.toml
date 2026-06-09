@@ -1,0 +1,20 @@
+[package]
+name = "xtask-generate-tiny-bert"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "generate-tiny-bert"
+path = "src/main.rs"
+
+[dependencies]
+ahash = "0.8"
+anyhow = "1"
+candle-core = { version = "=0.10.1", default-features = false }
+candle-nn = { version = "=0.10.1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }

@@ -1,0 +1,27 @@
+[package]
+name = "xtask-generate-test-pdfs"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "generate-test-pdfs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# Pure-Rust PDF builder for the committed test fixtures. Picked over
+# `printpdf 0.9` because printpdf's `prepare_fonts_for_serialization`
+# subset path is hardcoded `if false && ...` upstream (verified in
+# `src/serialize.rs:1162` on both `0.9.1` and `master` as of 2026-06),
+# so it always embeds the full font (~16 MB for Noto Sans CJK JP) — an
+# unacceptable size for a committed fixture. krilla is a typst spin-off
+# whose README highlights "Great subsetting for both, CFF-flavored and
+# TTF-flavored fonts, ensuring small file sizes" and uses the
+# `subsetter` crate internally. Used only by this xtask: the generated
+# PDFs live in `tests/fixtures/pdfs/` and are committed so contributors
+# do not need to run this task on a fresh clone. krilla is dev-tooling
+# only and never ships in the mdya binary.
+krilla = "0.8"
