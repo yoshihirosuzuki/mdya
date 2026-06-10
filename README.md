@@ -28,9 +28,21 @@ What it can do:
 - Linux (amd64 / arm64)
 - Windows (x86_64)
 
-## Install / build
+## Install
 
-The only install method right now is **building from source**. `cargo install mdya` (via crates.io) and prebuilt release binaries are not yet provided; both will land as part of the public release.
+```sh
+# Linux / macOS
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/yoshihirosuzuki/mdya/releases/latest/download/mdya-installer.sh | sh
+```
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/yoshihirosuzuki/mdya/releases/latest/download/mdya-installer.ps1 | iex"
+```
+
+Or grab an archive from the [releases page](https://github.com/yoshihirosuzuki/mdya/releases) and put the `mdya` binary on your `PATH`.
+
+### Build from source
 
 Prerequisites:
 

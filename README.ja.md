@@ -28,9 +28,21 @@ mdya は検索エージェントでも、LLM によるクエリ書き換えフ�
 - Linux（amd64 / arm64）
 - Windows（x86_64）
 
-## インストール / ビルド
+## インストール
 
-現状は **ソースからのビルド**が唯一のインストール方法です。`cargo install mdya`（crates.io 経由）とリリースバイナリの配布は未提供で、公開準備の中で整える予定です。
+```sh
+# Linux / macOS
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/yoshihirosuzuki/mdya/releases/latest/download/mdya-installer.sh | sh
+```
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/yoshihirosuzuki/mdya/releases/latest/download/mdya-installer.ps1 | iex"
+```
+
+または[リリースページ](https://github.com/yoshihirosuzuki/mdya/releases)からアーカイブを取得し、 `mdya` バイナリを `PATH` の通った場所に置いてください。
+
+### ソースからビルド
 
 前提:
 
