@@ -1,0 +1,83 @@
+# Lint, test, and release-build gate for pull requests and pushes to `main`.
+#
+# Mirrors `just check` (cargo fmt + clippy + test) so the workspace is exercised
+# the same way locally and in CI, plus a release build of the distribution
+# binary.
+#
+# Trigger:
+#   - pull_request (default events: opened / synchronize / reopened)
+#   - push to `main`
+# Pure-`*.md` changes are skipped via `paths-ignore`.
+#
+# Cross-platform link verification (5-platform native build matrix) lives in
+# `verify.yml` and is intentionally workflow_dispatch-only — the manual gate
+# is run before a release.
+#
+# Third-party actions are SHA-pinned, except `dtolnay/rust-toolchain@stable`
+# which is a channel ref by design (tracks latest stable Rust), matching
+# `verify.yml`.
+
+name: ci
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+
+# Pull requests group by `refs/pull/N/merge` (unique per PR), so each PR
+# cancels only its own earlier in-progress run on a re-push. Pushes to `main`
+# share a single `refs/heads/main` group and cancel each other; the latest
+# push to `main` is the only one kept running.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege default; this workflow only needs to read the repository.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (ubuntu-latest)
+    runs-on: ubuntu-latest
+    # Headroom for the cold-cache compile of the workspace; also acts as a
+    # hang guard if a step gets stuck.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # `@stable` is a channel ref by design (tracks latest stable Rust),
+      # intentionally not SHA-pinned, matching `verify.yml`.
+      # `dtolnay/rust-toolchain` uses the `minimal` rustup profile, which does
+      # NOT include `rustfmt` or `clippy`; they must be listed explicitly so
+      # the fmt-check and clippy steps below succeed.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # `lance-encoding`'s build script invokes `protoc`; the runner does not
+      # ship it. Installed via the OS package manager to keep the dependency
+      # surface minimal, matching `verify.yml`.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # Release build of the distribution binary. xtask workspace members are
+      # fixture generators (not distributed) and are intentionally excluded
+      # by omitting `--workspace`, matching `release.yml` precise-builds mode.
+      - name: cargo build --release
+        run: cargo build --release
