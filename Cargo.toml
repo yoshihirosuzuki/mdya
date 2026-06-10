@@ -68,7 +68,7 @@ lindera = { version = "=0.44.1", default-features = false, features = ["ipadic",
 candle-core = { version = "=0.10.1", default-features = false }
 candle-nn = { version = "=0.10.1", default-features = false }
 candle-transformers = { version = "=0.10.1", default-features = false }
-tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
 # HTTP client for the optional `ollama:<model>` embedding backend.
 # reqwest is already a prod-tree dependency (pulled by hf-hub for
