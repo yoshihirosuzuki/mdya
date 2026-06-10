@@ -30,21 +30,17 @@ mdya は検索エージェントでも、LLM によるクエリ書き換えフ�
 
 ## インストール
 
-サポートする全 platform 向けのプリビルドバイナリが各 GitHub Release に同梱されています。下記のインストーラスクリプトは**最新の release** からお使いの platform に合ったアーカイブを取得し、`mdya` バイナリを `$CARGO_HOME/bin`（default は `~/.cargo/bin`）に配置します。
-
-Linux / macOS の場合:
-
 ```sh
+# Linux / macOS
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/yoshihirosuzuki/mdya/releases/latest/download/mdya-installer.sh | sh
 ```
 
-Windows (PowerShell) の場合:
-
 ```powershell
+# Windows
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/yoshihirosuzuki/mdya/releases/latest/download/mdya-installer.ps1 | iex"
 ```
 
-特定バージョンに pin したり platform 別アーカイブ（`.tar.xz` / `.zip`）を直接取りたい場合は[リリースページ](https://github.com/yoshihirosuzuki/mdya/releases)を参照してください。
+または[リリースページ](https://github.com/yoshihirosuzuki/mdya/releases)からアーカイブを取得し、 `mdya` バイナリを `PATH` の通った場所に置いてください。
 
 ### ソースからビルド
 

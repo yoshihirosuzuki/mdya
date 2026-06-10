@@ -30,21 +30,17 @@ What it can do:
 
 ## Install
 
-Prebuilt binaries for every supported platform are published with each GitHub Release. The installer scripts below pick the right archive from the **latest** release and drop the `mdya` binary into your `$CARGO_HOME/bin` (`~/.cargo/bin` by default).
-
-On Linux or macOS:
-
 ```sh
+# Linux / macOS
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/yoshihirosuzuki/mdya/releases/latest/download/mdya-installer.sh | sh
 ```
 
-On Windows (PowerShell):
-
 ```powershell
+# Windows
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/yoshihirosuzuki/mdya/releases/latest/download/mdya-installer.ps1 | iex"
 ```
 
-To pin a specific version or grab the per-platform archive (`.tar.xz` / `.zip`), see the [releases page](https://github.com/yoshihirosuzuki/mdya/releases).
+Or grab an archive from the [releases page](https://github.com/yoshihirosuzuki/mdya/releases) and put the `mdya` binary on your `PATH`.
 
 ### Build from source
 
