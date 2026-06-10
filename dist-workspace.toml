@@ -21,6 +21,11 @@ install-updater = false
 # PR-time build/test gates are handled by .github/workflows/verify.yml
 # (workflow_dispatch).
 pr-run-mode = "skip"
+# Build the publishable packages individually with `cargo build -p mdya`
+# instead of `cargo build --workspace`. The workspace contains xtask helpers
+# that include_bytes! committed-only fixture inputs (Noto fonts, etc.) and
+# would fail a workspace-wide compile on a fresh clone.
+precise-builds = true
 
 # Pin third-party GitHub Actions to specific commit SHAs to mitigate
 # supply-chain risk. Tracks the latest of each major version that dist 0.32.0
