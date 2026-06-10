@@ -15,12 +15,14 @@ repository = "https://github.com/yoshihirosuzuki/mdya"
 
 [package]
 name = "mdya"
-version = "0.0.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Local Markdown retrieval primitive (BM25 + on-device vector + MCP). Rust rewrite of yoshihirosuzuki/mdya."
+description = "Local Markdown retrieval primitive (BM25 + on-device vector + MCP)."
+keywords = ["markdown", "search", "retrieval", "mcp", "local-first"]
+categories = ["command-line-utilities", "text-processing"]
 
 [[bin]]
 name = "mdya"
@@ -162,3 +164,15 @@ futures = "0.3"
 arrow-array = "58"
 arrow-schema = "58"
 lance-index = "=6.0.0"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

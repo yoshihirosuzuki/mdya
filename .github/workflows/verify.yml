@@ -1,16 +1,23 @@
-# Manual 3-platform build + link verification.
+# Manual cross-platform build + link verification.
 #
 # Trigger: `workflow_dispatch` ONLY — there is intentionally no `push` /
 # `pull_request` trigger.
 #
-# Each runner builds natively (ubuntu/windows are x86_64, macOS is arm64),
-# which sidesteps the `lance-linalg` `-march=native` cross-compile breakage.
+# Each runner builds natively, which sidesteps the `lance-linalg`
+# `-march=native` cross-compile breakage. The matrix covers every
+# release distribution target so the link check runs everywhere a
+# release artifact ships:
+#   - ubuntu-latest    : Linux x86_64
+#   - ubuntu-22.04-arm : Linux aarch64
+#   - windows-latest   : Windows x86_64
+#   - macos-latest     : macOS aarch64 (Apple Silicon)
+#   - macos-15-intel         : macOS x86_64 (Intel)
 # The link check enforces the structural requirement that the binary must
 # NOT dynamically link ORT / libtokenizers / libsqlite.
 # `onig_sys` (C oniguruma, via candle's tokenizers) is statically linked and
 # is a known exception, so it is not in the forbidden set.
 
-name: verify-3-platform
+name: verify
 
 on:
   workflow_dispatch:
@@ -22,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-22.04-arm, windows-latest, macos-latest, macos-15-intel]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
