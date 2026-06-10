@@ -30,3 +30,15 @@ pr-run-mode = "skip"
 "actions/checkout" = "df4cb1c069e1874edd31b4311f1884172cec0e10" # v6.0.3
 "actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" # v7.0.1
 "actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" # v8.0.1
+
+# System dependencies installed on each runner before the cargo build.
+# lance-encoding's build script invokes `protoc` and the GitHub-hosted
+# runners do not ship it; dist's package_install step picks these up.
+[dist.dependencies.apt]
+protobuf-compiler = "*"
+
+[dist.dependencies.homebrew]
+protobuf = "*"
+
+[dist.dependencies.chocolatey]
+protoc = "*"
