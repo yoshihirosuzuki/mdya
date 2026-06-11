@@ -23,3 +23,7 @@ When reporting, please include:
 - The mdya version (`mdya --version`) and the platform you observed it on.
 
 Acknowledgement of reports usually happens within a few business days. There is no formal SLA — mdya is maintained by one person.
+
+## Informational advisories
+
+`cargo audit` is run weekly and on every change to `Cargo.toml` / `Cargo.lock`. Upstream crates flagged as `unmaintained` (informational, not CVE) that mdya cannot fix directly are tracked in [`.cargo/audit.toml`](.cargo/audit.toml). Each ignored advisory is reviewed when an upstream release drops the crate. CVE / RUSTSEC security advisories are never suppressed.

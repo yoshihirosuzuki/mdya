@@ -48,5 +48,7 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
+      # `--deny warnings` is intentional. Per-advisory suppressions live in
+      # `.cargo/audit.toml` at the project root.
       - name: cargo audit
         run: cargo audit --deny warnings

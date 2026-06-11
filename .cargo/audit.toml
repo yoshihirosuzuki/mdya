@@ -1,0 +1,26 @@
+# cargo-audit configuration for mdya.
+#
+# Each entry below is an "unmaintained" informational advisory from an upstream
+# crate. None of these is a CVE or security advisory. They are accepted as
+# WONTFIX because mdya cannot fix the upstream crate directly; resolution is
+# expected to come from upstream replacing the crate, or from transitive
+# dependency evolution.
+#
+# When an upstream release drops one of these crates, remove the matching ID
+# from this list. Do NOT add CVE or RUSTSEC security advisories here.
+
+[advisories]
+ignore = [
+    # encoding (unmaintained, via lindera)
+    # https://rustsec.org/advisories/RUSTSEC-2021-0153.html
+    "RUSTSEC-2021-0153",
+    # paste (unmaintained, via datafusion -> lance)
+    # https://rustsec.org/advisories/RUSTSEC-2024-0436.html
+    "RUSTSEC-2024-0436",
+    # number_prefix (unmaintained, via hf-hub -> indicatif)
+    # https://rustsec.org/advisories/RUSTSEC-2025-0119.html
+    "RUSTSEC-2025-0119",
+    # bincode (unmaintained, via lindera and lance-tokenizer)
+    # https://rustsec.org/advisories/RUSTSEC-2025-0141.html
+    "RUSTSEC-2025-0141",
+]
