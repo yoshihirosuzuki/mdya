@@ -18,7 +18,7 @@ mod store;
 pub use error::{ConfigError, InvalidPathKind};
 pub use paths::{expand_tilde, resolve_config_dir, resolve_model_cache_dir};
 pub use schema::{
-    CollectionEntry, Config, DEFAULT_MEMORY_LIMIT_MB, EmbeddingConfig, RuntimeConfig,
-    validate_collection_name,
+    CollectionEntry, Config, DEFAULT_MEMORY_LIMIT_MB, EmbeddingConfig, MAX_EMBED_PARALLELISM,
+    RuntimeConfig, validate_collection_name,
 };
 pub use store::{load, save};

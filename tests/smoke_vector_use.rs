@@ -120,7 +120,9 @@ async fn vector_use_switches_model_recreates_table_and_re_embeds() -> Result<()>
         model_id: NEW_MODEL.to_string(),
         dim: NEW_DIM,
     });
-    let summary = switch_model(&base, cfg, embedder, Arc::new(NullProgress)).await?;
+    // The smoke test only re-embeds two tiny files; the sequential path
+    // exercises the same code paths without spawning extra task workers.
+    let summary = switch_model(&base, cfg, embedder, Arc::new(NullProgress), 0).await?;
     assert_eq!(summary.failed, 0, "no file should fail to re-embed");
 
     // 1. config.yml now pins the new model.

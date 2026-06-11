@@ -25,7 +25,7 @@ use crate::embedding::{EmbedError, Embedder, ModelCache, ModelCacheError, build_
 use crate::ingest::{IngestError, IngestProgress, UpdateSummary, update_all_collections};
 use crate::store::{self, CHUNKS_TABLE_NAME, chunks_schema};
 
-use super::update_all::{IndicatifProgress, expand_collection_paths};
+use super::update_all::{IndicatifProgress, expand_collection_paths, resolve_embed_parallelism};
 
 #[derive(Debug, Error)]
 pub enum VectorUseError {
@@ -100,10 +100,10 @@ pub(crate) async fn run(
     // `switch_model` (which owns the rewrite). stdout carries the
     // machine-facing summary, mirroring `mdya update-all`; the no-op /
     // abort notices above go to stderr.
-    let progress: Arc<dyn IngestProgress> = Arc::new(IndicatifProgress::with_parallelism(
-        cfg.runtime.embed_parallelism,
-    ));
-    let summary = switch_model(&base, cfg, embedder, progress).await?;
+    let parallelism = resolve_embed_parallelism(&cfg.runtime);
+    let progress: Arc<dyn IngestProgress> =
+        Arc::new(IndicatifProgress::with_parallelism(parallelism));
+    let summary = switch_model(&base, cfg, embedder, progress, parallelism).await?;
     println!("{}", format_switch_summary(model, &summary));
     if summary.failed > 0 {
         return Err(VectorUseError::FilesFailed(summary.failed));
@@ -133,6 +133,7 @@ pub async fn switch_model(
     mut cfg: config::Config,
     embedder: Arc<dyn Embedder>,
     progress: Arc<dyn IngestProgress>,
+    parallelism: usize,
 ) -> Result<UpdateSummary, VectorUseError> {
     cfg.embedding.model = embedder.model_id().to_string();
     config::save(&base.join("config.yml"), &cfg)?;
@@ -142,15 +143,9 @@ pub async fn switch_model(
         i32::try_from(embedder.dim()).map_err(|_| VectorUseError::DimOverflow(embedder.dim()))?;
     recreate_chunks_table(base, new_dim, embedder.model_id()).await?;
     let collections = expand_collection_paths(&cfg);
-    let summary = update_all_collections(
-        &collections,
-        base,
-        embedder,
-        progress,
-        cfg.runtime.embed_parallelism,
-    )
-    .await
-    .map_err(VectorUseError::Ingest)?;
+    let summary = update_all_collections(&collections, base, embedder, progress, parallelism)
+        .await
+        .map_err(VectorUseError::Ingest)?;
     Ok(summary)
 }
 

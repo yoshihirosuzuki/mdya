@@ -28,7 +28,7 @@ pub async fn run(
     let cfg = config::load(&base.join("config.yml"))?;
     let collections = expand_collection_paths(&cfg);
     let cache = ModelCache::new(&config::resolve_model_cache_dir(model_cache_dir_flag)?)?;
-    let parallelism = cfg.runtime.embed_parallelism;
+    let parallelism = resolve_embed_parallelism(&cfg.runtime);
     let embedder: Arc<dyn Embedder> = build_embedder(&cfg.embedding.model, &cache).await?;
     let progress: Arc<dyn IngestProgress> =
         Arc::new(IndicatifProgress::with_parallelism(parallelism));
@@ -39,6 +39,26 @@ pub async fn run(
         return Err(UpdateAllError::FilesFailed(summary.failed));
     }
     Ok(())
+}
+
+/// Resolve the effective `embed_parallelism` for an ingest run,
+/// clamping the YAML value to the fixed `MAX_EMBED_PARALLELISM` sanity
+/// ceiling (see `RuntimeConfig::embed_parallelism_capped`). Logs a
+/// warning when the ceiling actually fires so the user notices a value
+/// that would otherwise have built an unbounded futures stream. Shared
+/// with `cli::vector` so `mdya vector use` clamps the same way.
+pub(crate) fn resolve_embed_parallelism(runtime: &config::RuntimeConfig) -> usize {
+    let configured = runtime.embed_parallelism;
+    let capped = runtime.embed_parallelism_capped();
+    if capped < configured {
+        warn!(
+            configured,
+            capped,
+            max = config::MAX_EMBED_PARALLELISM,
+            "runtime.embed_parallelism exceeds the sanity ceiling; clamping"
+        );
+    }
+    capped
 }
 
 /// `config.yml`'s `collections.<name>.path` may carry `~/`; resolve once
