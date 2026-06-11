@@ -18,10 +18,11 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
         path: path.to_owned(),
         source,
     })?;
-    let config: Config = serde_yaml_ng::from_str(&yaml).map_err(|source| ConfigError::ParseYaml {
-        path: path.to_owned(),
-        source,
-    })?;
+    let config: Config =
+        serde_yaml_ng::from_str(&yaml).map_err(|source| ConfigError::ParseYaml {
+            path: path.to_owned(),
+            source,
+        })?;
     for name in config.collections.keys() {
         super::schema::validate_collection_name(name)?;
     }

@@ -21,7 +21,6 @@ use crate::introspect::{self, output};
 pub enum CollectionAddError {
     #[error(transparent)]
     Config(#[from] ConfigError),
-
 }
 
 pub fn run(

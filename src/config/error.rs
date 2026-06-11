@@ -49,10 +49,7 @@ pub enum ConfigError {
     },
 
     #[error("collection name '{name}' is not valid: {reason}")]
-    InvalidCollectionName {
-        name: String,
-        reason: &'static str,
-    },
+    InvalidCollectionName { name: String, reason: &'static str },
 }
 
 #[derive(Debug, Error)]
