@@ -29,7 +29,8 @@ pub async fn run(
     let collections = expand_collection_paths(&cfg);
     let cache = ModelCache::new(&config::resolve_model_cache_dir(model_cache_dir_flag)?)?;
     let parallelism = resolve_embed_parallelism(&cfg.runtime);
-    let embedder: Arc<dyn Embedder> = build_embedder(&cfg.embedding.model, &cache).await?;
+    let embedder: Arc<dyn Embedder> =
+        build_embedder(&cfg.embedding.model, &cfg.embedding.ollama.endpoint, &cache).await?;
     let progress: Arc<dyn IngestProgress> =
         Arc::new(IndicatifProgress::with_parallelism(parallelism));
     let summary =

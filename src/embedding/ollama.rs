@@ -9,10 +9,14 @@
 //! vector dimension by probing the endpoint once at construction.
 //!
 //! ## Locality
-//! mdya does NOT enforce a loopback endpoint. The protected value
-//! ("inference stays on-device") is guaranteed by this backend being opt-in,
-//! not by a code guard. `OLLAMA_HOST` is honoured verbatim, defaulting to the
-//! loopback address Ollama itself binds.
+//! The endpoint comes entirely from `config.yml`'s
+//! `embedding.ollama.endpoint` key (default `http://127.0.0.1:11434`,
+//! matching Ollama's own bind). mdya honours the YAML value verbatim
+//! and never reads any environment variable to derive the endpoint —
+//! that closes the "ambient env var redirects the request off-device"
+//! surface. Pointing the YAML value at a non-loopback host is a
+//! deliberate user choice and means embedding text leaves the device;
+//! there is no code guard against this, only the explicit YAML opt-in.
 //!
 //! ## Sync/async bridge
 //! The [`Embedder`] trait is synchronous and is called from blocking contexts
@@ -34,9 +38,17 @@ use super::{EmbedError, Embedder};
 /// `config.yml` `embedding.model` prefix that selects this backend.
 pub const OLLAMA_PREFIX: &str = "ollama:";
 
-/// Default endpoint when `OLLAMA_HOST` is unset — Ollama binds
-/// `127.0.0.1:11434` by default.
-const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434";
+/// Maximum number of UTF-8 bytes of a server-returned error body that
+/// `sanitize_error_body` will splice into an `EmbedError::Ollama`
+/// message. A malicious or misconfigured Ollama process could otherwise
+/// return a multi-gigabyte body that `EmbedError` would have to carry
+/// to the logger. The chosen size is enough to surface a typical
+/// Ollama JSON error reply while keeping the message bounded. Note
+/// the actual upper bound on `sanitize_error_body`'s return value is
+/// `ERROR_BODY_MAX_BYTES + 3` (the ellipsis `…` is 3 UTF-8 bytes), so
+/// callers can size their downstream buffers as `~ERROR_BODY_MAX_BYTES`
+/// without an explicit headroom calculation.
+const ERROR_BODY_MAX_BYTES: usize = 512;
 
 /// Embedding backend that delegates inference to a local Ollama server.
 pub struct OllamaEmbedder {
@@ -56,9 +68,14 @@ impl OllamaEmbedder {
     /// endpoint once to learn the vector dimension. The probe runs off the
     /// async scheduler via `spawn_blocking`, so it never blocks a runtime
     /// worker. Requires the Ollama server to be reachable.
-    pub async fn new(model_id: &str) -> Result<Self, EmbedError> {
+    pub async fn new(model_id: &str, endpoint: &str) -> Result<Self, EmbedError> {
         let model = parse_ollama_model(model_id)?;
-        let bridge = EmbedBridge::spawn(resolve_base_url(), model);
+        // Drop a trailing `/` so the `{base}/api/embed` request URL never
+        // collapses into `//api/embed`. The endpoint otherwise flows through
+        // unchanged — mdya does not silently rewrite what the user wrote in
+        // `config.yml`.
+        let base = endpoint.trim_end_matches('/').to_string();
+        let bridge = EmbedBridge::spawn(base, model);
         let dim = probe_dim(bridge.clone()).await?;
         Ok(Self {
             model_id: model_id.to_string(),
@@ -99,27 +116,6 @@ fn parse_ollama_model(model_id: &str) -> Result<String, EmbedError> {
         ));
     }
     Ok(name.to_string())
-}
-
-/// Resolve the base URL from `OLLAMA_HOST` (Ollama's own env var), defaulting
-/// to the loopback endpoint. No loopback enforcement.
-fn resolve_base_url() -> String {
-    match std::env::var("OLLAMA_HOST") {
-        Ok(raw) if !raw.trim().is_empty() => normalize_base_url(raw.trim()),
-        _ => DEFAULT_BASE_URL.to_string(),
-    }
-}
-
-/// `OLLAMA_HOST` may be `host:port`, `scheme://host:port`, or a bare host.
-/// Assume `http://` when no scheme is present and drop a trailing slash so
-/// `{base}/api/embed` joins cleanly.
-fn normalize_base_url(raw: &str) -> String {
-    let with_scheme = if raw.contains("://") {
-        raw.to_string()
-    } else {
-        format!("http://{raw}")
-    };
-    with_scheme.trim_end_matches('/').to_string()
 }
 
 /// Probe the endpoint for the model's output dimension. Runs the blocking
@@ -223,7 +219,7 @@ async fn request_embeddings(
         let body = response.text().await.unwrap_or_default();
         return Err(EmbedError::Ollama(format!(
             "{url} returned {status}: {}",
-            body.trim()
+            sanitize_error_body(&body)
         )));
     }
     let parsed: EmbedResponse = response
@@ -231,6 +227,57 @@ async fn request_embeddings(
         .await
         .map_err(|e| EmbedError::Ollama(format!("decode /api/embed response: {e}")))?;
     Ok(parsed.embeddings)
+}
+
+/// Sanitize a server-returned error body before splicing it into an
+/// `EmbedError::Ollama` message: drop ANSI CSI escape sequences (`ESC
+/// [ … letter`) plus other control characters so a malicious server
+/// cannot inject terminal control codes into mdya's stderr or
+/// `tracing` output, then truncate to `ERROR_BODY_MAX_BYTES` so a
+/// server returning a multi-gigabyte body cannot make the error
+/// message itself the failure mode. CR/LF/HT are kept so multi-line
+/// server-side messages still read naturally.
+///
+/// **Scope**: only CSI sequences are matched as escape sequences.
+/// Other ANSI introducers (OSC `ESC ]`, SS3 `ESC O`, etc.) have their
+/// `ESC` byte dropped by the introducer rule but their payload survives
+/// as ordinary characters. That is intentional — without the `ESC`
+/// the terminal cannot reinterpret the payload as a control sequence,
+/// so the residue is at worst noisy text, not an injection vector.
+fn sanitize_error_body(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let mut out = String::with_capacity(trimmed.len().min(ERROR_BODY_MAX_BYTES));
+    let mut in_csi_escape = false;
+    let mut byte_len = 0usize;
+    for c in trimmed.chars() {
+        // ESC (`\x1b`) introduces an ANSI escape sequence; skip until
+        // the closing letter (CSI: `ESC [ … letter`). For
+        // single-character ESC sequences without a `[` follow-up the
+        // next character closes it, which still drops the unsafe byte.
+        if c == '\x1b' {
+            in_csi_escape = true;
+            continue;
+        }
+        if in_csi_escape {
+            if c.is_ascii_alphabetic() {
+                in_csi_escape = false;
+            }
+            continue;
+        }
+        // Drop other control characters except CR/LF/HT so the message
+        // cannot embed bell, backspace, etc.
+        if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+            continue;
+        }
+        let c_len = c.len_utf8();
+        if byte_len + c_len > ERROR_BODY_MAX_BYTES {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+        byte_len += c_len;
+    }
+    out
 }
 
 #[derive(Serialize)]
@@ -269,27 +316,46 @@ mod tests {
     }
 
     #[test]
-    fn normalize_base_url_adds_http_scheme_when_absent() {
-        assert_eq!(
-            normalize_base_url("127.0.0.1:11434"),
-            "http://127.0.0.1:11434"
-        );
+    fn sanitize_error_body_passes_short_text_through() {
+        assert_eq!(sanitize_error_body("model not found"), "model not found");
     }
 
     #[test]
-    fn normalize_base_url_keeps_explicit_scheme() {
-        assert_eq!(
-            normalize_base_url("https://gpu.lan:11434"),
-            "https://gpu.lan:11434"
-        );
+    fn sanitize_error_body_strips_ansi_color_escape() {
+        let raw = "\x1b[31mboom\x1b[0m at line 1";
+        assert_eq!(sanitize_error_body(raw), "boom at line 1");
     }
 
     #[test]
-    fn normalize_base_url_drops_trailing_slash() {
-        assert_eq!(
-            normalize_base_url("http://127.0.0.1:11434/"),
-            "http://127.0.0.1:11434"
-        );
+    fn sanitize_error_body_drops_other_control_characters() {
+        // Bell + backspace + form feed must not survive into the log
+        // message; tab / newline / carriage return are kept.
+        let raw = "abc\x07\x08\x0Cdef\nghi\tjkl";
+        assert_eq!(sanitize_error_body(raw), "abcdef\nghi\tjkl");
+    }
+
+    #[test]
+    fn sanitize_error_body_truncates_overlong_input_with_ellipsis() {
+        let raw = "a".repeat(ERROR_BODY_MAX_BYTES + 100);
+        let sanitized = sanitize_error_body(&raw);
+        let expected_prefix = "a".repeat(ERROR_BODY_MAX_BYTES);
+        let expected = format!("{expected_prefix}…");
+        assert_eq!(sanitized, expected);
+    }
+
+    #[test]
+    fn sanitize_error_body_truncate_does_not_split_a_multibyte_char() {
+        // Pad with `ERROR_BODY_MAX_BYTES - 2` ASCII bytes so the next
+        // input character is a 3-byte UTF-8 codepoint that would push
+        // the running byte length to `ERROR_BODY_MAX_BYTES + 1`. The
+        // truncate guard must refuse to splice the partial codepoint
+        // and emit the ellipsis instead, so the result is the ASCII
+        // prefix followed by `…` — never a malformed UTF-8 prefix.
+        let prefix_len = ERROR_BODY_MAX_BYTES - 2;
+        let raw = format!("{}中trailing", "a".repeat(prefix_len));
+        let sanitized = sanitize_error_body(&raw);
+        let expected = format!("{}…", "a".repeat(prefix_len));
+        assert_eq!(sanitized, expected);
     }
 
     #[test]
@@ -316,7 +382,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires a running Ollama server with nomic-embed-text pulled"]
     async fn smoke_construct_and_embed_against_live_ollama() {
-        let embedder = OllamaEmbedder::new("ollama:nomic-embed-text")
+        let embedder = OllamaEmbedder::new("ollama:nomic-embed-text", "http://127.0.0.1:11434")
             .await
             .expect("construct against live ollama");
         assert!(embedder.dim() > 0, "probed dim should be positive");

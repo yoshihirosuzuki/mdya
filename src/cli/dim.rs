@@ -34,7 +34,11 @@ pub enum DimError {
 /// for any unrecognized model — `build_embedder` rejects those later), the
 /// pinned dim already stored in the `chunks` table for an `ollama:` model, or
 /// the probed dim when no table exists yet.
-pub async fn resolve_declared_dim(config_dir: &Path, model: &str) -> Result<i32, DimError> {
+pub async fn resolve_declared_dim(
+    config_dir: &Path,
+    model: &str,
+    ollama_endpoint: &str,
+) -> Result<i32, DimError> {
     if !model.starts_with(OLLAMA_PREFIX) {
         return Ok(i32::try_from(RURI_V3_30M_DIM).expect("RURI_V3_30M_DIM (256) fits in i32"));
     }
@@ -42,7 +46,7 @@ pub async fn resolve_declared_dim(config_dir: &Path, model: &str) -> Result<i32,
         return Ok(dim);
     }
     // Table absent (first `mdya init`): probe the live endpoint.
-    let embedder = OllamaEmbedder::new(model).await?;
+    let embedder = OllamaEmbedder::new(model, ollama_endpoint).await?;
     i32::try_from(embedder.dim()).map_err(|_| DimError::DimOverflow(embedder.dim()))
 }
 

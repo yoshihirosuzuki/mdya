@@ -95,7 +95,12 @@ async fn run_fts(config_dir: Option<&Path>, args: SearchArgs, no_color_flag: boo
     // FTS uses no vectors, so this resolves the pin dim without loading an
     // embedder — for `ollama:` models it reads the table's stored dim rather
     // than probing the server, keeping FTS offline.
-    let dim = resolve_declared_dim(&cfg_dir, &cfg.embedding.model).await?;
+    let dim = resolve_declared_dim(
+        &cfg_dir,
+        &cfg.embedding.model,
+        &cfg.embedding.ollama.endpoint,
+    )
+    .await?;
     let engine = SearchEngine::open(&cfg_dir, &cfg.embedding.model, dim).await?;
     let (req, format) = args_into_request(args);
     // FTS does not load an embedder, so `validate_request` is folded
@@ -115,7 +120,12 @@ async fn run_vector(
 ) -> Result<()> {
     let cfg_dir = config::resolve_config_dir(config_dir)?;
     let cfg = config::load(&cfg_dir.join("config.yml"))?;
-    let dim = resolve_declared_dim(&cfg_dir, &cfg.embedding.model).await?;
+    let dim = resolve_declared_dim(
+        &cfg_dir,
+        &cfg.embedding.model,
+        &cfg.embedding.ollama.endpoint,
+    )
+    .await?;
     let engine = SearchEngine::open(&cfg_dir, &cfg.embedding.model, dim).await?;
     let (req, format) = args_into_request(args);
     // Reject bad requests (empty query / limit 0 / unknown collection)
@@ -123,7 +133,8 @@ async fn run_vector(
     // the ~140 MB `cl-nagoya/ruri-v3-30m` download (or an Ollama round-trip).
     engine.validate_request(&req)?;
     let cache = ModelCache::new(&config::resolve_model_cache_dir(model_cache_dir)?)?;
-    let embedder = build_embedder(&cfg.embedding.model, &cache).await?;
+    let embedder =
+        build_embedder(&cfg.embedding.model, &cfg.embedding.ollama.endpoint, &cache).await?;
     let resp = engine.vector(&req, embedder.as_ref()).await?;
     let mut stdout = io::stdout().lock();
     render(&mut stdout, format, &resp, color_enabled(no_color_flag))?;
@@ -138,7 +149,12 @@ async fn run_hybrid(
 ) -> Result<()> {
     let cfg_dir = config::resolve_config_dir(config_dir)?;
     let cfg = config::load(&cfg_dir.join("config.yml"))?;
-    let dim = resolve_declared_dim(&cfg_dir, &cfg.embedding.model).await?;
+    let dim = resolve_declared_dim(
+        &cfg_dir,
+        &cfg.embedding.model,
+        &cfg.embedding.ollama.endpoint,
+    )
+    .await?;
     let engine = SearchEngine::open(&cfg_dir, &cfg.embedding.model, dim).await?;
     let (req, format) = args_into_request(args);
     // Reject bad requests (empty query / limit 0 / unknown collection)
@@ -146,7 +162,8 @@ async fn run_hybrid(
     // the ~140 MB `cl-nagoya/ruri-v3-30m` download (or an Ollama round-trip).
     engine.validate_request(&req)?;
     let cache = ModelCache::new(&config::resolve_model_cache_dir(model_cache_dir)?)?;
-    let embedder = build_embedder(&cfg.embedding.model, &cache).await?;
+    let embedder =
+        build_embedder(&cfg.embedding.model, &cfg.embedding.ollama.endpoint, &cache).await?;
     let resp = engine.hybrid(&req, embedder.as_ref()).await?;
     let mut stdout = io::stdout().lock();
     render(&mut stdout, format, &resp, color_enabled(no_color_flag))?;

@@ -78,11 +78,12 @@ fn classify_model(model: &str) -> Option<ModelKind> {
 /// server-side). An unrecognized model string is a config error.
 pub async fn build_embedder(
     model: &str,
+    ollama_endpoint: &str,
     cache: &ModelCache,
 ) -> Result<Arc<dyn Embedder>, EmbedError> {
     match classify_model(model) {
         Some(ModelKind::Ruri) => Ok(Arc::new(RuriV3_30m::new(cache).await?)),
-        Some(ModelKind::Ollama) => Ok(Arc::new(OllamaEmbedder::new(model).await?)),
+        Some(ModelKind::Ollama) => Ok(Arc::new(OllamaEmbedder::new(model, ollama_endpoint).await?)),
         None => Err(EmbedError::UnsupportedModel(model.to_string())),
     }
 }
@@ -152,7 +153,14 @@ mod tests {
         // is only needed to construct a `ModelCache` (which performs no I/O).
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let cache = ModelCache::new(tmp.path()).expect("cache");
-        let result = futures::executor::block_on(build_embedder("some/other-model", &cache));
+        // The unsupported branch errors before either input is touched; the
+        // endpoint placeholder satisfies the new signature without reaching
+        // out to a real Ollama process.
+        let result = futures::executor::block_on(build_embedder(
+            "some/other-model",
+            "http://127.0.0.1:11434",
+            &cache,
+        ));
         // `Arc<dyn Embedder>` is not `Debug`, so match instead of `expect_err`.
         assert!(matches!(
             result,
