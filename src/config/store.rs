@@ -9,16 +9,23 @@ use super::error::ConfigError;
 use super::schema::Config;
 
 /// Load `config.yml` from `path`. Returns the typed `Config` or a
-/// `ConfigError` distinguishing IO failure from YAML parse failure.
+/// `ConfigError` distinguishing IO failure, YAML parse failure, and
+/// invalid collection name (a user hand-editing `config.yml` to add
+/// a name that the writer-layer SQL grammar cannot represent is
+/// caught here before any ingest touches the database).
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let yaml = fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_owned(),
         source,
     })?;
-    serde_yaml_ng::from_str(&yaml).map_err(|source| ConfigError::ParseYaml {
+    let config: Config = serde_yaml_ng::from_str(&yaml).map_err(|source| ConfigError::ParseYaml {
         path: path.to_owned(),
         source,
-    })
+    })?;
+    for name in config.collections.keys() {
+        super::schema::validate_collection_name(name)?;
+    }
+    Ok(config)
 }
 
 /// Serialize `config` to YAML and write atomically (write to `<path>.tmp`,

@@ -137,4 +137,24 @@ pub enum IngestError {
          `~/.mdya/index/`, run `mdya init`, and re-run `mdya update-all`."
     )]
     SchemaMetadataMissing { absent_keys: Vec<&'static str> },
+
+    /// A path supplied to the ingest writer contained traversal components
+    /// (`..`, an absolute root, or a Windows prefix) and was therefore
+    /// refused before any filesystem operation. File-level: caught by the
+    /// per-file `unwrap_or_else` in the writer loop, logged, and counted
+    /// as `Failed`.
+    #[error("path traversal rejected: {rel_path}")]
+    PathTraversal { rel_path: PathBuf },
+
+    /// Embedding vector dimension exceeds `i32::MAX`, which Arrow's
+    /// `FixedSizeList` cannot represent. File-level: caught by the
+    /// per-file `unwrap_or_else` in the writer loop.
+    #[error("embedding dim {dim} exceeds Arrow FixedSizeList capacity (i32::MAX)")]
+    DimTooLarge { dim: usize },
+
+    /// Per-file chunk count exceeds `u32::MAX`, which the `chunk_sequence`
+    /// Arrow column cannot represent. File-level: caught by the per-file
+    /// `unwrap_or_else` in the writer loop.
+    #[error("chunk count {count} exceeds u32::MAX")]
+    TooManyChunks { count: usize },
 }
