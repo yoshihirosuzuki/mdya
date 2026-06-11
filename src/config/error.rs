@@ -25,7 +25,7 @@ pub enum ConfigError {
         source: std::io::Error,
     },
 
-    // NOTE: parse and serialize share the same `serde_yaml_ng::Error` type
+    // NOTE: parse and serialize share the same `serde_saphyr::Error` type
     // but are split into two variants so the error chain can carry the file
     // path on the read side. `#[from]` is attached only to `SerializeYaml`;
     // `ParseYaml` is built via `map_err` so the offending path is preserved.
@@ -33,11 +33,11 @@ pub enum ConfigError {
     ParseYaml {
         path: PathBuf,
         #[source]
-        source: serde_yaml_ng::Error,
+        source: serde_saphyr::Error,
     },
 
     #[error("serialize YAML: {0}")]
-    SerializeYaml(#[from] serde_yaml_ng::Error),
+    SerializeYaml(#[from] serde_saphyr::Error),
 
     #[error("collection '{name}' already exists in config.yml")]
     CollectionExists { name: String },

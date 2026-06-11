@@ -170,13 +170,13 @@ fn collection_add_with_name_override_uses_override() {
     let cfg = fs::read_to_string(base.join("config.yml")).expect("read");
     assert!(cfg.contains("work-notes"));
     // basename should NOT have been used as a fallback alongside override.
-    let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&cfg).expect("parse");
-    let collections = yaml
-        .get("collections")
-        .and_then(|v| v.as_mapping())
-        .unwrap();
-    assert!(collections.contains_key(serde_yaml_ng::Value::String("work-notes".to_string())));
-    assert!(!collections.contains_key(serde_yaml_ng::Value::String("notes-source".to_string())));
+    // Parse through the strong-typed `Config` schema rather than a
+    // dynamic YAML `Value`: `serde_saphyr` is a typed-only deserializer
+    // (it deliberately omits the intermediate DOM that `serde_yaml`'s
+    // `Value` exposed), and the typed lookup is more precise anyway.
+    let parsed: mdya::config::Config = serde_saphyr::from_str(&cfg).expect("parse");
+    assert!(parsed.collections.contains_key("work-notes"));
+    assert!(!parsed.collections.contains_key("notes-source"));
 }
 
 #[test]

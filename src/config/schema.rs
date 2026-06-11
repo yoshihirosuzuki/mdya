@@ -242,7 +242,7 @@ mod tests {
         // template would mislead users into expecting a knob that does not
         // exist.
         let cfg = Config::init_template();
-        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        let yaml = serde_saphyr::to_string(&cfg).expect("serialize");
         assert!(
             !yaml.contains("chunking"),
             "init template must not mention chunking; got:\n{yaml}"
@@ -260,8 +260,8 @@ mod tests {
             },
         );
 
-        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
-        let back: Config = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+        let yaml = serde_saphyr::to_string(&cfg).expect("serialize");
+        let back: Config = serde_saphyr::from_str(&yaml).expect("deserialize");
 
         assert_eq!(back.collections["notes"].path, "~/notes");
         assert_eq!(back, cfg);
@@ -277,7 +277,7 @@ mod tests {
                 description: None,
             },
         );
-        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        let yaml = serde_saphyr::to_string(&cfg).expect("serialize");
         assert!(
             !yaml.contains("description"),
             "unset description must not appear in YAML; got:\n{yaml}"
@@ -294,8 +294,8 @@ mod tests {
                 description: Some("個人メモ".to_string()),
             },
         );
-        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
-        let back: Config = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+        let yaml = serde_saphyr::to_string(&cfg).expect("serialize");
+        let back: Config = serde_saphyr::from_str(&yaml).expect("deserialize");
         assert_eq!(
             back.collections["notes"].description.as_deref(),
             Some("個人メモ")
@@ -312,7 +312,7 @@ collections:
 embedding:
   model: cl-nagoya/ruri-v3-30m
 ";
-        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        let cfg: Config = serde_saphyr::from_str(yaml).expect("deserialize");
         assert_eq!(cfg.collections["notes"].description, None);
     }
 
@@ -332,7 +332,7 @@ collections: {}
 embedding:
   model: cl-nagoya/ruri-v3-30m
 ";
-        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        let cfg: Config = serde_saphyr::from_str(yaml).expect("deserialize");
         assert_eq!(cfg.runtime.memory_limit_mb, 8192);
     }
 
@@ -343,8 +343,8 @@ embedding:
         let mut cfg = Config::init_template();
         cfg.runtime.memory_limit_mb = 0;
 
-        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
-        let back: Config = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+        let yaml = serde_saphyr::to_string(&cfg).expect("serialize");
+        let back: Config = serde_saphyr::from_str(&yaml).expect("deserialize");
 
         assert_eq!(back.runtime.memory_limit_mb, 0);
     }
@@ -358,7 +358,7 @@ embedding:
 runtime:
   memory_limit_mb: 16384
 ";
-        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        let cfg: Config = serde_saphyr::from_str(yaml).expect("deserialize");
         assert_eq!(cfg.runtime.memory_limit_mb, 16384);
     }
 
@@ -378,7 +378,7 @@ embedding:
   model: cl-nagoya/ruri-v3-30m
 runtime: {}
 ";
-        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        let cfg: Config = serde_saphyr::from_str(yaml).expect("deserialize");
         assert_eq!(cfg.runtime.embed_parallelism, 8);
     }
 
@@ -389,8 +389,8 @@ runtime: {}
         let mut cfg = Config::init_template();
         cfg.runtime.embed_parallelism = 0;
 
-        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
-        let back: Config = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+        let yaml = serde_saphyr::to_string(&cfg).expect("serialize");
+        let back: Config = serde_saphyr::from_str(&yaml).expect("deserialize");
 
         assert_eq!(back.runtime.embed_parallelism, 0);
     }
@@ -405,7 +405,7 @@ runtime:
   memory_limit_mb: 8192
   embed_parallelism: 16
 ";
-        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        let cfg: Config = serde_saphyr::from_str(yaml).expect("deserialize");
         assert_eq!(cfg.runtime.embed_parallelism, 16);
     }
 
@@ -426,7 +426,7 @@ chunking:
 runtime:
   memory_limit_mb: 8192
 ";
-        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        let cfg: Config = serde_saphyr::from_str(yaml).expect("deserialize");
         assert_eq!(cfg.embedding.model, "cl-nagoya/ruri-v3-30m");
         assert_eq!(cfg.runtime.memory_limit_mb, 8192);
     }
@@ -523,7 +523,7 @@ runtime:
     #[test]
     fn init_template_omits_ollama_section_when_endpoint_is_default() {
         let cfg = Config::init_template();
-        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        let yaml = serde_saphyr::to_string(&cfg).expect("serialize");
         assert!(
             !yaml.contains("ollama"),
             "init template must not surface the ollama subsection when it \
@@ -543,7 +543,7 @@ runtime:
   memory_limit_mb: 8192
   embed_parallelism: 8
 ";
-        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        let cfg: Config = serde_saphyr::from_str(yaml).expect("deserialize");
         assert_eq!(cfg.embedding.ollama.endpoint, DEFAULT_OLLAMA_ENDPOINT);
     }
 
@@ -551,8 +551,8 @@ runtime:
     fn explicit_ollama_endpoint_override_round_trips() {
         let mut cfg = Config::init_template();
         cfg.embedding.ollama.endpoint = "http://gpu.lan:11434".to_string();
-        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
-        let back: Config = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+        let yaml = serde_saphyr::to_string(&cfg).expect("serialize");
+        let back: Config = serde_saphyr::from_str(&yaml).expect("deserialize");
         assert_eq!(back.embedding.ollama.endpoint, "http://gpu.lan:11434");
     }
 
@@ -560,7 +560,7 @@ runtime:
     fn non_default_ollama_endpoint_surfaces_in_serialized_yaml() {
         let mut cfg = Config::init_template();
         cfg.embedding.ollama.endpoint = "http://gpu.lan:11434".to_string();
-        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        let yaml = serde_saphyr::to_string(&cfg).expect("serialize");
         assert!(
             yaml.contains("ollama"),
             "non-default endpoint must surface the ollama subsection; got:\n{yaml}"

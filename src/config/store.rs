@@ -1,6 +1,13 @@
-//! YAML load/save for `~/.mdya/config.yml` via `serde_yaml_ng`. The parser is
-//! a maintenance fork of the deprecated `serde_yaml`; the API surface we use
-//! (`from_str` / `to_string`) is the standard serde data-format pair.
+//! YAML load/save for `~/.mdya/config.yml` via `serde_saphyr`. The parser
+//! is a pure-Rust YAML 1.2 implementation built on `granit-parser` (a
+//! fork of the original `saphyr-parser` project; the "saphyr" name in
+//! the crate prefix is historical). The `unsafe-libyaml` C-port lineage
+//! that `serde_yaml` / `serde_yaml_ng` carried is gone from the
+//! mdya-direct dependency edge — it survives only as a transitive of
+//! `lindera`'s own `serde_yaml` use, which is outside this module's
+//! scope. The API surface we use (`from_str` / `to_string`) is the
+//! standard serde data-format pair, so the swap is a one-symbol
+//! migration on the call site.
 
 use std::fs;
 use std::path::Path;
@@ -19,7 +26,7 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
         source,
     })?;
     let config: Config =
-        serde_yaml_ng::from_str(&yaml).map_err(|source| ConfigError::ParseYaml {
+        serde_saphyr::from_str(&yaml).map_err(|source| ConfigError::ParseYaml {
             path: path.to_owned(),
             source,
         })?;
@@ -33,7 +40,7 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 /// then rename) so a crash mid-write cannot leave the user with a truncated
 /// `config.yml`.
 pub fn save(path: &Path, config: &Config) -> Result<(), ConfigError> {
-    let yaml = serde_yaml_ng::to_string(config)?;
+    let yaml = serde_saphyr::to_string(config)?;
     let tmp = path.with_extension("yml.tmp");
     fs::write(&tmp, yaml).map_err(|source| ConfigError::Write {
         path: tmp.clone(),
