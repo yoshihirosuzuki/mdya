@@ -47,6 +47,9 @@ pub enum ConfigError {
         path: PathBuf,
         kind: InvalidPathKind,
     },
+
+    #[error("collection name '{name}' is not valid: {reason}")]
+    InvalidCollectionName { name: String, reason: &'static str },
 }
 
 #[derive(Debug, Error)]

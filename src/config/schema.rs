@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::ConfigError;
 use crate::embedding::RURI_V3_30M_MODEL_ID;
 
 /// Default for `runtime.memory_limit_mb`. 8192 MB caps a 16-32 GB
@@ -114,6 +115,38 @@ impl Config {
             runtime: RuntimeConfig::default(),
         }
     }
+}
+
+/// Validate that a collection name is safe to splice into a LanceDB
+/// SQL predicate without injection risk and is reasonable as a config
+/// identifier. Accepts `[A-Za-z0-9_-]`, 1..=64 characters. Used by
+/// `mdya collection add --name <NAME>` and by the YAML loader so the
+/// ingest writer can splice the name directly into `Table::delete` /
+/// `UpdateBuilder::only_if` predicates (lancedb 0.29 has no typed
+/// expression API on the write side).
+pub fn validate_collection_name(name: &str) -> Result<(), ConfigError> {
+    if name.is_empty() {
+        return Err(ConfigError::InvalidCollectionName {
+            name: name.to_string(),
+            reason: "must not be empty",
+        });
+    }
+    if name.len() > 64 {
+        return Err(ConfigError::InvalidCollectionName {
+            name: name.to_string(),
+            reason: "must be 64 characters or fewer",
+        });
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ConfigError::InvalidCollectionName {
+            name: name.to_string(),
+            reason: "must contain only ASCII letters, digits, '-' or '_'",
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -320,5 +353,43 @@ runtime:
         let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
         assert_eq!(cfg.embedding.model, "cl-nagoya/ruri-v3-30m");
         assert_eq!(cfg.runtime.memory_limit_mb, 8192);
+    }
+
+    #[test]
+    fn validate_collection_name_accepts_alnum_dash_underscore() {
+        assert!(validate_collection_name("notes").is_ok());
+        assert!(validate_collection_name("work-notes").is_ok());
+        assert!(validate_collection_name("rag_v2").is_ok());
+        assert!(validate_collection_name("A1-b2_C3").is_ok());
+    }
+
+    #[test]
+    fn validate_collection_name_rejects_empty() {
+        let err = validate_collection_name("").unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidCollectionName { ref name, .. } if name.is_empty()
+        ));
+    }
+
+    #[test]
+    fn validate_collection_name_rejects_too_long() {
+        let too_long = "a".repeat(65);
+        let err = validate_collection_name(&too_long).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidCollectionName { .. }));
+    }
+
+    #[test]
+    fn validate_collection_name_rejects_sql_metacharacters() {
+        assert!(validate_collection_name("foo'bar").is_err());
+        // `-` is a member of the accepted charset; `--` inside the name is
+        // still safe because the charset bans every quote / semicolon /
+        // whitespace that DataFusion's SQL grammar would treat as a token
+        // boundary, so the name can never escape its single-quoted literal.
+        assert!(validate_collection_name("foo--bar").is_ok());
+        assert!(validate_collection_name("foo bar").is_err()); // space rejected
+        assert!(validate_collection_name("foo/bar").is_err()); // slash rejected
+        assert!(validate_collection_name("foo;DROP").is_err());
+        assert!(validate_collection_name("日本語").is_err()); // non-ASCII rejected
     }
 }

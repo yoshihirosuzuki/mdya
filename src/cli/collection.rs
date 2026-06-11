@@ -21,9 +21,6 @@ use crate::introspect::{self, output};
 pub enum CollectionAddError {
     #[error(transparent)]
     Config(#[from] ConfigError),
-
-    #[error("--name argument cannot be the empty string")]
-    EmptyNameFlag,
 }
 
 pub fn run(
@@ -38,6 +35,7 @@ pub fn run(
 
     let expanded = validate_collection_path(path_arg)?;
     let name = resolve_collection_name(&expanded, name_override)?;
+    config::validate_collection_name(&name)?;
 
     if cfg.collections.contains_key(&name) {
         return Err(ConfigError::CollectionExists { name }.into());
@@ -92,9 +90,8 @@ fn resolve_collection_name(
     name_override: Option<&str>,
 ) -> Result<String, CollectionAddError> {
     if let Some(n) = name_override {
-        if n.is_empty() {
-            return Err(CollectionAddError::EmptyNameFlag);
-        }
+        // Empty `--name` is rejected by `validate_collection_name` in the
+        // caller, so it does not need its own variant here.
         return Ok(n.to_string());
     }
     expanded_path

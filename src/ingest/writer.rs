@@ -3,7 +3,7 @@
 //! the public entry point (`super::mod`).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -114,8 +114,9 @@ pub async fn update_all_collections(
     // cheap and keeps `mdya update-all` self-bootstrapping when the
     // user skipped `mdya init`.
     ensure_lindera_ipadic_config(config_dir)?;
-    let declared_dim =
-        i32::try_from(embedder.dim()).expect("embedder dim fits i32 (ruri-v3-30m = 256)");
+    let declared_dim = i32::try_from(embedder.dim()).map_err(|_| IngestError::DimTooLarge {
+        dim: embedder.dim(),
+    })?;
     enforce_schema_metadata(
         metadata_check::check(&tables.chunks, embedder.model_id(), declared_dim)
             .await
@@ -501,9 +502,24 @@ fn extract_existing_rows(batches: &[RecordBatch]) -> BTreeMap<PathBuf, DbRow> {
                 tracing::warn!(row = i, "non-nullable column carried null, skipping row");
                 continue;
             }
-            let path = PathBuf::from(paths.value(i));
-            let mtime = DateTime::<Utc>::from_timestamp_micros(mtimes.value(i))
-                .expect("modified_at is a valid UTC timestamp_micros value");
+            let path_str = paths.value(i);
+            let Some(path) = validate_relative_path(path_str) else {
+                tracing::warn!(
+                    row = i,
+                    path = path_str,
+                    "ignoring row with non-relative or traversal path",
+                );
+                continue;
+            };
+            let micros = mtimes.value(i);
+            let Some(mtime) = DateTime::<Utc>::from_timestamp_micros(micros) else {
+                tracing::warn!(
+                    row = i,
+                    micros,
+                    "ignoring row with out-of-range modified_at timestamp",
+                );
+                continue;
+            };
             let row = DbRow {
                 modified_at: mtime,
                 source_hash: hashes.value(i).to_string(),
@@ -569,6 +585,12 @@ async fn process_file(
     // panic at the boundary rather than a silent skip.
     let format = FileFormat::from_path(rel_path)
         .expect("walker only emits paths recognised by FileFormat::from_path");
+    // Defense-in-depth: refuse traversal or absolute components before
+    // forming `absolute`, even when the caller already supplies a
+    // canonical relative path. `extract_existing_rows` also pre-filters
+    // DB-derived paths via `validate_relative_path`, so this guard is
+    // mainly insurance against future callers.
+    ensure_under_root(rel_path)?;
     let absolute = root.join(rel_path);
     let fs_mtime = read_mtime(&absolute)?;
     // True only when this path has a `chunks` row AND the `sources` row
@@ -670,6 +692,17 @@ fn read_bytes_with_hash(absolute: &Path) -> Result<(Vec<u8>, String), IngestErro
     Ok((bytes, hex))
 }
 
+/// UPSERT the `modified_at` column for one `(collection, path)` row
+/// without re-chunking the file.
+///
+/// The `micros` value spliced into the SQL `column` expression is
+/// `mtime.timestamp_micros()` — sourced from a `DateTime<Utc>` built
+/// by `read_mtime` from `std::fs::Metadata::modified()`. chrono and
+/// Arrow's `TimestampMicrosecond` share the same i64 representation,
+/// so the literal cannot land outside Arrow's range and DataFusion
+/// accepts it for any filesystem mtime (including pre-1970 negatives
+/// that APFS / ext4 preserve). The `format!` substitution is therefore
+/// a literal whose value cannot escape DataFusion's literal grammar.
 async fn update_mtime(
     table: &Table,
     collection: &str,
@@ -819,10 +852,10 @@ fn build_record_batch(
     );
     let collection_col = StringArray::from(vec![collection; n]);
     let path_col = StringArray::from(vec![path; n]);
-    let n_u32 = u32::try_from(n).expect("chunk count fits u32 (~4 billion ceiling)");
+    let n_u32 = u32::try_from(n).map_err(|_| IngestError::TooManyChunks { count: n })?;
     let chunk_sequence_col = UInt32Array::from((0..n_u32).collect::<Vec<u32>>());
     let body_col = StringArray::from(chunks.iter().map(|c| c.body.as_str()).collect::<Vec<_>>());
-    let embedding_col = build_embedding_array(chunks, vectors, vector_dim);
+    let embedding_col = build_embedding_array(chunks, vectors, vector_dim)?;
     let micros = mtime.timestamp_micros();
     let modified_at_col =
         TimestampMicrosecondArray::from(vec![micros; n]).with_timezone("UTC".to_string());
@@ -869,10 +902,15 @@ fn enforce_schema_metadata(
 /// verified, lancedb 0.29.0). The `FixedSizeList` still needs `dim`
 /// child values written before a null `append(false)`, so we pad with
 /// zeros that the null bitmap then masks.
-fn build_embedding_array(chunks: &[Chunk], vectors: &[Vec<f32>], dim: usize) -> FixedSizeListArray {
+fn build_embedding_array(
+    chunks: &[Chunk],
+    vectors: &[Vec<f32>],
+    dim: usize,
+) -> Result<FixedSizeListArray, IngestError> {
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    let dim_i32 = i32::try_from(dim).map_err(|_| IngestError::DimTooLarge { dim })?;
     let values_builder = Float32Builder::with_capacity(vectors.len() * dim);
-    let mut builder = FixedSizeListBuilder::new(values_builder, dim as i32);
+    let mut builder = FixedSizeListBuilder::new(values_builder, dim_i32);
     let mut next_vector = vectors.iter();
     for chunk in chunks {
         if chunk.body.is_empty() {
@@ -887,7 +925,7 @@ fn build_embedding_array(chunks: &[Chunk], vectors: &[Vec<f32>], dim: usize) -> 
         builder.values().append_slice(v);
         builder.append(true);
     }
-    builder.finish()
+    Ok(builder.finish())
 }
 
 /// UPSERT the faithful original `content` into the `sources` table for
@@ -967,10 +1005,61 @@ fn extract_source_hashes(batches: &[RecordBatch]) -> BTreeMap<PathBuf, String> {
                 tracing::warn!(row = i, "sources row carried null, skipping");
                 continue;
             }
-            by_path.insert(PathBuf::from(paths.value(i)), hashes.value(i).to_string());
+            let path_str = paths.value(i);
+            let Some(path) = validate_relative_path(path_str) else {
+                tracing::warn!(
+                    row = i,
+                    path = path_str,
+                    "ignoring sources row with non-relative or traversal path",
+                );
+                continue;
+            };
+            by_path.insert(path, hashes.value(i).to_string());
         }
     }
     by_path
+}
+
+/// Validate that a path string read from the `chunks` or `sources`
+/// table is a safe relative path: no parent-dir traversal (`..`),
+/// no absolute root, no Windows prefix. Used by
+/// `extract_existing_rows` and `extract_source_hashes` to drop rows
+/// whose stored `path` would otherwise escape the collection root
+/// once later joined with `root.join(...)`. Returns `None` on any
+/// rejected component so the caller can log and continue rather
+/// than abort the surrounding loop.
+fn validate_relative_path(s: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(s);
+    if p.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+/// Defense-in-depth invariant for `process_file`: refuse a relative
+/// path that would escape the collection root once joined. Called
+/// before `root.join(rel_path)` so a future caller that bypasses
+/// `extract_existing_rows`'s pre-filter still cannot reach a sibling
+/// directory via `..` / absolute components.
+fn ensure_under_root(rel_path: &Path) -> Result<(), IngestError> {
+    if rel_path.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        Err(IngestError::PathTraversal {
+            rel_path: rel_path.to_path_buf(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 /// Double single quotes inside a string literal so it can be safely
@@ -1005,5 +1094,52 @@ mod tests {
         assert_eq!(sql_escape("foo'bar"), "foo''bar");
         assert_eq!(sql_escape("'leading"), "''leading");
         assert_eq!(sql_escape("trailing'"), "trailing''");
+    }
+
+    #[test]
+    fn validate_relative_path_accepts_simple_relative_paths() {
+        assert!(validate_relative_path("foo.md").is_some());
+        assert!(validate_relative_path("dir/sub/file.md").is_some());
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_parent_dir() {
+        assert!(validate_relative_path("../foo").is_none());
+        assert!(validate_relative_path("foo/../bar").is_none());
+        assert!(validate_relative_path("..").is_none());
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_absolute_root() {
+        assert!(validate_relative_path("/etc/shadow").is_none());
+    }
+
+    #[test]
+    fn ensure_under_root_accepts_relative_path() {
+        let p = Path::new("foo/bar.md");
+        assert!(ensure_under_root(p).is_ok());
+    }
+
+    #[test]
+    fn ensure_under_root_rejects_parent_dir() {
+        let p = Path::new("../foo");
+        let err = ensure_under_root(p).unwrap_err();
+        assert!(matches!(err, IngestError::PathTraversal { .. }));
+    }
+
+    #[test]
+    fn ensure_under_root_rejects_absolute_root() {
+        let p = Path::new("/etc/shadow");
+        let err = ensure_under_root(p).unwrap_err();
+        assert!(matches!(err, IngestError::PathTraversal { .. }));
+    }
+
+    #[test]
+    fn build_embedding_array_rejects_dim_exceeding_i32_max() {
+        let chunks: Vec<Chunk> = vec![];
+        let vectors: Vec<Vec<f32>> = vec![];
+        let dim = (i32::MAX as usize) + 1;
+        let err = build_embedding_array(&chunks, &vectors, dim).unwrap_err();
+        assert!(matches!(err, IngestError::DimTooLarge { dim: d } if d == dim));
     }
 }
