@@ -114,8 +114,9 @@ pub async fn update_all_collections(
     // cheap and keeps `mdya update-all` self-bootstrapping when the
     // user skipped `mdya init`.
     ensure_lindera_ipadic_config(config_dir)?;
-    let declared_dim =
-        i32::try_from(embedder.dim()).expect("embedder dim fits i32 (ruri-v3-30m = 256)");
+    let declared_dim = i32::try_from(embedder.dim()).map_err(|_| IngestError::DimTooLarge {
+        dim: embedder.dim(),
+    })?;
     enforce_schema_metadata(
         metadata_check::check(&tables.chunks, embedder.model_id(), declared_dim)
             .await
