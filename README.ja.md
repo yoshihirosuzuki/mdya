@@ -2,6 +2,10 @@
 
 *[English](README.md) / 日本語*
 
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue.svg)](#ライセンス)
+[![Latest release](https://img.shields.io/github/v/release/yoshihirosuzuki/mdya)](https://github.com/yoshihirosuzuki/mdya/releases/latest)
+[![CI](https://github.com/yoshihirosuzuki/mdya/actions/workflows/ci.yml/badge.svg)](https://github.com/yoshihirosuzuki/mdya/actions/workflows/ci.yml)
+
 ローカルの Markdown コレクションのための、小さく速い検索プリミティブ。BM25 全文検索・on-device ベクトル検索・両者を束ねる hybrid 検索を、**CLI** と **MCP サーバ**の 2 つの入口から提供します。
 
 ## 概要
@@ -134,6 +138,15 @@ just check    # fmt-check + clippy (-D warnings) + cargo test (全 workspace)
 just smoke    # smoke テストのみ実行
 just          # recipe 一覧を表示
 ```
+
+## コントリビュート
+
+best-effort 運用です（1 人 maintainer、 SLA はありません）。 Issue や PR を開く前に以下に目を通してください:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — issue / PR フロー、 build と test の手順。
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — Contributor Covenant。
+- [SECURITY.md](SECURITY.md) — セキュリティ脆弱性の private 報告経路。
+- [SUPPORT.md](SUPPORT.md) — 質問の窓口。
 
 ## ライセンス
 

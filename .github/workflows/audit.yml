@@ -1,0 +1,52 @@
+# RustSec advisory database scan.
+#
+# Runs weekly to catch newly published advisories against the pinned
+# dependency tree, and on every `Cargo.toml` / `Cargo.lock` change so dep
+# additions are checked at PR time. The GitHub Dependabot security alert
+# carries the GitHub Advisory Database (a subset of RustSec); this workflow
+# closes the gap by querying RustSec directly.
+#
+# Third-party actions are SHA-pinned, except `dtolnay/rust-toolchain@stable`
+# which is a channel ref by design (tracks latest stable Rust).
+
+name: audit
+
+on:
+  schedule:
+    # Monday 00:00 UTC.
+    - cron: '0 0 * * 1'
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        run: cargo audit --deny warnings
