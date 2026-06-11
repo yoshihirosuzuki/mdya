@@ -44,7 +44,20 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml_ng = "0.10"
+# Pure-Rust YAML (de)serializer for serde. Replaces `serde_yaml_ng`
+# (a maintenance fork of the deprecated `serde_yaml`) so the
+# `unsafe-libyaml` C-port (96%+ unsafe expressions) drops out of the
+# mdya-direct dependency edge. `serde-saphyr` builds on the
+# `granit-parser` pure-Rust stack (a fork of the original
+# `saphyr-parser` project; the "saphyr" name is historical) and is
+# one of the migration paths the upstream `serde_yml` 0.0.13 shim
+# points at for typed-only YAML consumers — which is exactly mdya's
+# usage profile (always-typed `Config` de/serialization, no
+# dynamic `Value` lookups). Cargo treats `0.0.x` as effectively
+# exact-pinned (`^0.0.27` resolves only to `0.0.27`), so any future
+# bump is a deliberate Cargo.toml edit rather than a transitive
+# surprise.
+serde-saphyr = "0.0.27"
 dirs = "6"
 shellexpand = "3"
 lancedb = { version = "=0.29.0", default-features = false }
@@ -176,3 +189,15 @@ panic = "abort"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[lints.clippy]
+# `serde-saphyr` (and the deprecated `serde_yaml` it transitively replaces
+# under `lindera`) carries a larger `Error` enum than its predecessors, so
+# `Result<_, ConfigError>` / `Result<_, IngestError>` / `Result<_, SearchError>`
+# now trip clippy's `result_large_err` size threshold. Boxing the error
+# variants in each enum would be a workspace-wide ergonomic regression
+# (every `?` site loses direct field access on the source), so the lint is
+# accepted here. The same rationale is implicit in clippy's own
+# documentation, which calls the lint a soft suggestion appropriate for
+# crates with intentionally rich error payloads.
+result_large_err = "allow"
