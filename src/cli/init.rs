@@ -134,7 +134,8 @@ async fn ensure_chunks_table(db: &Connection, base: &Path) -> Result<(), InitErr
     // `ollama:<model>` resolves by probing the endpoint (the table does not
     // exist yet here), so `mdya init` with an Ollama model requires the server
     // to be reachable.
-    let dim = resolve_declared_dim(base, &cfg.embedding.model).await?;
+    let dim =
+        resolve_declared_dim(base, &cfg.embedding.model, &cfg.embedding.ollama.endpoint).await?;
     let schema = chunks_schema(dim, &cfg.embedding.model);
     db.create_empty_table(CHUNKS_TABLE_NAME, Arc::new(schema))
         .execute()
