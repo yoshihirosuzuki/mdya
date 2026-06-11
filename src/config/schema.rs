@@ -27,6 +27,16 @@ pub const DEFAULT_MEMORY_LIMIT_MB: u64 = 8192;
 /// path).
 pub const DEFAULT_EMBED_PARALLELISM: usize = 8;
 
+/// Sanity upper bound on `runtime.embed_parallelism`. The figure is
+/// large enough that no realistic deployment touches it; it exists
+/// purely as a `buffer_unordered` ceiling so a typo or runaway value
+/// in `config.yml` (e.g. `embed_parallelism: 99999`) cannot tee up an
+/// unbounded futures stream that would OOM before the runtime memory
+/// guard fires. Memory budget enforcement remains the
+/// `memory_limit_mb` watchdog's job; this cap only prevents the kind
+/// of value that the runtime data structures themselves would refuse.
+pub const MAX_EMBED_PARALLELISM: usize = 1024;
+
 /// Root of `config.yml`. See `docs/manual/en/configuration.md` for the
 /// user-facing field reference.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,6 +94,22 @@ pub struct RuntimeConfig {
     /// `memory_limit_mb`; the watchdog kills the process otherwise.
     #[serde(default = "default_embed_parallelism")]
     pub embed_parallelism: usize,
+}
+
+impl RuntimeConfig {
+    /// Effective `embed_parallelism` after applying the
+    /// `MAX_EMBED_PARALLELISM` sanity ceiling. The cap is a fixed
+    /// constant (not derived from any other config field), so the
+    /// value the user wrote in `config.yml` is honoured exactly until
+    /// it crosses the static ceiling. `0` (the explicit sequential
+    /// path) is preserved verbatim. Memory budget enforcement is the
+    /// `memory_limit_mb` watchdog's job and is independent of this cap.
+    pub fn embed_parallelism_capped(&self) -> usize {
+        if self.embed_parallelism == 0 {
+            return 0;
+        }
+        self.embed_parallelism.min(MAX_EMBED_PARALLELISM)
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -391,5 +417,56 @@ runtime:
         assert!(validate_collection_name("foo/bar").is_err()); // slash rejected
         assert!(validate_collection_name("foo;DROP").is_err());
         assert!(validate_collection_name("日本語").is_err()); // non-ASCII rejected
+    }
+
+    #[test]
+    fn embed_parallelism_capped_clamps_at_max_when_user_exceeds_ceiling() {
+        let cfg = RuntimeConfig {
+            memory_limit_mb: 8192,
+            embed_parallelism: MAX_EMBED_PARALLELISM + 1,
+        };
+        assert_eq!(cfg.embed_parallelism_capped(), MAX_EMBED_PARALLELISM);
+    }
+
+    #[test]
+    fn embed_parallelism_capped_returns_user_value_when_within_ceiling() {
+        let cfg = RuntimeConfig {
+            memory_limit_mb: 8192,
+            embed_parallelism: 8,
+        };
+        // Within the sanity ceiling ⇒ the user's value is returned
+        // verbatim. The watchdog (`memory_limit_mb`) still enforces the
+        // memory budget separately.
+        assert_eq!(cfg.embed_parallelism_capped(), 8);
+    }
+
+    #[test]
+    fn embed_parallelism_capped_preserves_explicit_sequential_choice() {
+        let cfg = RuntimeConfig {
+            memory_limit_mb: 8192,
+            embed_parallelism: 0,
+        };
+        // The user explicitly opted into the sequential path; the cap
+        // must not promote it back to a parallel run.
+        assert_eq!(cfg.embed_parallelism_capped(), 0);
+    }
+
+    #[test]
+    fn embed_parallelism_capped_is_independent_of_memory_limit_mb() {
+        // Same `embed_parallelism`, opposite extremes of
+        // `memory_limit_mb`: the cap must produce identical output.
+        // Anything else would mean the user's value silently shifts
+        // when another config field changes — which is the failure
+        // mode the fixed-ceiling design exists to avoid.
+        let cfg_tight = RuntimeConfig {
+            memory_limit_mb: 100,
+            embed_parallelism: 8,
+        };
+        let cfg_loose = RuntimeConfig {
+            memory_limit_mb: u64::MAX,
+            embed_parallelism: 8,
+        };
+        assert_eq!(cfg_tight.embed_parallelism_capped(), 8);
+        assert_eq!(cfg_loose.embed_parallelism_capped(), 8);
     }
 }
