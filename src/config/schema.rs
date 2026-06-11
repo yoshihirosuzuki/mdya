@@ -37,6 +37,12 @@ pub const DEFAULT_EMBED_PARALLELISM: usize = 8;
 /// of value that the runtime data structures themselves would refuse.
 pub const MAX_EMBED_PARALLELISM: usize = 1024;
 
+/// Default endpoint when `embedding.ollama.endpoint` is omitted from
+/// `config.yml`. Mirrors the loopback address Ollama itself binds at
+/// install time, so a co-located Ollama process on the same machine
+/// works out of the box without any YAML override.
+pub const DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
+
 /// Root of `config.yml`. See `docs/manual/en/configuration.md` for the
 /// user-facing field reference.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -73,6 +79,49 @@ pub struct CollectionEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
     pub model: String,
+
+    /// Ollama backend configuration. The whole subsection is omitted
+    /// from `mdya init`'s template output when it carries the default
+    /// loopback endpoint, so users who stay on the candle path never
+    /// see an `ollama:` key in their `config.yml`. `ollama:<model>`
+    /// users either inherit the default loopback endpoint or write an
+    /// explicit override here.
+    #[serde(default, skip_serializing_if = "OllamaConfig::is_default")]
+    pub ollama: OllamaConfig,
+}
+
+/// Ollama-backend-specific configuration. Only `endpoint` is wired
+/// today; future Ollama-specific knobs land here so they cluster under
+/// one YAML subsection instead of polluting the top-level `embedding`
+/// shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OllamaConfig {
+    /// Base URL the Ollama embedding backend posts to. Default is the
+    /// loopback address Ollama itself binds at install time. Overriding
+    /// this to a non-loopback host means embedding text leaves the
+    /// device, which violates mdya's "inference stays local" property —
+    /// the override is honoured (no code guard) but users opting in
+    /// must accept that trade-off themselves.
+    #[serde(default = "default_ollama_endpoint")]
+    pub endpoint: String,
+}
+
+impl OllamaConfig {
+    fn is_default(&self) -> bool {
+        self.endpoint == DEFAULT_OLLAMA_ENDPOINT
+    }
+}
+
+impl Default for OllamaConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: DEFAULT_OLLAMA_ENDPOINT.to_string(),
+        }
+    }
+}
+
+fn default_ollama_endpoint() -> String {
+    DEFAULT_OLLAMA_ENDPOINT.to_string()
 }
 
 /// Process-level runtime policy. Holds the safety knobs
@@ -137,6 +186,7 @@ impl Config {
             collections: BTreeMap::new(),
             embedding: EmbeddingConfig {
                 model: RURI_V3_30M_MODEL_ID.to_string(),
+                ollama: OllamaConfig::default(),
             },
             runtime: RuntimeConfig::default(),
         }
@@ -468,5 +518,56 @@ runtime:
         };
         assert_eq!(cfg_tight.embed_parallelism_capped(), 8);
         assert_eq!(cfg_loose.embed_parallelism_capped(), 8);
+    }
+
+    #[test]
+    fn init_template_omits_ollama_section_when_endpoint_is_default() {
+        let cfg = Config::init_template();
+        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        assert!(
+            !yaml.contains("ollama"),
+            "init template must not surface the ollama subsection when it \
+             carries the default loopback endpoint; got:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn legacy_yaml_without_ollama_key_deserializes_to_default_endpoint() {
+        // Predates the ollama subsection: makes sure existing
+        // `config.yml` files round-trip without touching the new field.
+        let yaml = "\
+collections: {}
+embedding:
+  model: cl-nagoya/ruri-v3-30m
+runtime:
+  memory_limit_mb: 8192
+  embed_parallelism: 8
+";
+        let cfg: Config = serde_yaml_ng::from_str(yaml).expect("deserialize");
+        assert_eq!(cfg.embedding.ollama.endpoint, DEFAULT_OLLAMA_ENDPOINT);
+    }
+
+    #[test]
+    fn explicit_ollama_endpoint_override_round_trips() {
+        let mut cfg = Config::init_template();
+        cfg.embedding.ollama.endpoint = "http://gpu.lan:11434".to_string();
+        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        let back: Config = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+        assert_eq!(back.embedding.ollama.endpoint, "http://gpu.lan:11434");
+    }
+
+    #[test]
+    fn non_default_ollama_endpoint_surfaces_in_serialized_yaml() {
+        let mut cfg = Config::init_template();
+        cfg.embedding.ollama.endpoint = "http://gpu.lan:11434".to_string();
+        let yaml = serde_yaml_ng::to_string(&cfg).expect("serialize");
+        assert!(
+            yaml.contains("ollama"),
+            "non-default endpoint must surface the ollama subsection; got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("gpu.lan"),
+            "non-default endpoint must appear in serialized YAML; got:\n{yaml}"
+        );
     }
 }

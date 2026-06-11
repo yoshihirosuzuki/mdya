@@ -85,7 +85,7 @@ pub(crate) async fn run(
         return Ok(());
     }
     let cache = ModelCache::new(&config::resolve_model_cache_dir(model_cache_dir_flag)?)?;
-    let embedder = build_embedder(model, &cache).await?;
+    let embedder = build_embedder(model, &cfg.embedding.ollama.endpoint, &cache).await?;
     if !user_confirms(
         assume_yes,
         &cfg.embedding.model,
