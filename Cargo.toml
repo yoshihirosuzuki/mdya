@@ -60,20 +60,22 @@ serde_json = "1"
 serde-saphyr = "0.0.27"
 dirs = "6"
 shellexpand = "3"
-lancedb = { version = "=0.29.0", default-features = false }
+lancedb = { version = "=0.30.0", default-features = false }
 # Embedded IPADIC dictionary for Lance's FTS `lindera/ipadic` tokenizer.
-# The `ipadic` feature triggers `lindera-ipadic`'s build.rs to fetch
+# The `embed-ipadic` feature triggers `lindera-ipadic`'s build.rs to fetch
 # `mecab-ipadic-2.7.0-20070801.tar.gz` from Lindera.dev (md5-verified)
 # and `include_bytes!` the compiled dictionary into the rlib. At run
 # time mdya redirects Lance's `language_model_home` via the
 # `LANCE_LANGUAGE_MODEL_HOME` env var into `~/.mdya/lance-models/` and
-# writes a tiny `config.yml` whose `segmenter.dictionary.kind: ipadic`
-# makes Lance read the embedded dictionary through
-# `lindera_ipadic::ipadic::load()` — no foreign disk write, no `*-sys`.
-# Pinned exact-version to mirror the `lindera v0.44.1` already present
-# transitively via `lance-tokenizer`. Verified in
+# writes a tiny `config.yml` whose `segmenter.dictionary: embedded://ipadic`
+# makes Lance read the embedded dictionary — no foreign disk write,
+# no `*-sys`. Pinned exact-version to mirror the `lindera v3.0.7` already
+# present transitively via `lance-tokenizer`; declaring it here unifies
+# cargo features so the transitive copy picks up `embed-ipadic`. mdya
+# itself does not call any lindera API; the direct dep exists solely to
+# set features and pin the version in `Cargo.lock`. Verified in
 # `tests/verify_lindera_ipadic.rs`.
-lindera = { version = "=0.44.1", default-features = false, features = ["ipadic", "compress", "mmap"] }
+lindera = { version = "=3.0.7", default-features = false, features = ["embed-ipadic", "mmap"] }
 # Exact-pinned to 0.10.1: crates.io candle-core 0.10.2 was published without
 # a matching git tag (huggingface/candle has tags up to 0.10.1 only), so we
 # stay on the last verifiably tagged release. Bump only after the upstream
@@ -153,12 +155,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # Rust, no `*-sys`.
 schemars = "1"
 # `FullTextSearchQuery` / `SCORE_COL` for `mdya search fts`.
-# lancedb v0.29's `query.rs` doc example also imports them directly
+# lancedb v0.30's `query.rs` doc example also imports them directly
 # from `lance-index`; lancedb does not re-export them. Pinned to
-# `=6.0.0` to mirror the existing `[dev-dependencies]` pin, which
-# itself matches the transitive version lancedb 0.29 resolves to.
+# `=7.0.0` to mirror the existing `[dev-dependencies]` pin, which
+# itself matches the transitive version lancedb 0.30 resolves to.
 # Pure Rust, no `*-sys`.
-lance-index = "=6.0.0"
+lance-index = "=7.0.0"
 
 [features]
 default = []
@@ -176,7 +178,7 @@ tempfile = "3"
 futures = "0.3"
 arrow-array = "58"
 arrow-schema = "58"
-lance-index = "=6.0.0"
+lance-index = "=7.0.0"
 
 [profile.release]
 lto = "thin"

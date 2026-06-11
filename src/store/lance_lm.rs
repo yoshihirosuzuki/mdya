@@ -3,14 +3,14 @@
 //! time.
 //!
 //! Placement strategy: the IPADIC dictionary itself is embedded into the
-//! mdya binary by the `lindera` crate's `ipadic` feature
+//! mdya binary by the `lindera` crate's `embed-ipadic` feature
 //! (`include_bytes!` at build time), so the only thing mdya has to
 //! write to disk is a ~100 byte `config.yml` whose
-//! `segmenter.dictionary.kind: ipadic` directs Lance into the
-//! `lindera_ipadic::ipadic::load()` path. Combined with the
-//! `LANCE_LANGUAGE_MODEL_HOME` env redirect set by `main.rs`, this keeps
-//! every file mdya writes inside `<config_dir>/lance-models/`, in the
-//! single `~/.mdya/` namespace.
+//! `segmenter.dictionary: embedded://ipadic` directs Lance to load the
+//! embedded dictionary. Combined with the `LANCE_LANGUAGE_MODEL_HOME`
+//! env redirect set by `main.rs`, this keeps every file mdya writes
+//! inside `<config_dir>/lance-models/`, in the single `~/.mdya/`
+//! namespace.
 //!
 //! Lives under `src/store/` rather than `src/config/` because the helper
 //! is a LanceDB-engine concern (= what Lance needs on disk to load its
@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Environment variable Lance consults to locate its language-model
-/// directory tree (`lance-index-6.0.0/src/scalar/inverted/tokenizer.rs`).
+/// directory tree (`lance-index-7.0.0/src/scalar/inverted/tokenizer.rs`).
 /// `main.rs` redirects it to `<config_dir>/lance-models/` before the
 /// tokio runtime starts so every subsequent FTS index touch reads from
 /// inside `~/.mdya/`.
@@ -34,7 +34,7 @@ pub const LANCE_LANGUAGE_MODEL_HOME_ENV_KEY: &str = "LANCE_LANGUAGE_MODEL_HOME";
 /// Trailing newline is intentional — keeps the file POSIX-tidy and
 /// avoids editor diff noise.
 pub const LINDERA_IPADIC_CONFIG_YML: &str =
-    "segmenter:\n  mode: normal\n  dictionary:\n    kind: ipadic\n";
+    "segmenter:\n  mode: normal\n  dictionary: embedded://ipadic\n";
 
 #[derive(Debug, Error)]
 pub enum LanceLmError {

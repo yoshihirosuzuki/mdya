@@ -57,7 +57,7 @@ fn init_materializes_config_index_and_lance_models() {
     );
     let ipadic_yaml = fs::read_to_string(&ipadic_config).expect("read ipadic config");
     assert!(
-        ipadic_yaml.contains("kind: ipadic"),
+        ipadic_yaml.contains("embedded://ipadic"),
         "lindera/ipadic config.yml must select the embedded dictionary, got:\n{ipadic_yaml}"
     );
 

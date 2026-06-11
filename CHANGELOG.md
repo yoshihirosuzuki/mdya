@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-PR cross-platform `cargo check` smoke gate (Linux (arm64), Windows (x86_64), macOS (arm64 / x86_64)).
 - Weekly + per-PR `cargo audit` workflow against the RustSec advisory database.
 
+### Changed
+
+- Bumped `lancedb` 0.29 → 0.30, `lance-index` 6.0 → 7.0, and `lindera` 0.44.1 → 3.0.7 (forced by lance-tokenizer 7.0's transitive switch to lindera 3.0).
+- The on-disk `~/.mdya/lance-models/lindera/ipadic/config.yml` now uses lindera 3.0's URI dictionary scheme (`segmenter.dictionary: embedded://ipadic`) in place of the old nested form (`segmenter.dictionary.kind: ipadic`). The file is regenerated atomically on the next `mdya init` / `mdya update-all` run; no user action is required.
+
 ### Security
 
 - `.cargo/audit.toml` with four upstream `unmaintained` (non-CVE) RUSTSEC IDs accepted as WONTFIX; see file header and `SECURITY.md` for the policy.

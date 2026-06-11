@@ -246,7 +246,7 @@ async fn update_all_writes_lindera_ipadic_config_yml() -> Result<()> {
     );
     let yaml = std::fs::read_to_string(&config_path)?;
     assert!(
-        yaml.contains("kind: ipadic"),
+        yaml.contains("embedded://ipadic"),
         "config.yml must select the embedded dictionary, got:\n{yaml}"
     );
     Ok(())
