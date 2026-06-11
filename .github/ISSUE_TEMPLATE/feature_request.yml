@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest a new feature or enhancement for mdya.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing a feature request, please skim the [README](https://github.com/yoshihirosuzuki/mdya/blob/main/README.md) to understand mdya's scope.
+
+        mdya is a **search primitive**: local Markdown indexing and search, exposed via CLI and MCP. It is intentionally **not** a search agent, an LLM query rewriter, or a cloud-backed service. Proposals that move mdya outside that scope will be declined.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the problem?
+      description: The use case or pain point that motivates this request.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed feature
+      description: What you would like mdya to do, and roughly how it should look from the user's perspective (CLI flag, MCP tool, config option, etc.).
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case / workflow
+      description: A concrete example of when and how you'd use this feature in your workflow.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope acknowledgement
+      options:
+        - label: I have read the README and understand that mdya is local-first (no cloud LLM API) and distributed as a single binary. My proposal aligns with this scope.
+          required: true

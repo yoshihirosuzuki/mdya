@@ -1,0 +1,77 @@
+name: Bug report
+description: Report a defect, crash, incorrect result, or unexpected behavior in mdya.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Please fill out the fields below so the issue can be reproduced and fixed quickly.
+
+        For security vulnerabilities, do **not** open a public issue. See [SECURITY.md](https://github.com/yoshihirosuzuki/mdya/blob/main/SECURITY.md) for the private reporting channel.
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What did you try?
+      description: Command, MCP tool call, or sequence of operations. Include the exact arguments where relevant.
+      placeholder: |
+        e.g. `mdya search hybrid --collection notes -n 10 "embedding model"`
+    validations:
+      required: true
+
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened?
+      description: The actual output, error message, or behavior you observed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: What you thought would happen.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: mdya version
+      description: Output of `mdya --version`.
+      placeholder: "mdya 0.3.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: OS / architecture
+      options:
+        - macOS (arm64)
+        - macOS (x86_64)
+        - Linux (amd64)
+        - Linux (arm64)
+        - Windows (x86_64)
+        - Other (please specify in "Anything else?")
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output of running the same command with `RUST_LOG=mdya=debug`. Strip anything sensitive first.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Configuration snippets, collection size, related issues — anything that helps.
+    validations:
+      required: false

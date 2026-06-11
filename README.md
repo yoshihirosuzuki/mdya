@@ -2,6 +2,10 @@
 
 *English / [日本語](README.ja.md)*
 
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue.svg)](#license)
+[![Latest release](https://img.shields.io/github/v/release/yoshihirosuzuki/mdya)](https://github.com/yoshihirosuzuki/mdya/releases/latest)
+[![CI](https://github.com/yoshihirosuzuki/mdya/actions/workflows/ci.yml/badge.svg)](https://github.com/yoshihirosuzuki/mdya/actions/workflows/ci.yml)
+
 A small, fast search primitive for your local Markdown collections. BM25 full-text search, on-device vector search, and a hybrid that fuses both — exposed through two entry points: a **CLI** and an **MCP server**.
 
 ## Overview
@@ -134,6 +138,15 @@ just check    # fmt-check + clippy (-D warnings) + cargo test (full workspace)
 just smoke    # smoke tests only
 just          # list available recipes
 ```
+
+## Contributing
+
+Contributions are welcome on a best-effort basis (one-person maintainer; no formal SLA). Please read the following before opening an issue or PR:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — issue / PR workflow, build and test setup.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — Contributor Covenant.
+- [SECURITY.md](SECURITY.md) — private channels for security vulnerabilities.
+- [SUPPORT.md](SUPPORT.md) — where to ask questions.
 
 ## License
 

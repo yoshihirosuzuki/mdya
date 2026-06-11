@@ -1,0 +1,88 @@
+# Cross-platform PR-time smoke gate.
+#
+# Each runner does `cargo check --workspace` only — no link step, no test,
+# no release build. This catches OS-specific compile errors (Windows path
+# quirks, arch-dependent code) at PR time without paying the cold-cache
+# cost of a release build. `release.yml` handles the cargo-dist release
+# build; `verify.yml` is the pre-release 5-platform link verification with
+# the dynamic-link invariant check.
+#
+# `ubuntu-latest` is intentionally excluded — `ci.yml` already runs the
+# full lint + test suite on that platform, so this workflow covers only
+# the additional OS / arch combinations.
+#
+# `lance-encoding` invokes `protoc` and `xtask-generate-test-pdfs`
+# `include_bytes!`s Noto Sans CJK JP at compile time; both must be present
+# even for `cargo check`.
+#
+# Third-party actions are SHA-pinned, except `dtolnay/rust-toolchain@stable`
+# which is a channel ref by design (tracks latest stable Rust).
+
+name: cross-platform-smoke
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04-arm
+          - windows-latest
+          - macos-latest
+          - macos-15-intel
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install protoc -y
+
+      - name: Download Noto Sans CJK JP font for xtask (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          curl --proto '=https' --tlsv1.2 -fLsS \
+            -o xtask/generate-test-pdfs/fonts/NotoSansCJKjp-Regular.otf \
+            https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf
+
+      - name: Download Noto Sans CJK JP font for xtask (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf `
+            -OutFile xtask/generate-test-pdfs/fonts/NotoSansCJKjp-Regular.otf
+
+      - name: cargo check --workspace
+        run: cargo check --workspace

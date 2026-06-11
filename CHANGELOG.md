@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Contributor-facing community health files (`CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, `SUPPORT.md`, `CODEOWNERS`, issue / pull request templates).
+- README badges (license, latest release, CI status).
+- Dependabot weekly updates for Cargo and GitHub Actions dependencies.
+- Per-PR cross-platform `cargo check` smoke gate (Linux (arm64), Windows (x86_64), macOS (arm64 / x86_64)).
+- Weekly + per-PR `cargo audit` workflow against the RustSec advisory database.
+
 ## [0.3.0] - 2026-06-10
 
 ### Added
