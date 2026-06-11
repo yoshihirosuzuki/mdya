@@ -158,7 +158,7 @@ schemars = "1"
 # `=6.0.0` to mirror the existing `[dev-dependencies]` pin, which
 # itself matches the transitive version lancedb 0.29 resolves to.
 # Pure Rust, no `*-sys`.
-lance-index = "=6.0.0"
+lance-index = "=7.0.0"
 
 [features]
 default = []
@@ -176,7 +176,7 @@ tempfile = "3"
 futures = "0.3"
 arrow-array = "58"
 arrow-schema = "58"
-lance-index = "=6.0.0"
+lance-index = "=7.0.0"
 
 [profile.release]
 lto = "thin"
