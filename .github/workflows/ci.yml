@@ -65,10 +65,14 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # `lance-encoding`'s build script invokes `protoc`; the runner does not
-      # ship it. Installed via the OS package manager to keep the dependency
-      # surface minimal, matching `verify.yml`.
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # ship it. `lld` (the LLVM linker) is installed alongside it for the
+      # `cargo test --workspace` step: linking the workspace's test binaries
+      # (candle + lance + arrow statically linked across many binaries in
+      # parallel) intermittently crashed GNU `ld` with SIGBUS on the runner;
+      # `ld.lld` links with a far smaller memory/disk footprint. Both come from
+      # the OS package manager to keep the dependency surface minimal.
+      - name: Install protoc and lld
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler lld
 
       # `xtask-generate-test-pdfs` embeds Noto Sans CJK JP at compile time via
       # `include_bytes!`. The font (~16 MB) is `.gitignore`d to keep the repo
@@ -87,5 +91,10 @@ jobs:
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Link with `lld` (installed above) instead of GNU `ld` — see the
+      # install step's comment. Scoped to this step via `RUSTFLAGS` because
+      # only the test-binary link hit the limit; `fmt` / `clippy` do not link.
       - name: cargo test --workspace
         run: cargo test --workspace
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
