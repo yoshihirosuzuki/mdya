@@ -11,7 +11,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
-use tracing::info;
 
 use crate::cli::OutputFormat;
 use crate::config::{self, CollectionEntry, ConfigError, InvalidPathKind};
@@ -50,7 +49,8 @@ pub fn run(
     );
     config::save(&config_path, &cfg)?;
 
-    info!(name = %name, path = %expanded.display(), "collection added");
+    // Human status notice on stderr (stdout is reserved for piped data).
+    eprintln!("Added collection \"{}\" -> {}", name, expanded.display());
     Ok(())
 }
 

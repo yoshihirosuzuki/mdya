@@ -114,11 +114,10 @@ fd-lock = "4"
 # streams. Already in the tree transitively (tokio/lance); lifted to a direct
 # dep with no default features (`CancellationToken` needs none). Pure Rust.
 tokio-util = { version = "0.7", default-features = false }
-# Interactive progress UI for `mdya update-all`.
+# Interactive progress UI for `mdya update-all`. Log lines coexist with the
+# bars via `cli::log_writer`, which suspends the active `MultiProgress`
+# around each tracing event (no tracing-subscriber layer involved).
 indicatif = "0.18"
-# tracing-subscriber Layer that lets `tracing::info!` lines coexist with the
-# indicatif progress bars on stderr without redraw corruption.
-tracing-indicatif = "0.3"
 # RSS polling for the runtime memory guard. Default features
 # (component / disk / network / user) are disabled to keep transitive deps to
 # `system` only — the watchdog reads its own process's RSS and nothing else.

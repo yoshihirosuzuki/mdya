@@ -1,32 +1,37 @@
 //! Tracing-subscriber initialization.
 //!
 //! Resolution rules:
-//! - Level: `--log-level` > `RUST_LOG` env > `info`. `RUST_LOG` follows
-//!   the standard `tracing-subscriber` convention.
+//! - Level: `--log-level` > `RUST_LOG` env > `warn`. `RUST_LOG` follows
+//!   the standard `tracing-subscriber` convention. The `warn` default
+//!   keeps dependency INFO chatter (e.g. lance dataset-load events that
+//!   carry a misleading `status="error"`) off the default console; opt
+//!   in with `--log-level info` / `RUST_LOG=info`.
 //! - Format: `compact` (default) / `pretty` / `json`.
 //! - ANSI colors: `--no-color` flag > `NO_COLOR` env (Unix convention) > TTY
 //!   auto-detect on stderr.
 //! - All output goes to stderr (stdout is reserved for data / MCP JSON-RPC).
 //!
-//! `mdya update-all` renders an `indicatif` progress bar on stderr.
-//! To prevent `tracing::info!` events from clobbering the bar mid-
-//! redraw, the fmt layer writes through `IndicatifLayer`'s stderr-
-//! writer wrapper when stderr is a TTY. In non-TTY contexts the layer
-//! is skipped entirely: `IndicatifLayer::on_new_span` injects an
-//! `IndicatifSpanContext` into every span (not opt-in via
-//! `IndicatifSpanExt`), which would hijack every dependency-crate
-//! `#[instrument]` span and, with busy lance reads exceeding the
-//! default `max_progress_bars=7`, panic via `pb_manager`'s
-//! `debug_assert!` on a hidden footer.
+//! `mdya update-all` / `mdya vector use` render an `indicatif` progress
+//! bar on stderr. The fmt layer writes through
+//! [`log_writer::ProgressAwareStderr`], which suspends that bar around
+//! each event so a `tracing` line never lands mid-redraw. The bar is a
+//! plain `MultiProgress` owned by the command (see `update_all`); tracing
+//! does not render it.
 
 use std::io::{self, IsTerminal};
 
 use clap::ValueEnum;
-use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+use super::log_writer::ProgressAwareStderr;
+
+/// Default level when neither `--log-level` nor `RUST_LOG` is set. `warn`
+/// silences mdya's own INFO breadcrumbs and dependency INFO alike; the
+/// human-facing success / progress output is emitted outside `tracing`.
+const DEFAULT_LEVEL: &str = "warn";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 #[clap(rename_all = "lowercase")]
@@ -52,87 +57,49 @@ pub struct TracingOptions<'a> {
 pub fn init(opts: TracingOptions<'_>) -> Result<(), tracing_subscriber::filter::ParseError> {
     let filter = resolve_filter(opts.level_flag)?;
     let ansi = resolve_ansi(opts.no_color);
-    if io::stderr().is_terminal() {
-        init_for_tty(filter, ansi, opts.format);
-    } else {
-        init_for_non_tty(filter, ansi, opts.format);
+    let registry = tracing_subscriber::registry().with(filter);
+    let writer = ProgressAwareStderr;
+    match opts.format {
+        LogFormat::Compact => {
+            let _ = registry
+                .with(fmt::layer().with_writer(writer).with_ansi(ansi).compact())
+                .try_init();
+        }
+        LogFormat::Pretty => {
+            let _ = registry
+                .with(fmt::layer().with_writer(writer).with_ansi(ansi).pretty())
+                .try_init();
+        }
+        LogFormat::Json => {
+            let _ = registry
+                .with(fmt::layer().with_writer(writer).with_ansi(ansi).json())
+                .try_init();
+        }
     }
     Ok(())
 }
 
-/// TTY path: install `IndicatifLayer` and route the fmt writer through
-/// `get_stderr_writer()` so `update-all`'s progress bar survives
-/// concurrent `info!` emission.
-///
-/// Note: the `LogFormat` match below intentionally mirrors the one in
-/// [`init_for_non_tty`]. Sharing a helper is awkward because the writer
-/// types diverge (`IndicatifLayer`'s wrapper vs `fn() -> io::Stderr`);
-/// new `LogFormat` variants must be added to both functions.
-fn init_for_tty(filter: EnvFilter, ansi: bool, format: LogFormat) {
-    let indicatif_layer = IndicatifLayer::new();
-    let writer = indicatif_layer.get_stderr_writer();
-    let registry = tracing_subscriber::registry()
-        .with(filter)
-        .with(indicatif_layer);
-    match format {
-        LogFormat::Compact => {
-            let _ = registry
-                .with(fmt::layer().with_writer(writer).with_ansi(ansi).compact())
-                .try_init();
-        }
-        LogFormat::Pretty => {
-            let _ = registry
-                .with(fmt::layer().with_writer(writer).with_ansi(ansi).pretty())
-                .try_init();
-        }
-        LogFormat::Json => {
-            let _ = registry
-                .with(fmt::layer().with_writer(writer).with_ansi(ansi).json())
-                .try_init();
-        }
-    }
-}
-
-/// Non-TTY path: skip `IndicatifLayer` entirely. Even with the bar
-/// auto-hidden by `indicatif`, the layer still hijacks every
-/// dependency-crate `#[instrument]` span (see module-level doc) and
-/// trips `tracing-indicatif`'s `debug_assert!` when active spans
-/// exceed `max_progress_bars`.
-///
-/// The `LogFormat` match below mirrors [`init_for_tty`]; keep the
-/// two in sync when adding variants.
-fn init_for_non_tty(filter: EnvFilter, ansi: bool, format: LogFormat) {
-    let registry = tracing_subscriber::registry().with(filter);
-    let writer = io::stderr as fn() -> io::Stderr;
-    match format {
-        LogFormat::Compact => {
-            let _ = registry
-                .with(fmt::layer().with_writer(writer).with_ansi(ansi).compact())
-                .try_init();
-        }
-        LogFormat::Pretty => {
-            let _ = registry
-                .with(fmt::layer().with_writer(writer).with_ansi(ansi).pretty())
-                .try_init();
-        }
-        LogFormat::Json => {
-            let _ = registry
-                .with(fmt::layer().with_writer(writer).with_ansi(ansi).json())
-                .try_init();
-        }
-    }
-}
-
 fn resolve_filter(flag: Option<&str>) -> Result<EnvFilter, tracing_subscriber::filter::ParseError> {
+    resolve_filter_from(flag, std::env::var("RUST_LOG").ok())
+}
+
+/// Pure core of [`resolve_filter`] with the `RUST_LOG` value injected, so
+/// the precedence (`flag` > env > [`DEFAULT_LEVEL`]) is unit-testable
+/// without mutating process-wide env (`set_var` is `unsafe` in Edition
+/// 2024 because it races other threads in the test harness).
+fn resolve_filter_from(
+    flag: Option<&str>,
+    env_value: Option<String>,
+) -> Result<EnvFilter, tracing_subscriber::filter::ParseError> {
     if let Some(level) = flag {
+        // clap derive ValueEnum strings are already lowercase; EnvFilter is
+        // case-insensitive but we pass them through verbatim.
         return EnvFilter::try_new(level);
     }
-    if let Ok(value) = std::env::var("RUST_LOG")
-        && !value.is_empty()
-    {
+    if let Some(value) = env_value.filter(|v| !v.is_empty()) {
         return EnvFilter::try_new(value);
     }
-    Ok(EnvFilter::new("info"))
+    Ok(EnvFilter::new(DEFAULT_LEVEL))
 }
 
 fn resolve_ansi(no_color: bool) -> bool {
@@ -155,14 +122,26 @@ mod tests {
     }
 
     #[test]
-    fn filter_with_explicit_flag_returns_that_level() {
-        // Avoids touching process-wide env (set_var became `unsafe` in Edition
-        // 2024 precisely because it races with other threads in the test
-        // harness). Asserting "flag wins over env" by reading env would
-        // require serializing tests; instead we verify the flag path on its
-        // own — `resolve_filter` returns early on `Some(_)` and never reads
-        // env in that branch.
-        let filter = resolve_filter(Some("warn")).expect("parse");
+    fn explicit_flag_wins_over_env() {
+        let filter = resolve_filter_from(Some("error"), Some("info".to_string())).expect("parse");
+        assert!(format!("{filter}").contains("error"));
+    }
+
+    #[test]
+    fn env_used_when_flag_absent() {
+        let filter = resolve_filter_from(None, Some("info".to_string())).expect("parse");
+        assert!(format!("{filter}").contains("info"));
+    }
+
+    #[test]
+    fn default_is_warn_without_flag_or_env() {
+        let filter = resolve_filter_from(None, None).expect("parse");
+        assert!(format!("{filter}").contains("warn"));
+    }
+
+    #[test]
+    fn empty_env_falls_back_to_default() {
+        let filter = resolve_filter_from(None, Some(String::new())).expect("parse");
         assert!(format!("{filter}").contains("warn"));
     }
 }

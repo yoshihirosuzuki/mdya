@@ -25,6 +25,7 @@ use crate::embedding::{EmbedError, Embedder, ModelCache, ModelCacheError, build_
 use crate::ingest::{IngestError, IngestProgress, UpdateSummary, update_all_collections};
 use crate::store::{self, CHUNKS_TABLE_NAME, chunks_schema};
 
+use super::log_writer;
 use super::update_all::{IndicatifProgress, expand_collection_paths, resolve_embed_parallelism};
 
 #[derive(Debug, Error)]
@@ -97,14 +98,16 @@ pub(crate) async fn run(
         return Ok(());
     }
     // Read the parallelism for the progress UI before `cfg` moves into
-    // `switch_model` (which owns the rewrite). stdout carries the
-    // machine-facing summary, mirroring `mdya update-all`; the no-op /
-    // abort notices above go to stderr.
+    // `switch_model` (which owns the rewrite). The summary is a status
+    // notice, so it goes to stderr alongside the no-op / abort notices
+    // above (stdout stays empty), mirroring `mdya update-all`.
     let parallelism = resolve_embed_parallelism(&cfg.runtime);
-    let progress: Arc<dyn IngestProgress> =
-        Arc::new(IndicatifProgress::with_parallelism(parallelism));
+    let indicatif = IndicatifProgress::with_parallelism(parallelism);
+    let progress_guard = log_writer::register(indicatif.multiprogress());
+    let progress: Arc<dyn IngestProgress> = Arc::new(indicatif);
     let summary = switch_model(&base, cfg, embedder, progress, parallelism).await?;
-    println!("{}", format_switch_summary(model, &summary));
+    drop(progress_guard);
+    eprintln!("{}", format_switch_summary(model, &summary));
     if summary.failed > 0 {
         return Err(VectorUseError::FilesFailed(summary.failed));
     }

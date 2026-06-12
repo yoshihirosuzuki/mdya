@@ -279,7 +279,10 @@ pub async fn serve_http(config_dir: &Path, model_cache_dir: &Path, addr: &str) -
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     pid_lock::write_current_pid(&mut pid_guard, &pid_path)?;
-    tracing::info!("MCP HTTP daemon listening on http://{local}/mcp");
+    // Where the daemon is listening is user-facing startup status, not a
+    // diagnostic, so it goes to stderr as a human line — visible at the
+    // default `warn` log level (stdout is reserved for MCP JSON-RPC).
+    eprintln!("MCP HTTP daemon listening on http://{local}/mcp");
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {

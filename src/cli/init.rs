@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use lancedb::Connection;
 use thiserror::Error;
-use tracing::info;
 
 use crate::config;
 use crate::store::lance_lm::{LanceLmError, ensure_lindera_ipadic_config};
@@ -61,7 +60,8 @@ pub async fn run(config_dir_flag: Option<&Path>) -> Result<(), InitError> {
     let db = open_index_db(&base).await?;
     ensure_chunks_table(&db, &base).await?;
     ensure_sources_table(&db).await?;
-    info!(path = %base.display(), "mdya init complete");
+    // Human status notice on stderr (stdout is reserved for piped data).
+    eprintln!("Initialized mdya at {}", base.display());
     Ok(())
 }
 
