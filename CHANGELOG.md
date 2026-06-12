@@ -7,13 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-13
+
 ### Changed
 
 - **Breaking (MCP):** Consolidated the three search tools (`search_fts`, `search_vector`, `search_hybrid`) into a single `search` tool with a `mode` parameter (`"fts"` / `"vector"` / `"hybrid"`, default `"hybrid"`). MCP clients calling an old tool name must switch to `search` with the matching `mode`.
+- The default log level is now `warn` (was `info`), so dependency `INFO` chatter (e.g. lance's misleading `status="error"` dataset-load events) no longer appears on a clean run. Restore the old verbosity with `--log-level info` or `RUST_LOG=info`.
+- User-facing status (the `init` / `collection add` success lines and the MCP HTTP daemon's listening URL) now prints as plain text on stderr instead of as a log event, so it stays visible at the default log level.
+- **Breaking:** `mdya update-all` and `mdya vector use` print their completion summary to stderr instead of stdout; stdout is now empty for these commands (reserved for piped data).
 
 ### Removed
 
 - **Breaking (MCP):** Removed the `get_status` MCP tool. Index status remains available through the `mdya status` CLI command.
+
+### Fixed
+
+- `mdya update-all` no longer corrupts its progress display (duplicated bars / accumulated spinner rows) when log lines are emitted mid-render, and no longer panics in busy non-interactive (non-TTY) sessions. The progress bar is now rendered independently of the logging layer.
 
 ## [0.3.1] - 2026-06-12
 
