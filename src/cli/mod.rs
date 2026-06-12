@@ -6,6 +6,7 @@ mod collection;
 mod dim;
 mod get;
 mod init;
+mod log_writer;
 mod search;
 mod status;
 mod stress;
@@ -50,7 +51,7 @@ pub struct Cli {
     pub model_cache_dir: Option<PathBuf>,
 
     /// Tracing level (trace/debug/info/warn/error).
-    /// Fallback chain: this flag > `RUST_LOG` > `info`. (There is no
+    /// Fallback chain: this flag > `RUST_LOG` > `warn`. (There is no
     /// `MDYA_LOG` env binding; `RUST_LOG` keeps the same use case via
     /// `tracing-subscriber`'s standard sniff.)
     #[arg(long = "log-level", global = true)]

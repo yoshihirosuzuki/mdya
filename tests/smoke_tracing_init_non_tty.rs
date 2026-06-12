@@ -1,15 +1,15 @@
-//! Regression: `tracing_init::init` must skip `IndicatifLayer`
-//! attach in non-TTY subprocesses.
+//! Regression guard: a busy non-TTY ingest/get must not panic.
 //!
-//! Without the fix, `IndicatifLayer::on_new_span` hijacks every
-//! dependency-crate `#[tracing::instrument]` span (the layer inserts
-//! an `IndicatifSpanContext` unconditionally, not opt-in via
-//! `IndicatifSpanExt`). With a busy lance table the scan spawns >7
-//! concurrent active spans (default `max_progress_bars`), pushing the
-//! pending counter above zero. As the queue drains against a
-//! footer that `indicatif` auto-hides in non-TTY, tracing-indicatif's
-//! `pb_manager.rs:160`
-//! `debug_assert!(!footer_pb.is_hidden(), ...)` fires → panic.
+//! mdya no longer installs `tracing-indicatif`'s `IndicatifLayer`. That
+//! layer's `on_new_span` injected an `IndicatifSpanContext` into every
+//! span unconditionally (not opt-in via `IndicatifSpanExt`), hijacking
+//! dependency-crate `#[tracing::instrument]` spans. With a busy lance
+//! table the scan spawned more concurrent active spans than the default
+//! `max_progress_bars=7`; against a footer that `indicatif` auto-hides in
+//! non-TTY, tracing-indicatif's `debug_assert!(!footer_pb.is_hidden())`
+//! fired → panic. The layer is gone — progress bars now coexist with
+//! tracing via `cli::log_writer`, which suspends the active bar around
+//! each event — so this exercise must stay panic-free.
 //!
 //! Setup: library API + `MockEmbedder` (no model download) ingest
 //! 50 markdown docs. Verify: `mdya get` spawned as a non-TTY
@@ -38,11 +38,12 @@ use common::{LANCE_ENV_LOCK, ScopedLanceLanguageModelHome};
 const DEFAULT_MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
 const DEFAULT_VECTOR_DIM: usize = 256;
 
-/// Doc count chosen to exceed tracing-indicatif's default
-/// `max_progress_bars=7`. Lance's scan during `mdya get` spawns
-/// enough concurrent `#[instrument]` spans (`FilteredReadStream::
-/// read_fragment` and friends) to push the pending queue above zero,
-/// reproducing the panic precondition in non-TTY subprocesses.
+/// Doc count chosen to exceed the old `max_progress_bars=7` ceiling:
+/// lance's scan during `mdya get` spawns enough concurrent
+/// `#[instrument]` spans (`FilteredReadStream::read_fragment` and
+/// friends) to have tripped the former tracing-indicatif panic in
+/// non-TTY subprocesses. Kept as a regression guard now that the layer
+/// is gone.
 const DOC_COUNT: usize = 50;
 
 struct MockEmbedder;
@@ -134,7 +135,7 @@ async fn mdya_get_against_busy_db_does_not_panic_in_non_tty_subprocess() -> Resu
 
     // `assert_cmd`'s default stdio is `Stdio::piped()` on all three
     // streams, so the child binary sees a non-TTY stderr — exactly the
-    // environment that triggered the panic before the fix.
+    // environment that triggered the panic before the layer was removed.
     CliCommand::cargo_bin("mdya")?
         .args([
             "--config-dir",

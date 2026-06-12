@@ -57,6 +57,9 @@ fn update_all_indexes_one_markdown_file_end_to_end() {
         .arg("update-all")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Indexed 1 documents"))
-        .stdout(predicate::str::contains("new: 1"));
+        // The completion summary is a status notice on stderr; stdout
+        // stays empty for `update-all` (it has no piped artifact).
+        .stderr(predicate::str::contains("Indexed 1 documents"))
+        .stderr(predicate::str::contains("new: 1"))
+        .stdout(predicate::str::is_empty());
 }

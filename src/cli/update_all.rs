@@ -13,6 +13,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use thiserror::Error;
 use tracing::warn;
 
+use super::log_writer;
 use crate::config;
 use crate::embedding::{EmbedError, Embedder, ModelCache, ModelCacheError, build_embedder};
 use crate::ingest::{
@@ -31,11 +32,17 @@ pub async fn run(
     let parallelism = resolve_embed_parallelism(&cfg.runtime);
     let embedder: Arc<dyn Embedder> =
         build_embedder(&cfg.embedding.model, &cfg.embedding.ollama.endpoint, &cache).await?;
-    let progress: Arc<dyn IngestProgress> =
-        Arc::new(IndicatifProgress::with_parallelism(parallelism));
+    let indicatif = IndicatifProgress::with_parallelism(parallelism);
+    // Suspend the bars around tracing output for the duration of the run
+    // so file-level `warn!`s print above the bar instead of corrupting it.
+    let progress_guard = log_writer::register(indicatif.multiprogress());
+    let progress: Arc<dyn IngestProgress> = Arc::new(indicatif);
     let summary =
         update_all_collections(&collections, &base, embedder, progress, parallelism).await?;
-    println!("{}", format_summary(&summary));
+    drop(progress_guard);
+    // The completion summary is a status notice, not piped data, so it
+    // goes to stderr (stdout stays empty for this command).
+    eprintln!("{}", format_summary(&summary));
     if summary.failed > 0 {
         return Err(UpdateAllError::FilesFailed(summary.failed));
     }
@@ -91,15 +98,12 @@ fn format_summary(s: &UpdateSummary) -> String {
 /// which files the parallel ingest is touching right now. With
 /// `parallelism == 1` the pool collapses to a single spinner.
 ///
-/// **Known limitation**: this
-/// owns its own `MultiProgress`, separate from the one inside
-/// `tracing-indicatif`'s `IndicatifLayer`. `IndicatifLayer::get_stderr_writer()`
-/// only suspends bars owned by the layer's internal MP, so the bars
-/// here can in theory be partially redrawn over by a `tracing::info!`
-/// emitted in between two `inc(1)` calls. In practice `tracing::info!`
-/// output is low-frequency during ingest and `indicatif` hides the
-/// bars entirely when stderr is not a TTY (e.g. CI / piped output),
-/// so the artifact is bounded to interactive sessions.
+/// The bars live in a single `MultiProgress` that owns the stderr draw
+/// target. While ingest runs the caller registers that `MultiProgress`
+/// via [`log_writer::register`] so the tracing fmt layer suspends the
+/// bars around each event — diagnostics print above the bar instead of
+/// corrupting it. `indicatif` hides the bars entirely on a non-TTY
+/// stderr (e.g. CI / piped output).
 pub struct IndicatifProgress {
     /// File-completion counter; `inc(1)` per `finish_file` call.
     bar: ProgressBar,
@@ -109,10 +113,10 @@ pub struct IndicatifProgress {
     /// displaying `path`. `start_file` takes the first free slot;
     /// `finish_file` releases the slot whose `path` matches.
     slots: Mutex<Vec<Option<PathBuf>>>,
-    // Held only to keep the MultiProgress alive (its draw target owns
-    // the redraw thread). The trait methods drive `bar` / `spinners`
-    // directly; `_multi` does not need to be touched after construction.
-    _multi: MultiProgress,
+    /// Owns the stderr draw target (and its redraw thread). The trait
+    /// methods drive `bar` / `spinners` directly; this handle is also
+    /// registered with `log_writer` so log lines suspend the bars.
+    multi: MultiProgress,
 }
 
 impl IndicatifProgress {
@@ -149,8 +153,15 @@ impl IndicatifProgress {
             bar,
             spinners,
             slots,
-            _multi: multi,
+            multi,
         }
+    }
+
+    /// The `MultiProgress` owning these bars, for registration with
+    /// [`log_writer::register`] so concurrent log lines suspend the bars
+    /// instead of corrupting them.
+    pub fn multiprogress(&self) -> &MultiProgress {
+        &self.multi
     }
 }
 
@@ -240,11 +251,11 @@ pub enum UpdateAllError {
     Ingest(#[from] IngestError),
 
     /// At least one file produced a per-file error during ingest. The
-    /// `update_all_collections` summary line was still printed to stdout
-    /// so the user sees which counter is non-zero; this variant exists
-    /// so `main` propagates exit-1 to the shell (grill Q5). The
-    /// per-file `tracing::warn!` lines emitted during ingest carry the
-    /// specific path / reason for each failure.
+    /// `update_all_collections` summary line is still printed (to stderr)
+    /// so the user sees which counter is non-zero; this variant exists so
+    /// `main` propagates exit-1 to the shell. The per-file
+    /// `tracing::warn!` lines emitted during ingest carry the specific
+    /// path / reason for each failure.
     #[error("{0} file(s) failed during ingest — check warnings above for details")]
     FilesFailed(u64),
 }

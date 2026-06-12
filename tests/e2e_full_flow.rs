@@ -70,13 +70,15 @@ fn golden_path_init_to_mcp_through_real_binary() -> Result<()> {
         .assert()
         .success();
 
-    // 3. update-all → ingest summary for the one new document.
+    // 3. update-all → ingest summary for the one new document. The
+    // summary is a status notice on stderr; stdout stays empty.
     mdya(config_dir)
         .arg("update-all")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Indexed 1 documents"))
-        .stdout(predicate::str::contains("new: 1"));
+        .stderr(predicate::str::contains("Indexed 1 documents"))
+        .stderr(predicate::str::contains("new: 1"))
+        .stdout(predicate::str::is_empty());
 
     // 4-6. each search mode returns at least one hit. `score=` only
     // appears on a hit header (zero hits emit the footer alone), so it is
