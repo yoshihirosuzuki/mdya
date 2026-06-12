@@ -331,10 +331,11 @@ async fn axis_f_pretokenised_whitespace_fts() -> Result<()> {
 // ───────────────────────────── axis G — production path ───────────────────
 
 /// The production design end-to-end: redirect `LANCE_LANGUAGE_MODEL_HOME`
-/// to a tempdir, write the tiny `config.yml` (`kind: ipadic`), and call
-/// `create_index(FTS, "lindera/ipadic")`. Requires the `lindera/ipadic`
-/// cargo feature to be enabled on mdya (= embedded IPADIC dictionary),
-/// otherwise `load_dictionary_from_kind(IPADIC)` falls to the `_` arm
+/// to a tempdir, write the tiny `config.yml` (`embedded://ipadic`), and
+/// call `create_index(FTS, "lindera/ipadic")`. Requires the
+/// `lindera/embed-ipadic` cargo feature to be enabled on mdya
+/// (= embedded IPADIC dictionary), otherwise the `embedded://ipadic`
+/// scheme is not registered and `LinderaTokenizer::from_file` fails
 /// with `"Invalid dictionary type: IPADIC"`.
 #[tokio::test]
 #[ignore = "verifies real Lance behaviour; run via `just lindera-ipadic-verify`"]
