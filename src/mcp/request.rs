@@ -1,5 +1,7 @@
-//! MCP tool input schema. The three `search_*` tools share this one
-//! deserialization boundary type.
+//! MCP tool input schema for the `search` tool.
+//!
+//! The search mode is a `mode` field (defaulting to hybrid), not encoded
+//! in the tool name, so one tool covers BM25 / vector / hybrid.
 //!
 //! This is intentionally distinct from [`crate::search::SearchRequest`]:
 //! the wire field is `k` (MCP convention) whereas the engine field is
@@ -7,15 +9,15 @@
 //! the `k` → `limit` rename once, at the tool boundary, so the engine
 //! never sees the MCP-specific spelling. The `level` field defaults to
 //! `Doc`, matching the CLI default, and the boundary flows it straight
-//! into the engine request.
+//! into the engine request; `mode` is read by the tool to pick the engine
+//! method and so is not part of the engine request.
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::search::SearchLevel;
+use crate::search::{SearchLevel, SearchMode};
 
-/// Input for every `search_*` MCP tool. The search mode is carried by the
-/// tool name, not a field, so all three tools deserialize the same shape.
+/// Input for the `search` MCP tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     /// Search query string. Empty or whitespace-only is rejected.
@@ -36,6 +38,12 @@ pub struct SearchRequest {
     /// passage. Omitting the field is equivalent to `"doc"`.
     #[serde(default)]
     pub level: SearchLevel,
+
+    /// Search backend: `"fts"` (BM25 keyword), `"vector"` (semantic
+    /// cosine), or `"hybrid"` (both, fused with RRF). Omitting the field
+    /// is equivalent to `"hybrid"`, the general-purpose default.
+    #[serde(default)]
+    pub mode: SearchMode,
 }
 
 fn default_k() -> u32 {

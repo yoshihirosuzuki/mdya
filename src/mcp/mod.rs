@@ -1,12 +1,11 @@
-//! MCP server exposing the search tools (`search_fts` / `search_vector`
-//! / `search_hybrid`, which share one [`SearchEngine`] and one
-//! [`request::SearchRequest`] shape with the mode carried by the tool
-//! name), plus `get_document` and the `list_collections` / `get_status`
-//! introspection tools.
+//! MCP server exposing three tools: `search` (one [`SearchEngine`] over
+//! one [`request::SearchRequest`], with the backend chosen by a `mode`
+//! field — BM25 / vector / hybrid), `get_document`, and the
+//! `list_collections` introspection tool.
 //!
 //! The embedder (`cl-nagoya/ruri-v3-30m`, ~140 MB) is loaded lazily on
-//! the first `search_vector` / `search_hybrid` call via a shared
-//! [`OnceCell`], so `mdya mcp` startup and `search_fts` stay
+//! the first `mode: "vector"` / `mode: "hybrid"` search via a shared
+//! [`OnceCell`], so `mdya mcp` startup and `mode: "fts"` searches stay
 //! download-free. FTS needs no embedder at all.
 
 mod error;
@@ -38,8 +37,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::embedding::{EmbedError, Embedder, ModelCache, RURI_V3_30M_DIM, RuriV3_30m};
 use crate::get::{get_chunk, get_document};
-use crate::introspect::{self, CollectionListReport, StatusReport};
-use crate::search::{SearchEngine, SearchError, SearchResponse};
+use crate::introspect::{self, CollectionListReport};
+use crate::search::{SearchEngine, SearchError, SearchMode, SearchResponse};
 
 /// Structured output for the `get_document` tool. Echoes the
 /// `(collection, path)` locator alongside the faithful original text so
@@ -55,10 +54,10 @@ pub struct GetDocumentResponse {
 /// Human-readable guidance returned in the MCP `initialize` handshake so
 /// clients can pick the right tool without out-of-band docs.
 const SERVER_INSTRUCTIONS: &str = "mdya is a local Markdown retrieval server. \
-Use `search_fts` for exact keyword or phrase lookups (BM25), `search_vector` for \
-semantic meaning-based search, and `search_hybrid` to combine both (BM25 + vector, \
-fused with RRF). Every search tool takes `query`, an optional `k` (top-N, default 20), \
-an optional `collections` filter (empty = all collections), and an optional `level` \
+Use `search` to find content: it takes `query`, an optional `mode` (`\"hybrid\"` default — \
+BM25 + vector fused with RRF; `\"fts\"` for exact keyword or phrase lookups via BM25; \
+`\"vector\"` for semantic meaning-based search), an optional `k` (top-N, default 20), an \
+optional `collections` filter (empty = all collections), and an optional `level` \
 (`\"doc\"` default, or `\"chunk\"`). With `level: \"doc\"` each hit is one document \
 (one per `(collection, path)`) carrying the max chunk score and a `matched_chunks` \
 count; with `level: \"chunk\"` you get the raw chunk-level passages including \
@@ -66,8 +65,7 @@ count; with `level: \"chunk\"` you get the raw chunk-level passages including \
 document's full original text, or add `chunk` (a `chunk_sequence` from a \
 `level: \"chunk\"` hit) to fetch one chunk's body — the middle ground between the \
 short snippet and the full document. Use `list_collections` to see the available collections \
-(name, path, description, document count) and `get_status` for index health (server \
-version, embedding model, vector dimension, and row counts).";
+(name, path, description, document count).";
 
 #[derive(Clone)]
 pub struct Server {
@@ -100,7 +98,7 @@ impl Server {
     ///
     /// `model_cache_dir` is held verbatim and only consulted
     /// when [`Server::get_or_load_embedder`] runs (first
-    /// `search_vector` / `search_hybrid`).
+    /// `mode: "vector"` / `mode: "hybrid"` search).
     pub async fn new(config_dir: &Path, model_cache_dir: &Path) -> Result<Self> {
         let cfg = config::load(&config_dir.join("config.yml"))?;
         let dim = i32::try_from(RURI_V3_30M_DIM).expect("RURI_V3_30M_DIM (256) fits in i32");
@@ -140,51 +138,23 @@ impl Server {
     }
 
     #[tool(
-        description = "BM25 (lindera/ipadic) full-text search over Markdown collections. \
-                       Returns doc-level hits by default (one per `(collection, path)` \
-                       with the max chunk score and a `matched_chunks` count); pass \
-                       `level: \"chunk\"` for raw chunk-level passages."
+        description = "Search Markdown collections. `mode` selects the backend: \
+                       `\"hybrid\"` (default; BM25 + vector fused with RRF), `\"fts\"` \
+                       (BM25 keyword/phrase via lindera/ipadic), or `\"vector\"` (cosine \
+                       semantic). Returns doc-level hits by default (one per \
+                       `(collection, path)` with the max chunk score and a `matched_chunks` \
+                       count); pass `level: \"chunk\"` for raw chunk-level passages."
     )]
-    pub async fn search_fts(
+    pub async fn search(
         &self,
         Parameters(req): Parameters<SearchRequest>,
     ) -> Result<Json<SearchResponse>, Json<McpToolError>> {
-        self.run_fts(req)
-            .await
-            .map(Json)
-            .map_err(|e| Json(McpToolError::from(e)))
-    }
-
-    #[tool(
-        description = "Vector (cosine) semantic search over Markdown collections. \
-                       Returns doc-level hits by default (one per `(collection, path)` \
-                       with the max chunk score and a `matched_chunks` count); pass \
-                       `level: \"chunk\"` for raw chunk-level passages."
-    )]
-    pub async fn search_vector(
-        &self,
-        Parameters(req): Parameters<SearchRequest>,
-    ) -> Result<Json<SearchResponse>, Json<McpToolError>> {
-        self.run_vector(req)
-            .await
-            .map(Json)
-            .map_err(|e| Json(McpToolError::from(e)))
-    }
-
-    #[tool(
-        description = "Hybrid (BM25 + vector, RRF) search over Markdown collections. \
-                       Returns doc-level hits by default (one per `(collection, path)` \
-                       with the max chunk score and a `matched_chunks` count); pass \
-                       `level: \"chunk\"` for raw chunk-level passages."
-    )]
-    pub async fn search_hybrid(
-        &self,
-        Parameters(req): Parameters<SearchRequest>,
-    ) -> Result<Json<SearchResponse>, Json<McpToolError>> {
-        self.run_hybrid(req)
-            .await
-            .map(Json)
-            .map_err(|e| Json(McpToolError::from(e)))
+        let result = match req.mode {
+            SearchMode::Fts => self.run_fts(req).await,
+            SearchMode::Vector => self.run_vector(req).await,
+            SearchMode::Hybrid => self.run_hybrid(req).await,
+        };
+        result.map(Json).map_err(|e| Json(McpToolError::from(e)))
     }
 
     #[tool(
@@ -221,17 +191,6 @@ impl Server {
     )]
     pub async fn list_collections(&self) -> Result<Json<CollectionListReport>, Json<McpToolError>> {
         introspect::collection_list(Some(&self.config_dir))
-            .await
-            .map(Json)
-            .map_err(|e| Json(McpToolError::from(e)))
-    }
-
-    #[tool(
-        description = "Report index status: server version, embedding model, vector dimension, \
-                       and the collection / chunk / document counts."
-    )]
-    pub async fn get_status(&self) -> Result<Json<StatusReport>, Json<McpToolError>> {
-        introspect::status(Some(&self.config_dir))
             .await
             .map(Json)
             .map_err(|e| Json(McpToolError::from(e)))

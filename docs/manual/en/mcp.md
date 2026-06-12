@@ -33,19 +33,18 @@ This registers the MCP server under the name `mdya` and makes its tools availabl
 
 The mdya MCP server provides the following tools.
 
-### Search tools
+### Search tool
 
 | Tool | Description |
 |---|---|
-| `search_fts` | BM25 full-text search |
-| `search_vector` | Cosine-similarity vector search |
-| `search_hybrid` | Fuses `search_fts` and `search_vector` via RRF |
+| `search` | Search Markdown collections; `mode` selects the backend (BM25 / vector / hybrid) |
 
-All three tools accept the same input schema.
+Input schema:
 
 ```json
 {
   "query": "release plan",
+  "mode": "hybrid",
   "k": 20,
   "collections": ["notes"],
   "level": "doc"
@@ -53,6 +52,7 @@ All three tools accept the same input schema.
 ```
 
 - `query` (required) — search query string. Empty or whitespace-only is an error.
+- `mode` (optional, default `"hybrid"`) — search backend: `"fts"` (BM25 keyword/phrase), `"vector"` (cosine semantic), or `"hybrid"` (both, fused with RRF).
 - `k` (optional, default `20`) — top N hits. `0` is an error.
 - `collections` (optional) — filter by collection name. Omitted or empty array means all collections. Unknown collection names are an error.
 - `level` (optional, default `"doc"`) — hit granularity. `"doc"` returns aggregated hits per document; `"chunk"` returns one hit per matched chunk.
@@ -81,7 +81,7 @@ The output matches the CLI's `--format json` envelope.
 
 At `level: "doc"` (default), hits are aggregated per document and each hit's `matched_chunks` counts how many chunks within the document matched. Passing `level: "chunk"` returns hits at chunk granularity, and each hit carries `chunk_sequence` (the 0-indexed chunk number).
 
-The numeric range of `score` differs per tool (see [the three modes in commands.md](commands.md#the-three-modes)).
+The numeric range of `score` differs per mode (see [the three modes in commands.md](commands.md#the-three-modes)).
 
 ### Document retrieval tool
 
@@ -110,14 +110,13 @@ Output:
 
 You can pass the `collection` and `path` from a search hit directly to retrieve its source text.
 
-### Index introspection tools
+### Index introspection tool
 
 | Tool | Description |
 |---|---|
 | `list_collections` | List registered collections |
-| `get_status` | Index state |
 
-Neither tool takes any input. The output shape matches `mdya collection list --format json` and `mdya status --format json` respectively (see [commands.md](commands.md)).
+It takes no input. The output shape matches `mdya collection list --format json` (see [commands.md](commands.md)).
 
 ## Error behavior
 

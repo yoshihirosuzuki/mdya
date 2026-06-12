@@ -3,10 +3,10 @@
 //! populated by `update_all_collections` + `MockEmbedder`, bypassing
 //! the stdio transport. The transport / `list_tools` / on-the-wire
 //! error surface lives in `smoke_mcp_stdio.rs` (process layer); this
-//! file pins the tool *logic*: search mode echo + reachable hits +
-//! the `k` → `limit` default, the validation →
+//! file pins the tool *logic*: `search` mode dispatch + echo + reachable
+//! hits + the `k` → `limit` default, the validation →
 //! `Err(Json<McpToolError>)` mapping, `get_document`, and the
-//! `list_collections` / `get_status` introspection tools.
+//! `list_collections` introspection tool.
 //!
 //! `Server::with_seeded_embedder` pre-fills the embedder `OnceCell` with
 //! `MockEmbedder`, so these tests never download the ~140 MB
@@ -141,19 +141,20 @@ async fn seeded_server(tmp: &TempDir) -> Result<Server> {
     ))
 }
 
-fn req(query: &str, k: u32, collections: Vec<String>) -> SearchRequest {
+fn req(query: &str, k: u32, collections: Vec<String>, mode: &str) -> SearchRequest {
     serde_json::from_value(serde_json::json!({
         "query": query,
         "k": k,
         "collections": collections,
+        "mode": mode,
     }))
     .expect("valid MCP SearchRequest JSON")
 }
 
-// ---------- happy path: each tool echoes its mode and reaches hits ----------
+// ---------- happy path: `search` dispatches on `mode` and reaches hits ----------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn search_fts_returns_fts_envelope_with_hits() -> Result<()> {
+async fn search_with_fts_mode_returns_fts_envelope_with_hits() -> Result<()> {
     let _env_lock = LANCE_ENV_LOCK.lock().await;
     let tmp = TempDir::new()?;
     let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
@@ -161,7 +162,7 @@ async fn search_fts_returns_fts_envelope_with_hits() -> Result<()> {
 
     let resp = tool_ok(
         server
-            .search_fts(Parameters(req("release", 20, vec![])))
+            .search(Parameters(req("release", 20, vec![], "fts")))
             .await,
     );
 
@@ -171,7 +172,7 @@ async fn search_fts_returns_fts_envelope_with_hits() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn search_vector_returns_vector_envelope_with_hits() -> Result<()> {
+async fn search_with_vector_mode_returns_vector_envelope_with_hits() -> Result<()> {
     let _env_lock = LANCE_ENV_LOCK.lock().await;
     let tmp = TempDir::new()?;
     let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
@@ -179,7 +180,7 @@ async fn search_vector_returns_vector_envelope_with_hits() -> Result<()> {
 
     let resp = tool_ok(
         server
-            .search_vector(Parameters(req("release", 20, vec![])))
+            .search(Parameters(req("release", 20, vec![], "vector")))
             .await,
     );
 
@@ -189,7 +190,7 @@ async fn search_vector_returns_vector_envelope_with_hits() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn search_hybrid_returns_hybrid_envelope_with_hits() -> Result<()> {
+async fn search_with_hybrid_mode_returns_hybrid_envelope_with_hits() -> Result<()> {
     let _env_lock = LANCE_ENV_LOCK.lock().await;
     let tmp = TempDir::new()?;
     let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
@@ -197,7 +198,7 @@ async fn search_hybrid_returns_hybrid_envelope_with_hits() -> Result<()> {
 
     let resp = tool_ok(
         server
-            .search_hybrid(Parameters(req("release", 20, vec![])))
+            .search(Parameters(req("release", 20, vec![], "hybrid")))
             .await,
     );
 
@@ -206,7 +207,23 @@ async fn search_hybrid_returns_hybrid_envelope_with_hits() -> Result<()> {
     Ok(())
 }
 
-// ---------- the `k` → `limit` rename + default ----------
+// ---------- defaults: omitted `mode` runs hybrid, omitted `k` is 20 ----------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn omitted_mode_defaults_to_hybrid_in_envelope() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
+    let server = seeded_server(&tmp).await?;
+
+    // Omitting `mode` exercises SearchMode's Default on deserialize; the
+    // envelope's echoed `mode` proves the `search` tool dispatched to hybrid.
+    let omitted: SearchRequest = serde_json::from_value(serde_json::json!({ "query": "release" }))?;
+    assert_eq!(omitted.mode, SearchMode::Hybrid);
+    let resp = tool_ok(server.search(Parameters(omitted)).await);
+    assert_eq!(resp.mode, SearchMode::Hybrid);
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn omitted_k_defaults_to_twenty_in_envelope() -> Result<()> {
@@ -219,7 +236,7 @@ async fn omitted_k_defaults_to_twenty_in_envelope() -> Result<()> {
     // `limit` proves the `k` → `limit` rename carried the default through.
     let omitted: SearchRequest = serde_json::from_value(serde_json::json!({ "query": "release" }))?;
     assert_eq!(omitted.k, 20);
-    let resp = tool_ok(server.search_fts(Parameters(omitted)).await);
+    let resp = tool_ok(server.search(Parameters(omitted)).await);
     assert_eq!(resp.limit, 20);
     Ok(())
 }
@@ -233,7 +250,7 @@ async fn explicit_k_carries_into_limit() -> Result<()> {
 
     let resp = tool_ok(
         server
-            .search_fts(Parameters(req("release", 5, vec![])))
+            .search(Parameters(req("release", 5, vec![], "fts")))
             .await,
     );
     assert_eq!(resp.limit, 5);
@@ -245,25 +262,27 @@ async fn explicit_k_carries_into_limit() -> Result<()> {
 // The MCP error contract is `Result<_, Json<McpToolError>>`:
 // a stable `code`, the source error's
 // `Display` as `message`, and per-code `details`. The empty-query case is
-// checked on all three tools to prove each routes through the shared
-// `validate`; the other two rules (zero limit, unknown collection) are
-// checked once each — on a different tool — because the rule logic itself
-// is engine-tested and re-running it per tool would only re-prove the
-// routing.
+// checked on all three modes to prove each dispatch path routes through the
+// shared `validate`; the other two rules (zero limit, unknown collection)
+// are checked once each — on a different mode — because the rule logic
+// itself is engine-tested and re-running it per mode would only re-prove
+// the routing.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_query_is_err_for_every_tool() -> Result<()> {
+async fn empty_query_is_err_for_every_mode() -> Result<()> {
     let _env_lock = LANCE_ENV_LOCK.lock().await;
     let tmp = TempDir::new()?;
     let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
     let server = seeded_server(&tmp).await?;
 
-    let fts = server.search_fts(Parameters(req("   ", 20, vec![]))).await;
+    let fts = server
+        .search(Parameters(req("   ", 20, vec![], "fts")))
+        .await;
     let vector = server
-        .search_vector(Parameters(req("   ", 20, vec![])))
+        .search(Parameters(req("   ", 20, vec![], "vector")))
         .await;
     let hybrid = server
-        .search_hybrid(Parameters(req("   ", 20, vec![])))
+        .search(Parameters(req("   ", 20, vec![], "hybrid")))
         .await;
     for boxed in [
         fts.err().expect("fts rejects empty query"),
@@ -290,7 +309,7 @@ async fn zero_k_is_invalid_limit_error() -> Result<()> {
     let server = seeded_server(&tmp).await?;
 
     let err = server
-        .search_vector(Parameters(req("release", 0, vec![])))
+        .search(Parameters(req("release", 0, vec![], "vector")))
         .await
         .err()
         .expect("zero k rejected")
@@ -312,7 +331,12 @@ async fn unknown_collection_is_err_with_typo_hint() -> Result<()> {
     let server = seeded_server(&tmp).await?;
 
     let err = server
-        .search_hybrid(Parameters(req("release", 20, vec!["ghost".to_string()])))
+        .search(Parameters(req(
+            "release",
+            20,
+            vec!["ghost".to_string()],
+            "hybrid",
+        )))
         .await
         .err()
         .expect("unknown collection rejected")
@@ -450,7 +474,7 @@ async fn get_document_with_out_of_range_chunk_carries_chunk_sequence_in_details(
     Ok(())
 }
 
-// ---------- introspection: list_collections / get_status ----------
+// ---------- introspection: list_collections ----------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_collections_reports_notes_with_document_count() -> Result<()> {
@@ -467,25 +491,5 @@ async fn list_collections_reports_notes_with_document_count() -> Result<()> {
         .expect("notes collection present");
     // seeded_server ingests release.md + other.md into `notes`.
     assert_eq!(notes.document_count, 2);
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_status_reports_pins_and_counts() -> Result<()> {
-    let _env_lock = LANCE_ENV_LOCK.lock().await;
-    let tmp = TempDir::new()?;
-    let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
-    let server = seeded_server(&tmp).await?;
-
-    let report = tool_ok(server.get_status().await);
-    assert_eq!(report.embedding_model, DEFAULT_MODEL_ID);
-    assert_eq!(report.vector_dim, DEFAULT_VECTOR_DIM as u32);
-    assert_eq!(report.collections, 1);
-    assert_eq!(report.sources, 2);
-    assert!(
-        report.chunks >= 2,
-        "expected >=2 chunks, got {}",
-        report.chunks
-    );
     Ok(())
 }

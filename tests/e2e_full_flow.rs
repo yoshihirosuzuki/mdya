@@ -90,7 +90,7 @@ fn golden_path_init_to_mcp_through_real_binary() -> Result<()> {
     }
 
     // 7. the MCP server, on the same ingested corpus, advertises the
-    // three search tools and answers a `search_fts` call with a hit.
+    // `search` tool and answers a `mode: "fts"` search call with a hit.
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -106,16 +106,17 @@ async fn assert_mcp_lists_tools_and_answers_fts(config_dir: &str) -> Result<()> 
 
     let tools = client.list_all_tools().await?;
     let names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
-    for expected in ["search_fts", "search_vector", "search_hybrid"] {
+    for expected in ["search", "get_document", "list_collections"] {
         assert!(names.contains(&expected), "missing `{expected}`: {names:?}");
     }
 
     let mut args = Map::new();
     args.insert("query".to_string(), json!(QUERY));
+    args.insert("mode".to_string(), json!("fts"));
     let result = client
-        .call_tool(CallToolRequestParams::new("search_fts").with_arguments(args))
+        .call_tool(CallToolRequestParams::new("search").with_arguments(args))
         .await?;
-    assert_eq!(result.is_error, Some(false), "search_fts call errored");
+    assert_eq!(result.is_error, Some(false), "search call errored");
     let resp = parse_search_response(result.structured_content.as_ref());
     assert_eq!(resp.mode, SearchMode::Fts);
     assert!(!resp.hits.is_empty(), "expected a hit, got {resp:?}");
@@ -126,6 +127,6 @@ async fn assert_mcp_lists_tools_and_answers_fts(config_dir: &str) -> Result<()> 
 }
 
 fn parse_search_response(structured: Option<&serde_json::Value>) -> SearchResponse {
-    let value = structured.expect("search_fts tool returns structured_content");
+    let value = structured.expect("search tool returns structured_content");
     serde_json::from_value(value.clone()).expect("structured_content is a SearchResponse")
 }

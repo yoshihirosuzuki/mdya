@@ -2,10 +2,11 @@
 //! list` and `mdya status`. This module *gathers* the data; [`output`]
 //! renders it.
 //!
-//! The report types are the CLI / MCP shared shape that the MCP
-//! `list_collections` / `get_status` tools mirror, so they live in the
-//! library (not the CLI) and serialise through serde — `mdya search`
-//! ⇄ `search_*` works the same way (`search::SearchResponse`).
+//! The collection-list report is the CLI / MCP shared shape that the MCP
+//! `list_collections` tool mirrors (the status report is CLI-only), so the
+//! report types live in the library (not the CLI) and serialise through
+//! serde — `mdya search` ⇄ the MCP `search` tool works the same way
+//! (`search::SearchResponse`).
 
 pub mod output;
 
