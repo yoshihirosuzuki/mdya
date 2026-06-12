@@ -2,7 +2,7 @@
 //! binary in `mcp` mode, and talk to it as an MCP client over its
 //! stdin/stdout. Verifies the real binary path (not just the library)
 //! wires rmcp + tokio + stdio on every supported platform, and that the
-//! three `search_*` tools are advertised.
+//! `search` / `get_document` / `list_collections` tools are advertised.
 //!
 //! Stays download- and index-free: `mdya init` creates an empty `chunks`
 //! table, and the one tool call uses an empty `query` so the engine's
@@ -39,13 +39,7 @@ async fn mcp_stdio_advertises_search_tools_and_surfaces_validation_error() -> Re
 
     let tools = client.list_all_tools().await?;
     let tool_names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
-    for expected in [
-        "search_fts",
-        "search_vector",
-        "search_hybrid",
-        "list_collections",
-        "get_status",
-    ] {
+    for expected in ["search", "get_document", "list_collections"] {
         assert!(
             tool_names.contains(&expected),
             "expected `{expected}` tool, got {tool_names:?}"
@@ -60,10 +54,12 @@ async fn mcp_stdio_advertises_search_tools_and_surfaces_validation_error() -> Re
     // which rmcp surfaces as a `CallToolResult` flagged `is_error` whose
     // `structured_content` carries `{ code, message, details }`; the same
     // JSON is mirrored in the text content for backwards compatibility.
+    // `mode: "fts"` keeps this empty-query rejection embedder-free.
     let mut args = Map::new();
     args.insert("query".to_string(), json!(""));
+    args.insert("mode".to_string(), json!("fts"));
     let result = client
-        .call_tool(CallToolRequestParams::new("search_fts").with_arguments(args))
+        .call_tool(CallToolRequestParams::new("search").with_arguments(args))
         .await?;
     assert_eq!(result.is_error, Some(true), "expected error result");
     let structured = result
@@ -84,6 +80,20 @@ async fn mcp_stdio_advertises_search_tools_and_surfaces_validation_error() -> Re
     assert!(
         text.contains("query must be non-empty"),
         "expected validation message, got: {text}"
+    );
+
+    // An unknown `mode` value fails rmcp's request deserialization before
+    // the tool body runs, so the call is rejected at the protocol layer
+    // rather than reaching the tool's structured-error path.
+    let mut bad_mode = Map::new();
+    bad_mode.insert("query".to_string(), json!("release"));
+    bad_mode.insert("mode".to_string(), json!("keyword"));
+    let invalid_mode = client
+        .call_tool(CallToolRequestParams::new("search").with_arguments(bad_mode))
+        .await;
+    assert!(
+        invalid_mode.is_err(),
+        "unknown `mode` should be rejected at the protocol layer"
     );
 
     // Best-effort shutdown: propagating a JoinError here would mask the

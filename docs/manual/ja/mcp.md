@@ -37,15 +37,14 @@ mdya MCP サーバは次のツールを提供します。
 
 | ツール名 | 内容 |
 |---|---|
-| `search_fts` | BM25 による全文検索 |
-| `search_vector` | cosine 類似度によるベクトル検索 |
-| `search_hybrid` | `search_fts` と `search_vector` を RRF で統合 |
+| `search` | Markdown コレクションの検索。`mode` でバックエンド (BM25 / ベクトル / ハイブリッド) を選択 |
 
-3 ツールとも共通の入力スキーマを取ります。
+入力スキーマ:
 
 ```json
 {
   "query": "リリース手順",
+  "mode": "hybrid",
   "k": 20,
   "collections": ["notes"],
   "level": "doc"
@@ -53,6 +52,7 @@ mdya MCP サーバは次のツールを提供します。
 ```
 
 - `query` (必須) — 検索クエリ文字列。空文字列 / 空白のみはエラー。
+- `mode` (任意、default `"hybrid"`) — 検索バックエンド。`"fts"` (BM25 の語句一致)、`"vector"` (cosine の意味検索)、`"hybrid"` (両者を RRF で統合)。
 - `k` (任意、default `20`) — 上位 N 件。`0` はエラー。
 - `collections` (任意) — コレクション名で絞り込み。省略 / 空配列で全コレクション対象。未知のコレクション名はエラー。
 - `level` (任意、default `"doc"`) — hit 粒度。`"doc"` は文書単位の集約 hit、`"chunk"` はチャンク単位の hit。
@@ -81,7 +81,7 @@ mdya MCP サーバは次のツールを提供します。
 
 `level: "doc"` (default) では文書単位の集約 hit が返り、 hit の `matched_chunks` に文書内で hit したチャンク数が入ります。 入力で `level: "chunk"` を渡すとチャンク単位の hit が返り、 hit に `chunk_sequence` (0-indexed のチャンク番号) が入ります。
 
-スコアの数値域はツールごとに異なります ([commands.md の 3 モードの違い](commands.md#3-モードの違い) を参照)。
+スコアの数値域は mode ごとに異なります ([commands.md の 3 モードの違い](commands.md#3-モードの違い) を参照)。
 
 ### 文書取得ツール
 
@@ -115,9 +115,8 @@ mdya MCP サーバは次のツールを提供します。
 | ツール名 | 内容 |
 |---|---|
 | `list_collections` | 登録済みコレクションの一覧 |
-| `get_status` | 索引の状態 |
 
-両ツールとも入力は不要です。出力は CLI の `mdya collection list --format json` / `mdya status --format json` と同じ shape です ([commands.md](commands.md) を参照)。
+入力は不要です。出力は CLI の `mdya collection list --format json` と同じ shape です ([commands.md](commands.md) を参照)。
 
 ## エラー時の動作
 

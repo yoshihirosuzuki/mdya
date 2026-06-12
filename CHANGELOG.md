@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (MCP):** Consolidated the three search tools (`search_fts`, `search_vector`, `search_hybrid`) into a single `search` tool with a `mode` parameter (`"fts"` / `"vector"` / `"hybrid"`, default `"hybrid"`). MCP clients calling an old tool name must switch to `search` with the matching `mode`.
+
+### Removed
+
+- **Breaking (MCP):** Removed the `get_status` MCP tool. Index status remains available through the `mdya status` CLI command.
+
 ## [0.3.1] - 2026-06-12
 
 ### Added

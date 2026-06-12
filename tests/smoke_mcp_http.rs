@@ -54,7 +54,7 @@ async fn mcp_http_advertises_search_tools_and_surfaces_validation_error() -> Res
 
     let tools = client.list_all_tools().await?;
     let tool_names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
-    for expected in ["search_fts", "search_vector", "search_hybrid"] {
+    for expected in ["search", "get_document", "list_collections"] {
         assert!(
             tool_names.contains(&expected),
             "expected `{expected}` tool, got {tool_names:?}"
@@ -65,10 +65,12 @@ async fn mcp_http_advertises_search_tools_and_surfaces_validation_error() -> Res
     // which rmcp surfaces as a `CallToolResult` flagged `is_error` whose
     // `structured_content` carries `{ code, message, details }`; the same
     // JSON is mirrored in the text content for backwards compatibility.
+    // `mode: "fts"` keeps this empty-query rejection embedder-free.
     let mut args = Map::new();
     args.insert("query".to_string(), json!(""));
+    args.insert("mode".to_string(), json!("fts"));
     let result = client
-        .call_tool(CallToolRequestParams::new("search_fts").with_arguments(args))
+        .call_tool(CallToolRequestParams::new("search").with_arguments(args))
         .await?;
     assert_eq!(result.is_error, Some(true), "expected error result");
     let structured = result

@@ -1,5 +1,5 @@
 //! Shared response shape for `mdya search` (CLI `--format json`) and
-//! the MCP `search_*` tools. Both sides MUST serialise identically so
+//! the MCP `search` tool. Both sides MUST serialise identically so
 //! a client cannot tell which transport produced the payload.
 //!
 //! `SearchHit` is a `#[serde(untagged)]` enum splitting the `Doc`
@@ -11,14 +11,19 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Which search backend produced the response. `lowercase` rename keeps
-/// the wire format (`"fts"` / `"vector"` / `"hybrid"`) aligned with the
-/// MCP spec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// The search backend: BM25 (`Fts`), vector cosine (`Vector`), or RRF
+/// hybrid (`Hybrid`). Serialised on the response envelope to echo which
+/// mode ran, and accepted as the MCP `search` tool's `mode` parameter,
+/// where it defaults to `Hybrid` — the general-purpose default that
+/// fuses keyword and semantic matches. The `lowercase` rename keeps the
+/// wire tokens (`"fts"` / `"vector"` / `"hybrid"`) aligned across CLI and
+/// MCP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
     Fts,
     Vector,
+    #[default]
     Hybrid,
 }
 
@@ -195,6 +200,13 @@ mod tests {
     #[test]
     fn search_level_default_is_doc() {
         assert_eq!(SearchLevel::default(), SearchLevel::Doc);
+    }
+
+    #[test]
+    fn search_mode_default_is_hybrid() {
+        // The MCP `search` tool relies on this default: omitting `mode`
+        // runs hybrid (BM25 + vector, RRF), the general-purpose default.
+        assert_eq!(SearchMode::default(), SearchMode::Hybrid);
     }
 
     #[test]
