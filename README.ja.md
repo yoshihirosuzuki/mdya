@@ -46,6 +46,12 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/yoshihirosuzuki/md
 
 または[リリースページ](https://github.com/yoshihirosuzuki/mdya/releases)からアーカイブを取得し、 `mdya` バイナリを `PATH` の通った場所に置いてください。
 
+Rust ユーザは [crates.io](https://crates.io/crates/mdya) からインストールすることもできます。 この経路はソースからビルドするため、 下記[ソースからビルド](#ソースからビルド)の前提（特に `protoc`）が必要です。
+
+```sh
+cargo install mdya
+```
+
 ### ソースからビルド
 
 前提:

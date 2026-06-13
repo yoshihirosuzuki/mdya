@@ -46,13 +46,19 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/yoshihirosuzuki/md
 
 Or grab an archive from the [releases page](https://github.com/yoshihirosuzuki/mdya/releases) and put the `mdya` binary on your `PATH`.
 
+Rust users can install from [crates.io](https://crates.io/crates/mdya) instead. This builds from source, so it needs the [build-from-source prerequisites](#build-from-source) below (notably `protoc`):
+
+```sh
+cargo install mdya
+```
+
 ### Build from source
 
 Prerequisites:
 
 - Rust 1.95+ (pinned automatically by `rust-toolchain.toml` at the repo root)
 - `just` (`cargo install just`)
-- `protoc` (Protocol Buffers compiler, build dependency of one of the storage libraries). On macOS `brew install protobuf`; on Linux `apt install -y protobuf-compiler`; on Windows `choco install protoc`.
+- `protoc` (Protocol Buffers compiler, a build dependency of the `lance` storage library). On macOS `brew install protobuf`; on Linux `apt install -y protobuf-compiler`; on Windows `choco install protoc`.
 
 ```sh
 git clone https://github.com/yoshihirosuzuki/mdya.git
