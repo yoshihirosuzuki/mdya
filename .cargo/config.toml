@@ -1,0 +1,14 @@
+# aws-lc-sys reaches mdya transitively (rustls -> reqwest 0.13 ->
+# lindera-dictionary build script). On Windows x86-64 it compiles via its
+# cc-based builder — pregenerated bindings ship in-crate, so CMake is never
+# invoked — which leaves NASM as the only external build tool for the crypto
+# assembly. Telling aws-lc-sys it may fall back to its bundled prebuilt NASM
+# objects removes that dependency on whatever the CI runner image happens to
+# ship: the build no longer breaks if a future Windows image drops NASM.
+# When NASM is present it is always used and the prebuilt objects are
+# ignored, so this only matters when the assembler is missing. Set here
+# rather than in a workflow so the cargo-dist-generated release build, the
+# verify workflow, and local builds all share one source of truth. The
+# variable is inert on every non-Windows target.
+[env]
+AWS_LC_SYS_PREBUILT_NASM = "1"
