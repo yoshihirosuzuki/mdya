@@ -17,6 +17,10 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+# Publish to crates.io as an additional channel during a tagged release. This
+# names the reusable workflow .github/workflows/publish-crates-io.yml, which
+# publishes via crates.io Trusted Publishing (OIDC, no stored token).
+publish-jobs = ["./publish-crates-io"]
 # Do not run release CI on pull requests; release.yml is tag-triggered only.
 # PR-time build/test gates are handled by .github/workflows/verify.yml
 # (workflow_dispatch).

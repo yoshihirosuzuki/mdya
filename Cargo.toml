@@ -23,6 +23,19 @@ repository.workspace = true
 description = "Local Markdown retrieval primitive (BM25 + on-device vector + MCP)."
 keywords = ["markdown", "search", "retrieval", "mcp", "local-first"]
 categories = ["command-line-utilities", "text-processing"]
+# Keep the published crate to what a `cargo install mdya` consumer needs.
+# Integration tests (and their fixtures), CI workflows, and repo/dev tooling
+# are not used when building from the crates.io tarball.
+exclude = [
+    "/.github",
+    "/.cargo",
+    "/tests",
+    "/dist-workspace.toml",
+    "/justfile",
+    "/rustfmt.toml",
+    "/.editorconfig",
+    "/.gitattributes",
+]
 
 [[bin]]
 name = "mdya"

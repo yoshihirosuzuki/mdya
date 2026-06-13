@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Published to [crates.io](https://crates.io/crates/mdya): `cargo install mdya` now works alongside the prebuilt installers. This path builds from source and requires `protoc`.
+
 ## [0.3.2] - 2026-06-13
 
 ### Changed
