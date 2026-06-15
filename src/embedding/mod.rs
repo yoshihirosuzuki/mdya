@@ -50,20 +50,90 @@ pub trait Embedder: Send + Sync {
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError>;
 }
 
+/// Retrieval prefixes a model prepends to query vs passage text before
+/// embedding. The query/passage asymmetry is model-specific — `ruri-v3-30m`
+/// uses Japanese retrieval prefixes, a plain sentence-transformer uses none —
+/// so wrapping the pair lets every embedder apply it through one uniform seam.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetrievalPrefixes {
+    query: &'static str,
+    passage: &'static str,
+}
+
+impl RetrievalPrefixes {
+    pub(crate) const fn new(query: &'static str, passage: &'static str) -> Self {
+        Self { query, passage }
+    }
+
+    /// Prepend the query prefix to `text`.
+    pub(crate) fn apply_query(&self, text: &str) -> String {
+        format!("{}{text}", self.query)
+    }
+
+    /// Prepend the passage prefix to `text`.
+    pub(crate) fn apply_passage(&self, text: &str) -> String {
+        format!("{}{text}", self.passage)
+    }
+}
+
+/// Static metadata for one on-device embedding model. [`ON_DEVICE_PRESETS`] is
+/// the single source of recognized on-device models; adding a model is a new
+/// entry there plus its constructor arm in [`build_embedder`].
+pub(crate) struct OnDevicePreset {
+    /// Repo id. Doubles as the `config.yml` `embedding.model` value and the
+    /// per-chunk DB pin (`chunks.embedding_model`).
+    model_id: &'static str,
+    /// Query/passage retrieval prefixes this model expects.
+    prefixes: RetrievalPrefixes,
+}
+
+/// Recognized on-device presets. The Ollama backend is intentionally absent:
+/// it accepts any `ollama:<model>` name, so it is matched by prefix in
+/// [`classify_model`] rather than enumerated here.
+const ON_DEVICE_PRESETS: &[OnDevicePreset] = &[OnDevicePreset {
+    model_id: RURI_V3_30M_MODEL_ID,
+    prefixes: RetrievalPrefixes::new("検索クエリ: ", "検索文書: "),
+}];
+
+/// Look up the on-device preset whose `model_id` equals `model`.
+pub(crate) fn find_on_device_preset(model: &str) -> Option<&'static OnDevicePreset> {
+    ON_DEVICE_PRESETS
+        .iter()
+        .find(|preset| preset.model_id == model)
+}
+
+/// Whether the config layer accepts `model`: a recognized on-device preset or
+/// an `ollama:<model>` value. The allowlist lives only here so the config
+/// layer has a single source to validate against.
+pub fn is_supported_model(model: &str) -> bool {
+    classify_model(model).is_some()
+}
+
+/// The recognized on-device model ids, for building "supported models" hints
+/// in config validation errors.
+pub fn on_device_model_ids() -> Vec<&'static str> {
+    ON_DEVICE_PRESETS
+        .iter()
+        .map(|preset| preset.model_id)
+        .collect()
+}
+
 /// Which concrete backend a `config.yml` `embedding.model` string selects.
 /// Separated from [`build_embedder`] so the dispatch decision is a pure,
 /// I/O-free function the tests can exercise without constructing an embedder
-/// (the Ruri path downloads a model, the Ollama path probes a server).
+/// (the on-device path downloads a model, the Ollama path probes a server).
 enum ModelKind {
-    /// The on-device default `cl-nagoya/ruri-v3-30m`.
-    Ruri,
+    /// A recognized on-device preset from [`ON_DEVICE_PRESETS`]. Only one
+    /// on-device architecture ships today, so the matched preset carries no
+    /// payload; a second preset will reintroduce it to drive arch dispatch.
+    OnDevice,
     /// An `ollama:<name>` backend.
     Ollama,
 }
 
 fn classify_model(model: &str) -> Option<ModelKind> {
-    if model == RURI_V3_30M_MODEL_ID {
-        Some(ModelKind::Ruri)
+    if find_on_device_preset(model).is_some() {
+        Some(ModelKind::OnDevice)
     } else if model.starts_with(OLLAMA_PREFIX) {
         Some(ModelKind::Ollama)
     } else {
@@ -82,7 +152,11 @@ pub async fn build_embedder(
     cache: &ModelCache,
 ) -> Result<Arc<dyn Embedder>, EmbedError> {
     match classify_model(model) {
-        Some(ModelKind::Ruri) => Ok(Arc::new(RuriV3_30m::new(cache).await?)),
+        // Only one on-device architecture ships today (ruri-v3-30m). A second
+        // on-device preset will reintroduce the preset payload on
+        // `ModelKind::OnDevice` and match on it here to select the
+        // architecture-specific constructor.
+        Some(ModelKind::OnDevice) => Ok(Arc::new(RuriV3_30m::new(cache).await?)),
         Some(ModelKind::Ollama) => Ok(Arc::new(OllamaEmbedder::new(model, ollama_endpoint).await?)),
         None => Err(EmbedError::UnsupportedModel(model.to_string())),
     }
@@ -91,7 +165,7 @@ pub async fn build_embedder(
 #[derive(Debug, Error)]
 pub enum EmbedError {
     #[error(
-        "unsupported embedding model '{0}': expected 'cl-nagoya/ruri-v3-30m' or an 'ollama:<model>' value"
+        "unsupported embedding model '{0}': expected a recognized on-device model or an 'ollama:<model>' value"
     )]
     UnsupportedModel(String),
 
@@ -130,8 +204,34 @@ mod tests {
     fn classify_model_recognizes_the_ruri_default() {
         assert!(matches!(
             classify_model(RURI_V3_30M_MODEL_ID),
-            Some(ModelKind::Ruri)
+            Some(ModelKind::OnDevice)
         ));
+    }
+
+    #[test]
+    fn find_on_device_preset_returns_ruri_with_its_prefixes() {
+        let preset = find_on_device_preset(RURI_V3_30M_MODEL_ID).expect("ruri preset registered");
+        assert_eq!(preset.model_id, RURI_V3_30M_MODEL_ID);
+        assert_eq!(preset.prefixes.apply_query("x"), "検索クエリ: x");
+        assert_eq!(preset.prefixes.apply_passage("y"), "検索文書: y");
+    }
+
+    #[test]
+    fn find_on_device_preset_is_none_for_an_ollama_value() {
+        // `ollama:` targets are matched by prefix, never enumerated as presets.
+        assert!(find_on_device_preset("ollama:nomic-embed-text").is_none());
+    }
+
+    #[test]
+    fn is_supported_model_accepts_presets_and_ollama_rejects_unknown() {
+        assert!(is_supported_model(RURI_V3_30M_MODEL_ID));
+        assert!(is_supported_model("ollama:nomic-embed-text"));
+        assert!(!is_supported_model("some/other-model"));
+    }
+
+    #[test]
+    fn on_device_model_ids_lists_the_ruri_default() {
+        assert!(on_device_model_ids().contains(&RURI_V3_30M_MODEL_ID));
     }
 
     #[test]

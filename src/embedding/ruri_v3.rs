@@ -13,7 +13,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::modernbert::{Config, ModernBert};
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 
-use super::{EmbedError, Embedder, ModelCache};
+use super::{EmbedError, Embedder, ModelCache, RetrievalPrefixes, find_on_device_preset};
 
 pub const RURI_V3_30M_MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
 
@@ -23,9 +23,6 @@ pub const RURI_V3_30M_MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
 /// version change — the revision is code-hard-coded, not surfaced in
 /// `config.yml`.
 pub const RURI_V3_30M_REVISION: &str = "24899e5de370b56d179604a007c0d727bf144504";
-
-const QUERY_PREFIX: &str = "検索クエリ: ";
-const PASSAGE_PREFIX: &str = "検索文書: ";
 
 /// Output vector dimension. Re-exported as `RURI_V3_30M_DIM` from
 /// the `embedding` module so callers (e.g. `mdya init` building the chunks
@@ -37,6 +34,9 @@ pub struct RuriV3_30m {
     model: ModernBert,
     tokenizer: Tokenizer,
     device: Device,
+    /// Retrieval prefixes sourced from this model's entry in the embedding
+    /// preset registry, applied in `embed_queries` / `embed_passages`.
+    prefixes: RetrievalPrefixes,
 }
 
 impl RuriV3_30m {
@@ -106,10 +106,18 @@ impl RuriV3_30m {
         let vb = VarBuilder::from_tensors(renamed, DType::F32, &device);
         let model = ModernBert::load(vb, &config)?;
 
+        // Retrieval prefixes live in the preset registry so every embedder
+        // applies them through the same seam; ruri is a compile-time entry, so
+        // a missing lookup is a programmer error, not a runtime condition.
+        let prefixes = find_on_device_preset(RURI_V3_30M_MODEL_ID)
+            .expect("ruri-v3-30m must be registered in ON_DEVICE_PRESETS")
+            .prefixes;
+
         Ok(Self {
             model,
             tokenizer,
             device,
+            prefixes,
         })
     }
 
@@ -180,14 +188,14 @@ impl Embedder for RuriV3_30m {
     }
 
     fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        let prefixed: Vec<String> = texts.iter().map(|t| format!("{QUERY_PREFIX}{t}")).collect();
+        let prefixed: Vec<String> = texts.iter().map(|t| self.prefixes.apply_query(t)).collect();
         self.embed_internal(&prefixed)
     }
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
         let prefixed: Vec<String> = texts
             .iter()
-            .map(|t| format!("{PASSAGE_PREFIX}{t}"))
+            .map(|t| self.prefixes.apply_passage(t))
             .collect();
         self.embed_internal(&prefixed)
     }

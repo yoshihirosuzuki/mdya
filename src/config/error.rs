@@ -52,6 +52,11 @@ pub enum ConfigError {
 
     #[error("collection name '{name}' is not valid: {reason}")]
     InvalidCollectionName { name: String, reason: &'static str },
+
+    #[error(
+        "embedding model '{model}' is not supported: expected one of [{supported}] or an 'ollama:<model>' value"
+    )]
+    UnsupportedEmbeddingModel { model: String, supported: String },
 }
 
 #[derive(Debug, Error)]

@@ -30,10 +30,11 @@ pub enum DimError {
 }
 
 /// Resolve the dim to pass to the schema-metadata pin check / table creation.
-/// Returns the `cl-nagoya/ruri-v3-30m` compile-time dim for the default (and
-/// for any unrecognized model — `build_embedder` rejects those later), the
-/// pinned dim already stored in the `chunks` table for an `ollama:` model, or
-/// the probed dim when no table exists yet.
+/// Returns the on-device `cl-nagoya/ruri-v3-30m` compile-time dim for the
+/// default model, the pinned dim already stored in the `chunks` table for an
+/// `ollama:` model, or the probed dim when no table exists yet. An unrecognized
+/// `embedding.model` is rejected earlier at config load
+/// (`validate_embedding_model`), so only validated models reach this resolver.
 pub async fn resolve_declared_dim(
     config_dir: &Path,
     model: &str,
