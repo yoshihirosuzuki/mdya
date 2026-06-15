@@ -9,7 +9,12 @@
 //!
 //! - heading boundary: every heading level (h1–h6) starts a new chunk
 //! - unit: chars (Unicode-safe via `str::chars`)
-//! - window / overlap: 700 / 70 chars for overflow sub-split
+//! - body segmentation: a section's body is collected as block-level
+//!   segments (paragraphs, thematic breaks, fenced code blocks). On
+//!   overflow the segments are packed greedily into chunks of at most 700
+//!   chars at segment boundaries, with no inter-chunk overlap; only a
+//!   single segment larger than the window falls back to a 700 / 70-char
+//!   split. 700 stays a hard upper bound
 //! - chunk body: the heading text followed by its section text. Heading
 //!   words are thus searchable via both FTS and vector embedding.
 //!   Headings carry only their own (leaf) text, not an ancestor
@@ -23,10 +28,12 @@
 //!   stores it with a null embedding so it stays out of the vector
 //!   index. A headings-only document is not a placeholder — each heading
 //!   emits a real chunk
-//! - front matter (`---\n…\n---` at doc head): stripped from body
-//! - fenced code block contents: included in the section body verbatim
-//!   (searchable via FTS / vector), and `#` lines inside the fence do
-//!   not open new chunks
+//! - front matter (`---\n…\n---` or `---\n…\n...` at doc head): stripped
+//!   via pulldown-cmark's metadata block parsing
+//! - fenced code block: kept as one atomic segment — its contents stay in
+//!   the body verbatim (searchable via FTS / vector), `#` lines inside the
+//!   fence do not open new chunks, and packing never splits a fence across
+//!   chunks unless the fence alone exceeds the window
 //!
 //! These rules are pinned in code only; no chunking knob lives in the
 //! YAML, so altering any of them in a future release is a soft change
@@ -54,19 +61,20 @@ pub struct Chunk {
     pub body: String,
 }
 
-/// Window size in **chars** for overflow sub-split. A section whose body
-/// exceeds this is split into successive sub-chunks with [`OVERLAP_CHARS`]
-/// chars overlap to keep adjacent semantic context joined. 700 sets the
-/// *retrieval granularity* — smaller windows
+/// Window size in **chars**. A section whose body exceeds this is packed
+/// into chunks at block-segment boundaries; only a single segment larger
+/// than this is split into successive sub-chunks with [`OVERLAP_CHARS`]
+/// chars overlap. 700 sets the *retrieval granularity* — smaller windows
 /// keep each embedding / FTS hit tightly scoped. It is not bounded by the
 /// embedding model: ruri-v3-30m (ModernBERT-Ja) handles 8192 tokens, so 700
 /// chars sits well within capacity (see `embedding::ruri_v3`, which sets no
 /// truncation).
 pub const WINDOW_CHARS: usize = 700;
 
-/// Overlap between adjacent sub-chunks when a section overflows
-/// [`WINDOW_CHARS`]. 10 % of the window, matching common practice (e.g.
-/// LangChain's default).
+/// Overlap between sub-chunks when a single block segment exceeds
+/// [`WINDOW_CHARS`] and must be char-split. 10 % of the window, matching
+/// common practice (e.g. LangChain's default). Segment-boundary packing
+/// adds no overlap; this applies only to the oversized-segment fallback.
 pub const OVERLAP_CHARS: usize = 70;
 
 /// The single chunk emitted for a file with no chunkable content: an

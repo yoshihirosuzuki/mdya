@@ -4,19 +4,30 @@
 //! Each heading starts a new chunk whose body is the heading text followed
 //! by the section text beneath it — so heading words are searchable via
 //! both FTS and vector embedding without a separate `title` column.
-//! Bodies that exceed [`crate::chunking::WINDOW_CHARS`] are split into
-//! overlapping sub-chunks.
+//!
+//! Within a section, the body is collected as a list of block-level
+//! *segments* (paragraphs, thematic breaks, and fenced code blocks). When a
+//! section exceeds [`crate::chunking::WINDOW_CHARS`] the segments are packed
+//! greedily into chunks at segment boundaries, so a chunk never cuts a
+//! paragraph or a code fence in half. A single segment that is itself larger
+//! than the window is the only case that falls back to a fixed-width
+//! character split (with [`crate::chunking::OVERLAP_CHARS`] overlap).
 
-use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 use super::{Chunk, ChunkingError, OVERLAP_CHARS, WINDOW_CHARS};
 
 /// Chunk a Markdown document. See module-level docs for the rules; the
 /// behaviour is fully covered by `#[cfg(test)]` cases below.
+///
+/// YAML front matter is removed by pulldown-cmark itself
+/// (`ENABLE_YAML_STYLE_METADATA_BLOCKS`): a leading `---` … `---`/`...`
+/// block is delivered as a `MetadataBlock` whose text the walker drops. A
+/// block without a closing delimiter is not metadata — the parser keeps it
+/// as ordinary content, so it stays in the body.
 pub fn chunk_markdown(content: &str) -> Result<Vec<Chunk>, ChunkingError> {
-    let stripped = strip_front_matter(content);
     let mut walker = Walker::new();
-    for event in Parser::new(stripped) {
+    for event in Parser::new_ext(content, Options::ENABLE_YAML_STYLE_METADATA_BLOCKS) {
         walker.handle(event);
     }
     let mut chunks = walker.finalize();
@@ -26,61 +37,23 @@ pub fn chunk_markdown(content: &str) -> Result<Vec<Chunk>, ChunkingError> {
     Ok(chunks)
 }
 
-/// Drop a YAML-style front matter block (`---\n...\n---\n`) from the very
-/// top of the document. Other `---` (horizontal rules elsewhere) are not
-/// touched.
-///
-/// pulldown-cmark exposes `Options::ENABLE_YAML_STYLE_METADATA_BLOCKS` for
-/// the same purpose; this hand-written strip is intentional. The library
-/// option would (a) require an additional `in_metadata` flag inside Walker
-/// because metadata bodies arrive as `Event::Text`, and (b) delegate the
-/// "no closing `---`" recovery to the library, which is exactly the edge
-/// case `front_matter_without_close_is_treated_as_body` keeps under our
-/// explicit control.
-fn strip_front_matter(content: &str) -> &str {
-    let trimmed = content.trim_start_matches('\n');
-    if !trimmed.starts_with("---\n") && !trimmed.starts_with("---\r\n") {
-        return content;
-    }
-    let after_open = &trimmed[trimmed.find('\n').expect("just matched ---<newline>") + 1..];
-    let Some(close_offset) = find_front_matter_close(after_open) else {
-        return content;
-    };
-    let after_close = &after_open[close_offset..];
-    after_close
-        .strip_prefix("---\n")
-        .or_else(|| after_close.strip_prefix("---\r\n"))
-        .or_else(|| after_close.strip_prefix("---"))
-        .unwrap_or(after_close)
-}
-
-/// Find the byte offset of a closing `---` line (preceded by newline)
-/// within an already-trimmed front-matter body.
-fn find_front_matter_close(body: &str) -> Option<usize> {
-    let mut search_from = 0;
-    while let Some(rel) = body[search_from..].find("\n---") {
-        let abs = search_from + rel + 1;
-        let after = &body[abs + 3..];
-        if after.starts_with('\n') || after.starts_with("\r\n") || after.is_empty() {
-            return Some(abs);
-        }
-        search_from = abs + 3;
-    }
-    None
-}
-
 /// Mutable state for the event walk.
 struct Walker {
     /// Heading text of the currently open section, accumulated between
     /// `Start(Heading)` and `End(Heading)`. Empty before the first heading
     /// (the leading section) and for documents with no heading at all.
     current_heading: String,
-    /// Section text accumulated beneath the current heading. While
-    /// `in_heading == true` text fills `current_heading` instead.
-    pending_body: String,
-    /// Set between `Event::Start(Tag::Heading)` and the matching
-    /// `Event::End(TagEnd::Heading)`.
+    /// The block segment currently being accumulated (one paragraph, or the
+    /// contents of one fenced code block). Flushed into `segments` at the
+    /// block's end.
+    current_segment: String,
+    /// Completed body segments beneath the current heading, in order.
+    segments: Vec<String>,
+    /// Set between `Start(Tag::Heading)` and `End(TagEnd::Heading)`.
     in_heading: bool,
+    /// Set between `Start(Tag::MetadataBlock)` and its end. Text inside a
+    /// metadata block (YAML front matter) is dropped rather than chunked.
+    in_metadata: bool,
     chunks: Vec<Chunk>,
 }
 
@@ -88,8 +61,10 @@ impl Walker {
     fn new() -> Self {
         Self {
             current_heading: String::new(),
-            pending_body: String::new(),
+            current_segment: String::new(),
+            segments: Vec::new(),
             in_heading: false,
+            in_metadata: false,
             chunks: Vec::new(),
         }
     }
@@ -97,85 +72,155 @@ impl Walker {
     fn handle(&mut self, event: Event<'_>) {
         match event {
             Event::Start(Tag::Heading { .. }) => self.open_heading(),
-            Event::End(TagEnd::Heading(_)) => {
-                self.in_heading = false;
-            }
+            Event::End(TagEnd::Heading(_)) => self.in_heading = false,
+            Event::Start(Tag::MetadataBlock(_)) => self.in_metadata = true,
+            Event::End(TagEnd::MetadataBlock(_)) => self.in_metadata = false,
+            // A fenced/indented code block is one atomic segment: its inner
+            // blank lines must not become segment boundaries, so flush the
+            // pending paragraph at the block edges and let the block's text
+            // accumulate into a single segment.
+            Event::Start(Tag::CodeBlock(_)) | Event::End(TagEnd::CodeBlock) => self.end_segment(),
             Event::Text(text) | Event::Code(text) => self.append_text(&text),
             Event::SoftBreak | Event::HardBreak => self.append_text("\n"),
-            Event::End(TagEnd::Paragraph) => self.append_text("\n\n"),
+            Event::End(TagEnd::Paragraph) => self.end_segment(),
+            // A thematic break (`---`/`***`) is a block boundary with no text
+            // of its own; close the current segment so packing can split here.
+            Event::Rule => self.end_segment(),
             _ => {}
         }
     }
 
     /// Flush the section that just ended, then begin collecting the new
     /// heading. Heading level is irrelevant: every heading starts its own
-    /// chunk, so there is no level stack to maintain.
+    /// section, so there is no level stack to maintain.
     fn open_heading(&mut self) {
-        self.flush_pending();
+        self.flush_section();
         self.in_heading = true;
     }
 
     fn append_text(&mut self, text: &str) {
+        if self.in_metadata {
+            return;
+        }
         if self.in_heading {
             self.current_heading.push_str(text);
             return;
         }
-        self.pending_body.push_str(text);
+        self.current_segment.push_str(text);
     }
 
-    /// Emit the current section as a chunk: heading text followed by its
-    /// body. A heading with no body still emits (body = heading text) so
-    /// section names stay searchable; a section with neither heading nor
-    /// body emits nothing.
-    fn flush_pending(&mut self) {
-        let combined = combine_section(self.current_heading.trim(), self.pending_body.trim());
-        if !combined.is_empty() {
-            emit_with_overflow_split(&mut self.chunks, &combined);
+    /// Push the in-progress segment (if any) into `segments`. Empty/whitespace
+    /// segments are dropped so they never occupy a chunk. Inside a metadata
+    /// block `current_segment` is always empty (`append_text` drops metadata
+    /// text), so a stray block-end event there is a harmless no-op.
+    fn end_segment(&mut self) {
+        let segment = self.current_segment.trim();
+        if !segment.is_empty() {
+            self.segments.push(segment.to_string());
         }
-        self.current_heading.clear();
-        self.pending_body.clear();
+        self.current_segment.clear();
+    }
+
+    /// Emit the current section as chunks: the heading (if any) leads the
+    /// first chunk, followed by its packed body segments.
+    fn flush_section(&mut self) {
+        self.end_segment();
+        let heading = std::mem::take(&mut self.current_heading);
+        let segments = std::mem::take(&mut self.segments);
+        pack_section(&mut self.chunks, heading.trim(), &segments);
     }
 
     fn finalize(mut self) -> Vec<Chunk> {
-        self.flush_pending();
+        self.flush_section();
         self.chunks
     }
 }
 
-/// Join a section's heading and body into chunk text. Either may be empty;
-/// the result is empty only when both are.
-fn combine_section(heading: &str, body: &str) -> String {
-    match (heading.is_empty(), body.is_empty()) {
-        (false, false) => format!("{heading}\n\n{body}"),
-        (false, true) => heading.to_string(),
-        (true, false) => body.to_string(),
-        (true, true) => String::new(),
+/// Build a section's chunks from its heading and body segments. The heading
+/// is merged into the first segment so it leads the first chunk only —
+/// repeating it on every sub-chunk would inflate the body and double-count
+/// the heading words in BM25. A section with neither heading nor body emits
+/// nothing.
+fn pack_section(out: &mut Vec<Chunk>, heading: &str, segments: &[String]) {
+    if heading.is_empty() && segments.is_empty() {
+        return;
+    }
+
+    let mut blocks: Vec<String> = Vec::with_capacity(segments.len() + 1);
+    match (heading.is_empty(), segments.is_empty()) {
+        (true, _) => blocks.extend(segments.iter().cloned()),
+        (false, true) => blocks.push(heading.to_string()),
+        (false, false) => {
+            blocks.push(format!("{heading}\n\n{}", segments[0]));
+            blocks.extend(segments[1..].iter().cloned());
+        }
+    }
+
+    pack_blocks(out, &blocks);
+}
+
+/// Greedily pack block segments into chunks no larger than [`WINDOW_CHARS`],
+/// joining adjacent blocks with a blank line. A single block that exceeds the
+/// window is the only case split mid-block, via [`char_split_with_overlap`].
+fn pack_blocks(out: &mut Vec<Chunk>, blocks: &[String]) {
+    let mut current = String::new();
+    for block in blocks {
+        if block.chars().count() > WINDOW_CHARS {
+            flush_current(out, &mut current);
+            char_split_with_overlap(out, block);
+            continue;
+        }
+        if current.is_empty() {
+            current.push_str(block);
+        } else if joined_len(&current, block) <= WINDOW_CHARS {
+            current.push_str("\n\n");
+            current.push_str(block);
+        } else {
+            flush_current(out, &mut current);
+            current.push_str(block);
+        }
+    }
+    flush_current(out, &mut current);
+}
+
+/// Char length of `current` and `block` joined by a blank line.
+fn joined_len(current: &str, block: &str) -> usize {
+    current.chars().count() + "\n\n".chars().count() + block.chars().count()
+}
+
+fn flush_current(out: &mut Vec<Chunk>, current: &mut String) {
+    if !current.is_empty() {
+        out.push(Chunk {
+            body: std::mem::take(current),
+        });
     }
 }
 
-/// Emit one chunk if `body` fits in [`WINDOW_CHARS`], otherwise split it
-/// into overlapping sub-chunks. The sub-split walks `char_indices` once
-/// (O(n)) so very large sections stay linear instead of degrading
+/// Split one over-window block into successive sub-chunks with
+/// [`OVERLAP_CHARS`] chars of overlap. The walk over `char_indices` is done
+/// once (O(n)) so very large blocks stay linear instead of degrading
 /// quadratically with repeated `skip(start).take(...)`.
-fn emit_with_overflow_split(out: &mut Vec<Chunk>, body: &str) {
-    let char_count = body.chars().count();
+fn char_split_with_overlap(out: &mut Vec<Chunk>, block: &str) {
+    let char_count = block.chars().count();
+    // Defensive: callers only reach here for over-window blocks, but keep the
+    // single-chunk path so this helper is correct in isolation.
     if char_count <= WINDOW_CHARS {
         out.push(Chunk {
-            body: body.to_string(),
+            body: block.to_string(),
         });
         return;
     }
-    let boundaries: Vec<usize> = body
+    let boundaries: Vec<usize> = block
         .char_indices()
         .map(|(i, _)| i)
-        .chain(std::iter::once(body.len()))
+        .chain(std::iter::once(block.len()))
         .collect();
     let step = WINDOW_CHARS - OVERLAP_CHARS;
     let mut start = 0;
     while start < char_count {
         let end = (start + WINDOW_CHARS).min(char_count);
         out.push(Chunk {
-            body: body[boundaries[start]..boundaries[end]].to_string(),
+            body: block[boundaries[start]..boundaries[end]].to_string(),
         });
         if end == char_count {
             break;
@@ -187,17 +232,6 @@ fn emit_with_overflow_split(out: &mut Vec<Chunk>, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn combine_section_is_empty_only_when_both_inputs_are_empty() {
-        // Load-bearing for the placeholder invariant: a real section
-        // (heading and/or body present) must never produce an empty chunk
-        // body, so `body.is_empty()` uniquely marks the placeholder.
-        assert_eq!(combine_section("", ""), "");
-        assert_eq!(combine_section("heading", ""), "heading");
-        assert_eq!(combine_section("", "body"), "body");
-        assert_eq!(combine_section("heading", "body"), "heading\n\nbody");
-    }
 
     #[test]
     fn empty_document_yields_one_placeholder_chunk() {
@@ -220,9 +254,7 @@ mod tests {
     fn headings_only_document_emits_one_chunk_per_heading() {
         // Headings with no section body each emit a chunk carrying the
         // heading text, so section names (often the most important words,
-        // e.g. the document title) stay searchable. This is the
-        // "floating heading" fix — previously this produced a single
-        // empty placeholder.
+        // e.g. the document title) stay searchable.
         let out = chunk_markdown("# A\n\n## B\n\n### C\n").expect("ok");
         let bodies: Vec<&str> = out.iter().map(|c| c.body.as_str()).collect();
         assert_eq!(bodies, vec!["A", "B", "C"]);
@@ -300,21 +332,103 @@ mod tests {
     }
 
     #[test]
-    fn section_over_window_splits_with_overlap() {
-        // Body just over 700 chars so we get exactly 2 sub-chunks. Use a
-        // headingless body so the char math is exact (no heading prefix).
-        let body: String = "あ".repeat(750);
-        let out = chunk_markdown(&body).expect("ok");
+    fn long_prose_subsplit_breaks_at_paragraph_boundary() {
+        // Three 300-char paragraphs (900 chars total) exceed the 700 window.
+        // Packing fills a chunk with whole paragraphs (300 + 300 fits, the
+        // third spills over) and never cuts a paragraph in half.
+        let para_a = "a".repeat(300);
+        let para_b = "b".repeat(300);
+        let para_c = "c".repeat(300);
+        let md = format!("{para_a}\n\n{para_b}\n\n{para_c}\n");
+        let out = chunk_markdown(&md).expect("ok");
+        assert_eq!(
+            out.len(),
+            2,
+            "expected paragraph-packed chunks, got {out:?}"
+        );
+        assert_eq!(out[0].body, format!("{para_a}\n\n{para_b}"));
+        assert_eq!(out[1].body, para_c);
+    }
+
+    #[test]
+    fn paragraph_packed_chunks_do_not_overlap() {
+        // Packing at segment boundaries adds no inter-chunk overlap: the
+        // third paragraph appears only in the second chunk.
+        let para_a = "a".repeat(300);
+        let para_b = "b".repeat(300);
+        let para_c = "c".repeat(300);
+        let md = format!("{para_a}\n\n{para_b}\n\n{para_c}\n");
+        let out = chunk_markdown(&md).expect("ok");
+        assert!(!out[0].body.contains('c'));
+        assert!(!out[1].body.contains('a') && !out[1].body.contains('b'));
+    }
+
+    #[test]
+    fn heading_leads_only_the_first_chunk_of_a_split_section() {
+        // A heading plus paragraphs that overflow the window: the heading
+        // rides on the first chunk, later chunks carry no heading.
+        let para_a = "a".repeat(300);
+        let para_b = "b".repeat(300);
+        let para_c = "c".repeat(300);
+        let md = format!("# H\n\n{para_a}\n\n{para_b}\n\n{para_c}\n");
+        let out = chunk_markdown(&md).expect("ok");
+        assert!(out[0].body.starts_with("H"));
+        assert!(out.iter().skip(1).all(|c| !c.body.contains('H')));
+    }
+
+    #[test]
+    fn code_fence_is_not_split_when_section_overflows() {
+        // A 500-char paragraph and a 500-char code block overflow the window
+        // together, but each is its own segment, so the code block lands in a
+        // single chunk intact rather than being cut across chunks.
+        let prose = "a".repeat(500);
+        let code = "b".repeat(500);
+        let md = format!("{prose}\n\n```\n{code}\n```\n");
+        let out = chunk_markdown(&md).expect("ok");
+        assert_eq!(
+            out.len(),
+            2,
+            "expected prose and code in separate chunks, got {out:?}"
+        );
+        assert!(
+            out.iter().any(|c| c.body == code),
+            "code block should stay intact in one chunk; got {out:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_code_fence_falls_back_to_char_split() {
+        // A code block larger than the window is the one case a fence is
+        // split: it is char-split with overlap so WINDOW_CHARS stays a hard
+        // upper bound (no over-window chunk is ever emitted).
+        let code = "b".repeat(900);
+        let md = format!("```\n{code}\n```\n");
+        let out = chunk_markdown(&md).expect("ok");
         assert!(
             out.len() >= 2,
-            "expected at least 2 sub-chunks, got {out:?}"
+            "expected char-split sub-chunks, got {out:?}"
         );
-        let first_chars = out[0].body.chars().count();
-        let second_chars = out[1].body.chars().count();
-        assert_eq!(first_chars, WINDOW_CHARS);
-        // step = WINDOW - OVERLAP. The second chunk starts at `step` and
-        // runs to end, so it has `750 - step = 750 - 630 = 120` chars.
-        assert_eq!(second_chars, 750 - (WINDOW_CHARS - OVERLAP_CHARS));
+        assert_eq!(out[0].body.chars().count(), WINDOW_CHARS);
+        for chunk in &out {
+            assert!(chunk.body.chars().count() <= WINDOW_CHARS);
+        }
+    }
+
+    #[test]
+    fn section_over_window_splits_with_overlap() {
+        // A single headingless paragraph just over 700 chars is one
+        // oversized segment, so it falls back to the char split: exactly two
+        // sub-chunks with OVERLAP_CHARS overlap.
+        let body: String = "あ".repeat(750);
+        let out = chunk_markdown(&body).expect("ok");
+        assert_eq!(out.len(), 2, "expected 2 sub-chunks, got {out:?}");
+        assert_eq!(out[0].body.chars().count(), WINDOW_CHARS);
+        // step = WINDOW - OVERLAP. The second chunk starts at `step` and runs
+        // to the end, so it holds `750 - step = 750 - 630 = 120` chars.
+        assert_eq!(
+            out[1].body.chars().count(),
+            750 - (WINDOW_CHARS - OVERLAP_CHARS)
+        );
     }
 
     #[test]
@@ -331,11 +445,26 @@ mod tests {
     }
 
     #[test]
+    fn front_matter_with_dots_close_is_stripped() {
+        // `...` is a valid YAML document-end marker; pulldown-cmark treats it
+        // as a metadata block close, so the front matter is stripped just like
+        // a `---` close (the hand-rolled stripper this replaced missed it).
+        let md = "---\ntitle: foo\ndate: 2024-01-01\n...\n# Heading\n\nBody\n";
+        let out = chunk_markdown(md).expect("ok");
+        assert!(out.iter().any(|c| c.body.contains("Heading")));
+        assert!(
+            out.iter().all(|c| !c.body.contains("title: foo")),
+            "front matter with `...` close should be stripped; got {out:?}"
+        );
+    }
+
+    #[test]
     fn front_matter_without_close_is_treated_as_body() {
-        // No closing `---`: do not eat the rest of the file silently.
+        // No closing delimiter: pulldown-cmark does not treat the opening
+        // `---` as metadata, so the file is not silently eaten — the content
+        // stays in the body.
         let md = "---\ntitle: foo\n# Heading\n\nBody\n";
         let out = chunk_markdown(md).expect("ok");
-        // The `---` line stays as-is, "# Heading" becomes a real heading.
         assert!(
             out.iter().any(|c| c.body.contains("Heading")),
             "expected a chunk carrying the heading; got {out:?}"
@@ -353,8 +482,7 @@ mod tests {
         assert_eq!(out.len(), 1, "expected single chunk, got {out:?}");
         assert!(out[0].body.contains("Real"));
         // Code-block contents must remain in the body so FTS / vector
-        // search can match identifiers and prose inside fenced blocks
-        // (rule pinned in `mod.rs` docstring).
+        // search can match identifiers and prose inside fenced blocks.
         assert!(
             out[0].body.contains("Not a heading") && out[0].body.contains("foo"),
             "code-block contents should stay in body; got {:?}",
@@ -363,9 +491,24 @@ mod tests {
     }
 
     #[test]
+    fn code_fence_with_inner_blank_line_stays_one_segment() {
+        // A blank line inside a fence must not split it: pulldown-cmark
+        // delivers the block's text as one run, and the walker treats the
+        // whole fence as a single atomic segment. Both lines land together.
+        let md = "```\nline one\n\nline two\n```\n";
+        let out = chunk_markdown(md).expect("ok");
+        assert_eq!(
+            out.len(),
+            1,
+            "code fence split on its inner blank line: {out:?}"
+        );
+        assert!(out[0].body.contains("line one") && out[0].body.contains("line two"));
+    }
+
+    #[test]
     fn japanese_multibyte_chars_count_correctly_for_window() {
         // 1000 hiragana chars (each 3 bytes in UTF-8) — exceeds the 700-char
-        // window twice over but stays under any naive byte threshold.
+        // window but stays under any naive byte threshold.
         let body: String = "あ".repeat(1000);
         let md = format!("# 見出し\n\n{body}\n");
         let out = chunk_markdown(&md).expect("ok");
