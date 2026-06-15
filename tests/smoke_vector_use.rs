@@ -37,7 +37,12 @@ use common::{LANCE_ENV_LOCK, ScopedLanceLanguageModelHome};
 
 const OLD_MODEL: &str = "cl-nagoya/ruri-v3-30m";
 const OLD_DIM: usize = 256;
-const NEW_MODEL: &str = "fake-model-b";
+// `ollama:`-prefixed so it passes the config-load allowlist check
+// (`validate_embedding_model`) when `switch_model` rewrites `config.yml` and
+// the test reloads it. The value is only a stand-in label for `MockEmbedder`;
+// no Ollama server is contacted because `switch_model` takes the embedder
+// directly and never calls `build_embedder`.
+const NEW_MODEL: &str = "ollama:fake-model-b";
 const NEW_DIM: usize = 128;
 
 /// Constant-vector stand-in for the production embedder, parameterised on
