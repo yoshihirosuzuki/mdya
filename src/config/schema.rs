@@ -225,6 +225,22 @@ pub fn validate_collection_name(name: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Validate that `embedding.model` is a model the embedder layer can build:
+/// a recognized on-device preset or an `ollama:<model>` value. Run by the
+/// YAML loader so a hand-edited unknown model fails at load time instead of
+/// surfacing only when the embedder is first constructed. The allowlist is
+/// owned by the `embedding` module ([`crate::embedding::is_supported_model`]),
+/// so this layer never duplicates the set of recognized models.
+pub fn validate_embedding_model(model: &str) -> Result<(), ConfigError> {
+    if crate::embedding::is_supported_model(model) {
+        return Ok(());
+    }
+    Err(ConfigError::UnsupportedEmbeddingModel {
+        model: model.to_string(),
+        supported: crate::embedding::on_device_model_ids().join(", "),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,5 +585,35 @@ runtime:
             yaml.contains("gpu.lan"),
             "non-default endpoint must appear in serialized YAML; got:\n{yaml}"
         );
+    }
+
+    #[test]
+    fn validate_embedding_model_accepts_the_ruri_default() {
+        assert!(validate_embedding_model("cl-nagoya/ruri-v3-30m").is_ok());
+    }
+
+    #[test]
+    fn validate_embedding_model_accepts_an_ollama_value() {
+        assert!(validate_embedding_model("ollama:nomic-embed-text").is_ok());
+    }
+
+    #[test]
+    fn validate_embedding_model_rejects_an_unknown_model() {
+        let err = validate_embedding_model("some/other-model").unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::UnsupportedEmbeddingModel { ref model, .. } if model == "some/other-model"
+        ));
+    }
+
+    #[test]
+    fn validate_embedding_model_error_lists_supported_on_device_models() {
+        // The hint must name the recognized on-device model so a user who
+        // mistyped the repo id can correct it from the error alone.
+        let err = validate_embedding_model("typo/model").unwrap_err();
+        let ConfigError::UnsupportedEmbeddingModel { supported, .. } = err else {
+            panic!("expected UnsupportedEmbeddingModel");
+        };
+        assert!(supported.contains("cl-nagoya/ruri-v3-30m"));
     }
 }

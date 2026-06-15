@@ -16,10 +16,11 @@ use super::error::ConfigError;
 use super::schema::Config;
 
 /// Load `config.yml` from `path`. Returns the typed `Config` or a
-/// `ConfigError` distinguishing IO failure, YAML parse failure, and
-/// invalid collection name (a user hand-editing `config.yml` to add
-/// a name that the writer-layer SQL grammar cannot represent is
-/// caught here before any ingest touches the database).
+/// `ConfigError` distinguishing IO failure, YAML parse failure, an
+/// unsupported `embedding.model`, and an invalid collection name. Both
+/// content checks run here so a user hand-editing `config.yml` to an
+/// unrecognized model or a name the writer-layer SQL grammar cannot
+/// represent is caught before any ingest touches the database.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let yaml = fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_owned(),
@@ -30,6 +31,7 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
             path: path.to_owned(),
             source,
         })?;
+    super::schema::validate_embedding_model(&config.embedding.model)?;
     for name in config.collections.keys() {
         super::schema::validate_collection_name(name)?;
     }
@@ -92,5 +94,25 @@ mod tests {
 
         let err = load(&path).expect_err("must fail");
         assert!(matches!(err, ConfigError::ParseYaml { .. }));
+    }
+
+    #[test]
+    fn load_rejects_a_hand_edited_unsupported_embedding_model() {
+        // A user editing `embedding.model` to an unrecognized repo id must be
+        // caught at load, not deferred to embedder construction.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.yml");
+        std::fs::write(
+            &path,
+            "collections: {}\nembedding:\n  model: bogus/not-a-real-model\n",
+        )
+        .expect("write fixture");
+
+        let err = load(&path).expect_err("must fail");
+        assert!(matches!(
+            err,
+            ConfigError::UnsupportedEmbeddingModel { ref model, .. }
+                if model == "bogus/not-a-real-model"
+        ));
     }
 }
