@@ -23,6 +23,7 @@ use thiserror::Error;
 use crate::config;
 use crate::embedding::{EmbedError, Embedder, ModelCache, ModelCacheError, build_embedder};
 use crate::ingest::{IngestError, IngestProgress, UpdateSummary, update_all_collections};
+use crate::store::metadata_check::METADATA_KEY_EMBEDDING_MODEL;
 use crate::store::{self, CHUNKS_TABLE_NAME, chunks_schema};
 
 use super::log_writer;
@@ -66,6 +67,64 @@ pub enum VectorUseError {
     FilesFailed(u64),
 }
 
+/// What `mdya vector use <target>` should do, given how the config and the
+/// index currently stand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UseAction {
+    /// The config already declares `target` and the `chunks` index is already
+    /// built for it — nothing to do.
+    NoOp,
+    /// The config already declares `target` but the index is not built for it
+    /// (a hand-edited `config.yml` left the pin on the old model, so
+    /// `update-all` aborts on the mismatch). Rebuild the index for `target`.
+    Rebuild,
+    /// The config declares a different model — switch to `target` and rebuild.
+    Switch,
+}
+
+/// Decide the action from the config's current model, the requested `target`,
+/// and the model the `chunks` table is pinned to (`None` when no table/pin
+/// exists yet). Pure so the decision is exercised without touching the DB.
+///
+/// The no-op is gated on the DB pin, not just the config string: when a user
+/// hand-edits `config.yml` to `target` the config matches but the index is
+/// still pinned to the old model, and `vector use <target>` must rebuild
+/// rather than report "nothing to do" and leave `update-all` stuck on the
+/// pin mismatch.
+fn decide_use_action(config_model: &str, target: &str, pinned: Option<&str>) -> UseAction {
+    if config_model != target {
+        return UseAction::Switch;
+    }
+    if pinned == Some(target) {
+        UseAction::NoOp
+    } else {
+        UseAction::Rebuild
+    }
+}
+
+/// Read the embedding-model pin from the `chunks` table's schema metadata, or
+/// `None` when the table (or the pin key) does not exist yet.
+async fn chunks_pinned_model(base: &Path) -> Result<Option<String>, VectorUseError> {
+    let db = store::connect(base.join("index"))
+        .await
+        .map_err(VectorUseError::Store)?;
+    let names = db
+        .table_names()
+        .execute()
+        .await
+        .map_err(VectorUseError::Lance)?;
+    if !names.iter().any(|n| n == CHUNKS_TABLE_NAME) {
+        return Ok(None);
+    }
+    let table = db
+        .open_table(CHUNKS_TABLE_NAME)
+        .execute()
+        .await
+        .map_err(VectorUseError::Lance)?;
+    let schema = table.schema().await.map_err(VectorUseError::Lance)?;
+    Ok(schema.metadata().get(METADATA_KEY_EMBEDDING_MODEL).cloned())
+}
+
 /// `mdya vector use <model>` entry point. Called from `cli::Cli::run`.
 ///
 /// Order is chosen so a typo or unreachable backend never reaches the
@@ -81,14 +140,17 @@ pub(crate) async fn run(
 ) -> Result<(), VectorUseError> {
     let base = config::resolve_config_dir(config_dir_flag)?;
     let cfg = config::load(&base.join("config.yml"))?;
-    if cfg.embedding.model == model {
-        eprintln!("Already using '{model}'; nothing to do.");
+    let pinned = chunks_pinned_model(&base).await?;
+    let action = decide_use_action(&cfg.embedding.model, model, pinned.as_deref());
+    if action == UseAction::NoOp {
+        eprintln!("Already using '{model}' and the index is built for it; nothing to do.");
         return Ok(());
     }
     let cache = ModelCache::new(&config::resolve_model_cache_dir(model_cache_dir_flag)?)?;
     let embedder = build_embedder(model, &cfg.embedding.ollama.endpoint, &cache).await?;
     if !user_confirms(
         assume_yes,
+        action,
         &cfg.embedding.model,
         model,
         embedder.dim(),
@@ -107,7 +169,7 @@ pub(crate) async fn run(
     let progress: Arc<dyn IngestProgress> = Arc::new(indicatif);
     let summary = switch_model(&base, cfg, embedder, progress, parallelism).await?;
     drop(progress_guard);
-    eprintln!("{}", format_switch_summary(model, &summary));
+    eprintln!("{}", format_switch_summary(action, model, &summary));
     if summary.failed > 0 {
         return Err(VectorUseError::FilesFailed(summary.failed));
     }
@@ -127,10 +189,12 @@ pub(crate) async fn run(
 /// `runtime.embed_parallelism` bound and the memory guard apply exactly
 /// as they do for `mdya update-all`.
 ///
-/// Caller contract: `embedder.model_id()` must differ from
-/// `cfg.embedding.model` — `run` owns the no-op short-circuit and the
-/// destructive confirmation. `pub` so integration tests can inject a
-/// stand-in `Embedder` (same seam as `update_all_collections`).
+/// Caller contract: `run` owns the no-op short-circuit and the destructive
+/// confirmation, so this always rebuilds. `embedder.model_id()` may equal
+/// `cfg.embedding.model` (a same-model rebuild that recovers from a pin
+/// mismatch) or differ (a model switch); both rewrite the pin and re-embed.
+/// `pub` so integration tests can inject a stand-in `Embedder` (same seam as
+/// `update_all_collections`).
 pub async fn switch_model(
     base: &Path,
     mut cfg: config::Config,
@@ -193,6 +257,7 @@ async fn recreate_chunks_table(
 /// non-interactive stdin is refused (never destroy data unprompted).
 fn user_confirms(
     assume_yes: bool,
+    action: UseAction,
     current_model: &str,
     new_model: &str,
     new_dim: usize,
@@ -204,17 +269,25 @@ fn user_confirms(
     if !io::stdin().is_terminal() {
         return Err(VectorUseError::NonInteractive);
     }
-    prompt_and_read(current_model, new_model, new_dim, n_collections)
+    prompt_and_read(action, current_model, new_model, new_dim, n_collections)
 }
 
 fn prompt_and_read(
+    action: UseAction,
     current_model: &str,
     new_model: &str,
     new_dim: usize,
     n_collections: usize,
 ) -> Result<bool, VectorUseError> {
-    eprintln!("This will switch the embedding model:");
-    eprintln!("  {current_model} -> {new_model} (dim {new_dim})");
+    // A rebuild keeps the same model (`current_model == new_model`), so the
+    // `from -> to` framing of a switch would be misleading.
+    if action == UseAction::Rebuild {
+        eprintln!("This will rebuild the index for '{new_model}' (dim {new_dim}).");
+    } else {
+        // UseAction::Switch (NoOp returns in `run` before reaching the prompt).
+        eprintln!("This will switch the embedding model:");
+        eprintln!("  {current_model} -> {new_model} (dim {new_dim})");
+    }
     eprintln!(
         "The chunks index will be DROPPED and {n_collections} collection(s) re-embedded from scratch."
     );
@@ -234,14 +307,20 @@ fn parse_confirmation(input: &str) -> bool {
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-fn format_switch_summary(model: &str, s: &UpdateSummary) -> String {
+fn format_switch_summary(action: UseAction, model: &str, s: &UpdateSummary) -> String {
     // After a recreate every walked file is re-embedded as new, so
     // `total` is the document count. `removed` counts orphaned `sources`
     // rows whose file disappeared since the last ingest — reported for
     // parity with `mdya update-all` so that cleanup is not silent.
     let total = s.new + s.updated + s.skipped + s.failed;
+    let lead = if action == UseAction::Rebuild {
+        format!("Rebuilt the index for '{model}'")
+    } else {
+        // UseAction::Switch (NoOp never reaches the summary).
+        format!("Switched embedding model to '{model}'")
+    };
     format!(
-        "Switched embedding model to '{model}'. Re-embedded {total} document(s) (removed: {}, failed: {}).",
+        "{lead}. Re-embedded {total} document(s) (removed: {}, failed: {}).",
         s.removed, s.failed
     )
 }
@@ -273,12 +352,71 @@ mod tests {
             removed: 2,
             failed: 1,
         };
-        let out = format_switch_summary("ollama:nomic-embed-text", &s);
+        let out = format_switch_summary(UseAction::Switch, "ollama:nomic-embed-text", &s);
         // total = new + updated + skipped + failed = 8; removed is reported
         // separately (it does not count toward the document total).
         assert_eq!(
             out,
             "Switched embedding model to 'ollama:nomic-embed-text'. Re-embedded 8 document(s) (removed: 2, failed: 1)."
         );
+    }
+
+    #[test]
+    fn format_switch_summary_uses_rebuild_wording_for_a_same_model_rebuild() {
+        let s = UpdateSummary {
+            new: 3,
+            updated: 0,
+            skipped: 0,
+            removed: 0,
+            failed: 0,
+        };
+        let out = format_switch_summary(UseAction::Rebuild, "cl-nagoya/ruri-v3-30m", &s);
+        assert_eq!(
+            out,
+            "Rebuilt the index for 'cl-nagoya/ruri-v3-30m'. Re-embedded 3 document(s) (removed: 0, failed: 0)."
+        );
+    }
+
+    #[test]
+    fn decide_use_action_switches_when_config_model_differs() {
+        // A different target is always a switch, regardless of the DB pin.
+        assert_eq!(
+            decide_use_action("cl-nagoya/ruri-v3-30m", "ollama:nomic-embed-text", None),
+            UseAction::Switch
+        );
+        assert_eq!(
+            decide_use_action(
+                "cl-nagoya/ruri-v3-30m",
+                "ollama:nomic-embed-text",
+                Some("cl-nagoya/ruri-v3-30m")
+            ),
+            UseAction::Switch
+        );
+        // Even when the DB pin already matches the target, a differing config
+        // model is still a switch (the config is the source of truth being
+        // changed); the matching pin does not turn it into a no-op.
+        assert_eq!(
+            decide_use_action("old-model", "new-model", Some("new-model")),
+            UseAction::Switch
+        );
+    }
+
+    #[test]
+    fn decide_use_action_is_noop_only_when_config_and_pin_both_match() {
+        assert_eq!(
+            decide_use_action("ruri", "ruri", Some("ruri")),
+            UseAction::NoOp
+        );
+    }
+
+    #[test]
+    fn decide_use_action_rebuilds_when_config_matches_but_pin_does_not() {
+        // Hand-edited config: declares the target, but the index is still
+        // pinned to the old model (or absent) — rebuild instead of no-op.
+        assert_eq!(
+            decide_use_action("ruri", "ruri", Some("old-model")),
+            UseAction::Rebuild
+        );
+        assert_eq!(decide_use_action("ruri", "ruri", None), UseAction::Rebuild);
     }
 }
