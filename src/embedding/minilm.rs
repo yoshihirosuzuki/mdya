@@ -49,7 +49,11 @@ impl MiniLm {
             .fetch_model_file(MINILM_L6_V2_MODEL_ID, MINILM_L6_V2_REVISION, "config.json")
             .await?;
         let tokenizer_path = cache
-            .fetch_model_file(MINILM_L6_V2_MODEL_ID, MINILM_L6_V2_REVISION, "tokenizer.json")
+            .fetch_model_file(
+                MINILM_L6_V2_MODEL_ID,
+                MINILM_L6_V2_REVISION,
+                "tokenizer.json",
+            )
             .await?;
         let weights_path = cache
             .fetch_model_file(
@@ -74,8 +78,9 @@ impl MiniLm {
             .map_err(|e| EmbedError::Tokenizer(format!("load: {e}")))?;
         // Enable BatchLongest right-side padding so `encode_batch` returns
         // uniform-length rows that stack into a single tensor.
-        let pad_id = u32::try_from(config.pad_token_id)
-            .map_err(|_| EmbedError::Tokenizer(format!("pad_token_id {} too large", config.pad_token_id)))?;
+        let pad_id = u32::try_from(config.pad_token_id).map_err(|_| {
+            EmbedError::Tokenizer(format!("pad_token_id {} too large", config.pad_token_id))
+        })?;
         let pad_token = tokenizer
             .id_to_token(pad_id)
             .ok_or_else(|| EmbedError::Tokenizer(format!("pad token id {pad_id} not in vocab")))?;

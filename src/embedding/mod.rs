@@ -265,7 +265,8 @@ mod tests {
 
     #[test]
     fn find_on_device_preset_returns_minilm_with_empty_prefixes() {
-        let preset = find_on_device_preset(MINILM_L6_V2_MODEL_ID).expect("minilm preset registered");
+        let preset =
+            find_on_device_preset(MINILM_L6_V2_MODEL_ID).expect("minilm preset registered");
         assert_eq!(preset.arch, Arch::Bert);
         assert_eq!(preset.dim, MINILM_L6_V2_DIM);
         // MiniLM embeds plain text — query/passage prefixes are no-ops.

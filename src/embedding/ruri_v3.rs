@@ -201,4 +201,3 @@ impl Embedder for RuriV3_30m {
         self.embed_internal(&prefixed)
     }
 }
-

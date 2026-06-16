@@ -41,8 +41,8 @@ pub async fn resolve_declared_dim(
     ollama_endpoint: &str,
 ) -> Result<i32, DimError> {
     if !model.starts_with(OLLAMA_PREFIX) {
-        let dim = on_device_dim(model)
-            .ok_or_else(|| EmbedError::UnsupportedModel(model.to_string()))?;
+        let dim =
+            on_device_dim(model).ok_or_else(|| EmbedError::UnsupportedModel(model.to_string()))?;
         return Ok(i32::try_from(dim).expect("on-device preset dim fits in i32"));
     }
     if let Some(dim) = read_pinned_vector_dim(config_dir).await? {

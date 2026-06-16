@@ -49,7 +49,10 @@ async fn minilm_l6_v2_real_forward_dim_matches_contract() -> Result<()> {
     let cache = ModelCache::new(cache_dir.path())?;
     let embedder = MiniLm::new(&cache).await?;
 
-    assert_eq!(embedder.model_id(), "sentence-transformers/all-MiniLM-L6-v2");
+    assert_eq!(
+        embedder.model_id(),
+        "sentence-transformers/all-MiniLM-L6-v2"
+    );
     assert_eq!(embedder.dim(), MINILM_EXPECTED_DIM);
 
     let queries = embedder.embed_queries(&["what color is lapis lazuli?", "release checklist"])?;
