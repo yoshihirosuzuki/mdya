@@ -1,8 +1,8 @@
-//! `RuriV3_30m` — default embedder.
+//! `MiniLm` — `sentence-transformers/all-MiniLM-L6-v2` embedder.
 //!
-//! Backed by `cl-nagoya/ruri-v3-30m` (ModernBERT-Ja-30m fine-tuned for Japanese
-//! retrieval, 256-dim, Apache 2.0). Applies the retrieval prefixes
-//! `検索クエリ: ` / `検索文書: ` internally so callers pass plain text.
+//! A small English BERT sentence-transformer (6-layer, 384-dim, Apache 2.0,
+//! ~22 MB). Uses no retrieval prefix (queries and passages are embedded as
+//! plain text), so the registry pairs it with empty prefixes.
 //!
 //! Mean-pools the last hidden state with the attention mask, then L2-normalizes
 //! the row so cosine similarity is well-defined (LanceDB index uses
@@ -10,76 +10,72 @@
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::modernbert::{Config, ModernBert};
+use candle_transformers::models::bert::{BertModel, Config};
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 
 use super::pooling::{l2_normalize, mean_pool};
 use super::{EmbedError, Embedder, ModelCache, RetrievalPrefixes, find_on_device_preset};
 
-pub const RURI_V3_30M_MODEL_ID: &str = "cl-nagoya/ruri-v3-30m";
+pub const MINILM_L6_V2_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 
-/// Pinned commit hash of `cl-nagoya/ruri-v3-30m` on Hugging Face. Captured
-/// from `huggingface.co/api/models/cl-nagoya/ruri-v3-30m` (main) at the time
-/// this embedder was added (2026-05-25). Bumped only via a deliberate
-/// version change — the revision is code-hard-coded, not surfaced in
-/// `config.yml`.
-pub const RURI_V3_30M_REVISION: &str = "24899e5de370b56d179604a007c0d727bf144504";
+/// Pinned commit hash of `sentence-transformers/all-MiniLM-L6-v2` on Hugging
+/// Face. Captured from `huggingface.co/api/models/...` (main) when this
+/// embedder was added (2026-06-16). Bumped only via a deliberate version
+/// change — the revision is code-hard-coded, not surfaced in `config.yml`.
+pub const MINILM_L6_V2_REVISION: &str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
 
-/// Output vector dimension. Re-exported as `RURI_V3_30M_DIM` from
-/// the `embedding` module so callers (e.g. `mdya init` building the chunks
-/// table schema) can pin the LanceDB `FixedSizeList` without instantiating
-/// the embedder.
-pub const HIDDEN_SIZE: usize = 256;
+/// Output vector dimension. Re-exported as `MINILM_L6_V2_DIM` from the
+/// `embedding` module so the on-device preset registry and the schema-dim
+/// resolver can pin the LanceDB `FixedSizeList` without instantiating the
+/// embedder.
+pub const HIDDEN_SIZE: usize = 384;
 
-pub struct RuriV3_30m {
-    model: ModernBert,
+pub struct MiniLm {
+    model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
     /// Retrieval prefixes sourced from this model's entry in the embedding
-    /// preset registry, applied in `embed_queries` / `embed_passages`.
+    /// preset registry (empty for MiniLM), applied in `embed_queries` /
+    /// `embed_passages`.
     prefixes: RetrievalPrefixes,
 }
 
-impl RuriV3_30m {
-    /// Fetch the three required files via `cache`, then load the ModernBERT
-    /// graph and tokenizer into memory. Network access happens at most on the
-    /// first call per filesystem cache; subsequent calls are pure disk hits.
+impl MiniLm {
+    /// Fetch the three required files via `cache`, then load the BERT graph and
+    /// tokenizer into memory. Network access happens at most on the first call
+    /// per filesystem cache; subsequent calls are pure disk hits.
     pub async fn new(cache: &ModelCache) -> Result<Self, EmbedError> {
         let config_path = cache
-            .fetch_model_file(RURI_V3_30M_MODEL_ID, RURI_V3_30M_REVISION, "config.json")
+            .fetch_model_file(MINILM_L6_V2_MODEL_ID, MINILM_L6_V2_REVISION, "config.json")
             .await?;
         let tokenizer_path = cache
-            .fetch_model_file(RURI_V3_30M_MODEL_ID, RURI_V3_30M_REVISION, "tokenizer.json")
+            .fetch_model_file(MINILM_L6_V2_MODEL_ID, MINILM_L6_V2_REVISION, "tokenizer.json")
             .await?;
         let weights_path = cache
             .fetch_model_file(
-                RURI_V3_30M_MODEL_ID,
-                RURI_V3_30M_REVISION,
+                MINILM_L6_V2_MODEL_ID,
+                MINILM_L6_V2_REVISION,
                 "model.safetensors",
             )
             .await?;
 
         let config: Config = serde_json::from_slice(&std::fs::read(&config_path)?)?;
-        // Defense against silent `config.json` / `RURI_V3_30M_REVISION` drift:
-        // catch it the moment we load the file instead of way deeper in the
-        // forward pass.
+        // Defense against silent `config.json` / `MINILM_L6_V2_REVISION` drift:
+        // catch a dim mismatch at load instead of deep in the forward pass.
         if config.hidden_size != HIDDEN_SIZE {
             return Err(EmbedError::Forward(format!(
                 "config.hidden_size={} disagrees with compiled HIDDEN_SIZE={HIDDEN_SIZE} \
-                 (revision {RURI_V3_30M_REVISION} may have shifted)",
+                 (revision {MINILM_L6_V2_REVISION} may have shifted)",
                 config.hidden_size
             )));
         }
-        // Truncation is intentionally not configured. ruri-v3-30m supports
-        // 8192 tokens via ModernBERT RoPE; Markdown inputs rarely exceed
-        // that, and overflow surfaces as a candle error at forward time. If
-        // long-context inputs become routine, add `TruncationParams`.
+
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| EmbedError::Tokenizer(format!("load: {e}")))?;
-        // ruri-v3 ships its tokenizer.json without a baked-in padding policy;
-        // enable BatchLongest right-side padding so `encode_batch` returns
-        // uniform-length rows that we can stack into a single tensor.
-        let pad_id = config.pad_token_id;
+        // Enable BatchLongest right-side padding so `encode_batch` returns
+        // uniform-length rows that stack into a single tensor.
+        let pad_id = u32::try_from(config.pad_token_id)
+            .map_err(|_| EmbedError::Tokenizer(format!("pad_token_id {} too large", config.pad_token_id)))?;
         let pad_token = tokenizer
             .id_to_token(pad_id)
             .ok_or_else(|| EmbedError::Tokenizer(format!("pad token id {pad_id} not in vocab")))?;
@@ -93,25 +89,16 @@ impl RuriV3_30m {
         }));
 
         let device = Device::Cpu;
-        // ruri-v3-30m is published via SentenceTransformers, so its safetensors
-        // keys are root-rooted (`embeddings.tok_embeddings.weight`, etc.). The
-        // upstream `candle_transformers::models::modernbert::ModernBert::load`
-        // expects the canonical answerdotai/ModernBERT layout (`model.*`), so
-        // we re-key every tensor with a `model.` prefix before handing it to
-        // `VarBuilder::from_tensors`.
+        // all-MiniLM-L6-v2's `config.json` declares `model_type: "bert"`, so
+        // `BertModel::load` resolves both the root (`embeddings.*`) and the
+        // SentenceTransformers (`bert.embeddings.*`) key layouts via its
+        // built-in fallback — no manual re-keying is needed here.
         let raw = candle_core::safetensors::load(&weights_path, &device)?;
-        let renamed: std::collections::HashMap<String, Tensor> = raw
-            .into_iter()
-            .map(|(k, v)| (format!("model.{k}"), v))
-            .collect();
-        let vb = VarBuilder::from_tensors(renamed, DType::F32, &device);
-        let model = ModernBert::load(vb, &config)?;
+        let vb = VarBuilder::from_tensors(raw, DType::F32, &device);
+        let model = BertModel::load(vb, &config)?;
 
-        // Retrieval prefixes live in the preset registry so every embedder
-        // applies them through the same seam; ruri is a compile-time entry, so
-        // a missing lookup is a programmer error, not a runtime condition.
-        let prefixes = find_on_device_preset(RURI_V3_30M_MODEL_ID)
-            .expect("ruri-v3-30m must be registered in ON_DEVICE_PRESETS")
+        let prefixes = find_on_device_preset(MINILM_L6_V2_MODEL_ID)
+            .expect("all-MiniLM-L6-v2 must be registered in ON_DEVICE_PRESETS")
             .prefixes;
 
         Ok(Self {
@@ -123,9 +110,8 @@ impl RuriV3_30m {
     }
 
     fn embed_internal(&self, prefixed: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        // Empty input must not reach candle: `Tensor::from_vec` of an empty
-        // batch produces zero-sized tensors that the ModernBERT forward pass
-        // is not built to consume.
+        // Empty input must not reach candle: zero-sized tensors are not a
+        // shape the BERT forward pass is built to consume.
         if prefixed.is_empty() {
             return Ok(Vec::new());
         }
@@ -145,9 +131,6 @@ impl RuriV3_30m {
         let mut mask: Vec<u32> = Vec::with_capacity(batch_size * max_len);
         for enc in &encodings {
             if enc.get_ids().len() != max_len {
-                // tokenizers::encode_batch pads to the longest row by default;
-                // we treat a violation here as an internal invariant breach
-                // rather than re-padding manually.
                 return Err(EmbedError::Tokenizer(format!(
                     "encode_batch produced ragged rows: max_len={max_len}, row={}",
                     enc.get_ids().len()
@@ -159,11 +142,13 @@ impl RuriV3_30m {
 
         let input_ids = Tensor::from_vec(ids, (batch_size, max_len), &self.device)?;
         let attention_mask = Tensor::from_vec(mask, (batch_size, max_len), &self.device)?;
+        // Single-sentence inputs are all segment 0; BERT still requires the
+        // token_type_ids tensor, unlike ModernBERT.
+        let token_type_ids = Tensor::zeros((batch_size, max_len), DType::U32, &self.device)?;
 
-        // candle errors propagate as `EmbedError::Candle` via `#[from]`; only
-        // the post-processing helpers (`mean_pool`, `l2_normalize`, `to_vec2`)
-        // and shape invariants wear the `Forward` variant.
-        let hidden = self.model.forward(&input_ids, &attention_mask)?;
+        let hidden = self
+            .model
+            .forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
         let pooled = mean_pool(&hidden, &attention_mask)?;
         let normalized = l2_normalize(&pooled)?;
 
@@ -179,9 +164,9 @@ impl RuriV3_30m {
     }
 }
 
-impl Embedder for RuriV3_30m {
+impl Embedder for MiniLm {
     fn model_id(&self) -> &str {
-        RURI_V3_30M_MODEL_ID
+        MINILM_L6_V2_MODEL_ID
     }
 
     fn dim(&self) -> usize {
@@ -201,4 +186,3 @@ impl Embedder for RuriV3_30m {
         self.embed_internal(&prefixed)
     }
 }
-

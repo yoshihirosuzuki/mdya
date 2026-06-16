@@ -593,6 +593,11 @@ runtime:
     }
 
     #[test]
+    fn validate_embedding_model_accepts_the_minilm_preset() {
+        assert!(validate_embedding_model("sentence-transformers/all-MiniLM-L6-v2").is_ok());
+    }
+
+    #[test]
     fn validate_embedding_model_accepts_an_ollama_value() {
         assert!(validate_embedding_model("ollama:nomic-embed-text").is_ok());
     }
