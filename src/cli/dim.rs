@@ -11,7 +11,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::embedding::{EmbedError, Embedder, OLLAMA_PREFIX, OllamaEmbedder, RURI_V3_30M_DIM};
+use crate::embedding::{EmbedError, Embedder, OLLAMA_PREFIX, OllamaEmbedder, on_device_dim};
 use crate::store::{self, CHUNKS_TABLE_NAME, metadata_check::METADATA_KEY_VECTOR_DIM};
 
 #[derive(Debug, Error)]
@@ -30,18 +30,20 @@ pub enum DimError {
 }
 
 /// Resolve the dim to pass to the schema-metadata pin check / table creation.
-/// Returns the on-device `cl-nagoya/ruri-v3-30m` compile-time dim for the
-/// default model, the pinned dim already stored in the `chunks` table for an
-/// `ollama:` model, or the probed dim when no table exists yet. An unrecognized
-/// `embedding.model` is rejected earlier at config load
-/// (`validate_embedding_model`), so only validated models reach this resolver.
+/// Returns the on-device preset's compile-time dim for an on-device model, the
+/// pinned dim already stored in the `chunks` table for an `ollama:` model, or
+/// the probed dim when no table exists yet. An unrecognized `embedding.model`
+/// is rejected earlier at config load (`validate_embedding_model`), so only
+/// validated models reach this resolver.
 pub async fn resolve_declared_dim(
     config_dir: &Path,
     model: &str,
     ollama_endpoint: &str,
 ) -> Result<i32, DimError> {
     if !model.starts_with(OLLAMA_PREFIX) {
-        return Ok(i32::try_from(RURI_V3_30M_DIM).expect("RURI_V3_30M_DIM (256) fits in i32"));
+        let dim =
+            on_device_dim(model).ok_or_else(|| EmbedError::UnsupportedModel(model.to_string()))?;
+        return Ok(i32::try_from(dim).expect("on-device preset dim fits in i32"));
     }
     if let Some(dim) = read_pinned_vector_dim(config_dir).await? {
         return Ok(dim);
