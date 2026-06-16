@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
+use assert_cmd::Command as CliCommand;
+use predicates::str::contains;
 use tempfile::TempDir;
 
 use mdya::config::{self, CollectionEntry, Config};
@@ -359,5 +361,92 @@ async fn missing_sources_row_is_reinserted_on_next_update_all() -> Result<()> {
     // Re-running must re-insert the missing mirror, not skip the file.
     ingest(&base, &coll_dir).await?;
     assert_eq!(get_document(&base, "notes", "doc.md").await?, original);
+    Ok(())
+}
+
+/// Set `get.cli_max_bytes` in an existing `config.yml` and persist it.
+async fn set_cli_max_bytes(base: &Path, max_bytes: u64) -> Result<()> {
+    let cfg_path = base.join("config.yml");
+    let mut cfg = config::load(&cfg_path)?;
+    cfg.get.cli_max_bytes = max_bytes;
+    config::save(&cfg_path, &cfg)?;
+    Ok(())
+}
+
+fn mdya_get(base: &Path, extra: &[&str]) -> CliCommand {
+    let mut cmd = CliCommand::cargo_bin("mdya").expect("binary builds");
+    cmd.args([
+        "--config-dir",
+        base.to_str().unwrap(),
+        "get",
+        "notes",
+        "big.md",
+    ]);
+    cmd.args(extra);
+    cmd
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_get_enforces_cli_max_bytes_and_honors_the_bypass_flag() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
+    let (base, coll_dir) = setup(&tmp).await?;
+
+    // A full document comfortably over the small cap we set below.
+    let big = format!("# Big\n\n{}\n", "lorem ipsum dolor ".repeat(8));
+    write_md(&coll_dir, "big.md", &big);
+    ingest(&base, &coll_dir).await?;
+    assert!(big.len() as u64 > 64, "fixture must exceed the test cap");
+    set_cli_max_bytes(&base, 64).await?;
+
+    // Over the cap, no flag: exit 1 with the human error + override hint on
+    // stderr, and nothing on stdout (the document must not leak past the cap).
+    mdya_get(&base, &[])
+        .assert()
+        .failure()
+        .stdout(predicates::str::is_empty())
+        .stderr(contains("document too large"))
+        .stderr(contains("use --no-size-limit to override"));
+
+    // `-f` bypasses the cap and prints the document byte-for-byte.
+    mdya_get(&base, &["-f"])
+        .assert()
+        .success()
+        .stdout(big.clone());
+
+    // `--no-size-limit` (the long form) behaves identically.
+    mdya_get(&base, &["--no-size-limit"])
+        .assert()
+        .success()
+        .stdout(big.clone());
+
+    // `cli_max_bytes: 0` disables the cap entirely — the same over-cap
+    // document now prints without a flag.
+    set_cli_max_bytes(&base, 0).await?;
+    mdya_get(&base, &[]).assert().success().stdout(big.clone());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_get_chunk_path_is_never_size_checked() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
+    let (base, coll_dir) = setup(&tmp).await?;
+
+    let big = format!("# Big\n\n{}\n", "lorem ipsum dolor ".repeat(8));
+    write_md(&coll_dir, "big.md", &big);
+    ingest(&base, &coll_dir).await?;
+    // Cap below even one chunk body: the full-document path would fail, but
+    // `--chunk` must still succeed (chunk reads are out of the guard's scope).
+    set_cli_max_bytes(&base, 1).await?;
+
+    mdya_get(&base, &["--chunk", "0"])
+        .assert()
+        .success()
+        .stdout(contains("lorem ipsum dolor"));
+
     Ok(())
 }

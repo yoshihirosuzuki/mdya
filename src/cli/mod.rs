@@ -115,6 +115,12 @@ pub enum Command {
         /// between a snippet and the whole file.
         #[arg(long = "chunk", value_name = "N")]
         chunk: Option<u32>,
+        /// Bypass the `get.cli_max_bytes` output-size cap and print the full
+        /// document regardless of size — for redirects / pipes where a large
+        /// output is intended. Has no effect with `--chunk` (chunk reads are
+        /// never size-checked).
+        #[arg(short = 'f', long = "no-size-limit")]
+        no_size_limit: bool,
     },
 
     /// Print the package version. Stable surface for MCP / scripted callers.
@@ -306,8 +312,16 @@ impl Cli {
                 collection,
                 path,
                 chunk,
+                no_size_limit,
             } => {
-                get::run(config_dir.as_deref(), &collection, &path, chunk).await?;
+                get::run(
+                    config_dir.as_deref(),
+                    &collection,
+                    &path,
+                    chunk,
+                    no_size_limit,
+                )
+                .await?;
             }
             Command::Version => {
                 println!("mdya v{}", env!("CARGO_PKG_VERSION"));

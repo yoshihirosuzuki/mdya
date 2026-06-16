@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Published to [crates.io](https://crates.io/crates/mdya): `cargo install mdya` now works alongside the prebuilt installers. This path builds from source and requires `protoc`.
+- A `get` section in `config.yml` with `cli_max_bytes` and `mcp_max_bytes` (both default 1 MiB; `0` disables) capping the size of a full document returned by `mdya get` and the MCP `get_document` tool. `mdya get` gained a `-f` / `--no-size-limit` flag to bypass the cap for a single run.
+
+### Changed
+
+- `mdya get` and the MCP `get_document` tool now refuse to return a full document larger than 1 MiB by default, to avoid flooding a terminal or an LLM's context budget. Restore the previous unlimited behavior by passing `-f` / `--no-size-limit` to `mdya get`, or by raising / disabling (`0`) the new `get.cli_max_bytes` / `get.mcp_max_bytes` caps in `config.yml`. Single-chunk reads (`--chunk` / the MCP `chunk` parameter) are not size-checked.
 
 ## [0.3.2] - 2026-06-13
 

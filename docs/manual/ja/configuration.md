@@ -1,6 +1,6 @@
 # 設定
 
-mdya の設定は `~/.mdya/config.yml` の 1 ファイルにまとまっています。`mdya init` がひな形を生成し、`mdya collection add` がコレクションのセクションを書き換えます。多くの場合手で編集する必要はありませんが、`embedding` や `runtime` の値を変えたいときは直接編集できます。
+mdya の設定は `~/.mdya/config.yml` の 1 ファイルにまとまっています。`mdya init` がひな形を生成し、`mdya collection add` がコレクションのセクションを書き換えます。多くの場合手で編集する必要はありませんが、`embedding` / `runtime` / `get` の値を変えたいときは直接編集できます。
 
 ## ディレクトリレイアウト
 
@@ -51,9 +51,12 @@ embedding:
 runtime:
   memory_limit_mb: 8192
   embed_parallelism: 8
+get:
+  cli_max_bytes: 1048576
+  mcp_max_bytes: 1048576
 ```
 
-セクションは 3 つあります。
+セクションは 4 つあります。
 
 ### collections
 
@@ -117,3 +120,23 @@ mdya プロセス自身の使用メモリ (RSS) の上限を MB で指定しま�
 - `0` (逐次) ≈ 1.5 GB
 
 メモリ上限に引っかかって 137 で落ちる場合は、まず並列度を下げてみてください。
+
+### get
+
+`mdya get` と MCP `get_document` ツールが返す document 全文のサイズ上限です。単位は UTF-8 バイト数です。
+
+```yaml
+get:
+  cli_max_bytes: 1048576
+  mcp_max_bytes: 1048576
+```
+
+#### cli_max_bytes
+
+`mdya get` がエラーで停止せずに出力する document 全文の最大サイズです。default は `1048576` (= 1 MiB)。`0` で無効化されます。
+
+`mdya get` に `-f` / `--no-size-limit` を渡すと、その 1 回だけ上限を無視して出力します (大きな document を意図的にリダイレクト / パイプするときに便利)。上限が効くのは全文取得のみで、`mdya get --chunk <N>` は対象外です。
+
+#### mcp_max_bytes
+
+MCP `get_document` ツールが `payload_too_large` エラーを返さずに返す document 全文の最大サイズです。default は `1048576` (= 1 MiB)。`0` で無効化されます。MCP 側にはリクエスト単位の上書きはありません。CLI と同様に `chunk` 取得は対象外です。

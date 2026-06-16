@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config;
 use crate::embedding::{EmbedError, Embedder, ModelCache, RURI_V3_30M_DIM, RuriV3_30m};
-use crate::get::{get_chunk, get_document};
+use crate::get::{GetError, check_size_limit, configured_size_limit, get_chunk, get_document};
 use crate::introspect::{self, CollectionListReport};
 use crate::search::{SearchEngine, SearchError, SearchMode, SearchResponse};
 
@@ -175,7 +175,7 @@ impl Server {
         } = req;
         let content = match chunk {
             Some(seq) => get_chunk(&self.config_dir, &collection, &path, seq).await,
-            None => get_document(&self.config_dir, &collection, &path).await,
+            None => self.full_document_within_cap(&collection, &path).await,
         }
         .map_err(|e| Json(McpToolError::from(e)))?;
         Ok(Json(GetDocumentResponse {
@@ -183,6 +183,25 @@ impl Server {
             path,
             content,
         }))
+    }
+
+    /// Fetch the faithful full document and enforce the MCP output cap
+    /// (`get.mcp_max_bytes`, `0` = disabled). The document is read in full
+    /// before the cap is applied: the cap bounds the *emitted* payload (the
+    /// client's context budget), not the read. Unlike the CLI there is no
+    /// per-call bypass: an LLM that always opted out would defeat the
+    /// context-budget protection this guard exists for. An over-cap document
+    /// surfaces as [`GetError::DocumentTooLarge`], which the tool's
+    /// [`McpToolError`] projection renders as `payload_too_large`.
+    async fn full_document_within_cap(
+        &self,
+        collection: &str,
+        path: &str,
+    ) -> Result<String, GetError> {
+        let cfg = config::load(&self.config_dir.join("config.yml"))?;
+        let content = get_document(&self.config_dir, collection, path).await?;
+        check_size_limit(&content, configured_size_limit(cfg.get.mcp_max_bytes))?;
+        Ok(content)
     }
 
     #[tool(

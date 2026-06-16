@@ -3,7 +3,7 @@
 //! `Config` is an information holder; `ConfigStore` (sibling module) carries
 //! the load/save behavior. Chunking is fixed in source rather than user-
 //! configurable, so the schema has no `chunking` section. The remaining
-//! sections are `collections` / `embedding` / `runtime`.
+//! sections are `collections` / `embedding` / `runtime` / `get`.
 
 use std::collections::BTreeMap;
 
@@ -43,6 +43,12 @@ pub const MAX_EMBED_PARALLELISM: usize = 1024;
 /// works out of the box without any YAML override.
 pub const DEFAULT_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
 
+/// Default for `get.cli_max_bytes` / `get.mcp_max_bytes`. 1 MiB is the
+/// user-perceived line above which returning a whole document hurts more
+/// than it helps: it floods an interactive terminal, and it blows an LLM's
+/// context budget through MCP. `0` disables the cap on either channel.
+pub const DEFAULT_GET_MAX_BYTES: u64 = 1024 * 1024;
+
 /// Root of `config.yml`. See `docs/manual/en/configuration.md` for the
 /// user-facing field reference.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,6 +65,12 @@ pub struct Config {
     /// silently on next load. `0` disables the guard.
     #[serde(default)]
     pub runtime: RuntimeConfig,
+
+    /// Output-size guard for `mdya get` / MCP `get_document`. The whole
+    /// section is `#[serde(default)]` so a `config.yml` without `get:` still
+    /// gets the 1 MiB caps applied silently on next load. `0` disables a cap.
+    #[serde(default)]
+    pub get: GetConfig,
 }
 
 /// One row under `collections`. `path` stays as the user-typed string
@@ -178,6 +190,42 @@ fn default_embed_parallelism() -> usize {
     DEFAULT_EMBED_PARALLELISM
 }
 
+/// Output-size guard for the document-read paths. Kept separate from
+/// [`RuntimeConfig`] (process-safety knobs) because this bounds what a
+/// full-document read *emits*, not what the ingest pipeline consumes. The
+/// CLI and MCP caps are independent fields because their failure modes
+/// differ: the CLI cap is overridable per call with `--no-size-limit` (a
+/// terminal redirect / pipe is a legitimate large-output use), while the
+/// MCP cap has no bypass (an LLM that always opted out would hollow out the
+/// context-budget protection). Both apply only to the full-document path;
+/// chunk reads are never size-checked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetConfig {
+    /// Max UTF-8 bytes `mdya get` emits for a full document before it errors.
+    /// `0` disables the cap. `-f` / `--no-size-limit` bypasses it per call.
+    #[serde(default = "default_get_max_bytes")]
+    pub cli_max_bytes: u64,
+
+    /// Max UTF-8 bytes MCP `get_document` returns for a full document before
+    /// a `payload_too_large` error. `0` disables the cap; there is no MCP
+    /// bypass parameter.
+    #[serde(default = "default_get_max_bytes")]
+    pub mcp_max_bytes: u64,
+}
+
+impl Default for GetConfig {
+    fn default() -> Self {
+        Self {
+            cli_max_bytes: DEFAULT_GET_MAX_BYTES,
+            mcp_max_bytes: DEFAULT_GET_MAX_BYTES,
+        }
+    }
+}
+
+fn default_get_max_bytes() -> u64 {
+    DEFAULT_GET_MAX_BYTES
+}
+
 impl Config {
     /// The `chunking` section is intentionally absent because chunking is
     /// fixed in source rather than user-configurable.
@@ -189,6 +237,7 @@ impl Config {
                 ollama: OllamaConfig::default(),
             },
             runtime: RuntimeConfig::default(),
+            get: GetConfig::default(),
         }
     }
 }
@@ -620,5 +669,86 @@ runtime:
             panic!("expected UnsupportedEmbeddingModel");
         };
         assert!(supported.contains("cl-nagoya/ruri-v3-30m"));
+    }
+
+    #[test]
+    fn init_template_pins_the_default_get_caps() {
+        let cfg = Config::init_template();
+        assert_eq!(cfg.get.cli_max_bytes, 1_048_576);
+        assert_eq!(cfg.get.mcp_max_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn init_template_surfaces_the_get_section_in_serialized_yaml() {
+        // The `get:` caps are tuning knobs users discover by seeing them in
+        // the generated config (same treatment as `runtime:`), so the
+        // template must emit the section rather than rely on the silent
+        // serde default alone.
+        let cfg = Config::init_template();
+        let yaml = serde_saphyr::to_string(&cfg).expect("serialize");
+        assert!(
+            yaml.contains("cli_max_bytes") && yaml.contains("mcp_max_bytes"),
+            "init template must surface the get caps; got:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn yaml_without_get_section_falls_back_to_struct_default() {
+        // A config.yml predating the `get:` section must still pin the 1 MiB
+        // caps so the output guard is on by default on next load.
+        let yaml = "\
+collections: {}
+embedding:
+  model: cl-nagoya/ruri-v3-30m
+";
+        let cfg: Config = serde_saphyr::from_str(yaml).expect("deserialize");
+        assert_eq!(cfg.get.cli_max_bytes, 1_048_576);
+        assert_eq!(cfg.get.mcp_max_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn yaml_with_partial_get_section_fills_missing_cap_from_default() {
+        // Setting only one cap must leave the other at its struct default,
+        // the same per-field fallback `runtime` keys get.
+        let yaml = "\
+collections: {}
+embedding:
+  model: cl-nagoya/ruri-v3-30m
+get:
+  cli_max_bytes: 5242880
+";
+        let cfg: Config = serde_saphyr::from_str(yaml).expect("deserialize");
+        assert_eq!(cfg.get.cli_max_bytes, 5_242_880);
+        assert_eq!(cfg.get.mcp_max_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn yaml_with_get_caps_zero_round_trips_as_disable_sentinel() {
+        // Users disable a cap by setting it to `0`; that edit must survive a
+        // write-read cycle on both channels.
+        let mut cfg = Config::init_template();
+        cfg.get.cli_max_bytes = 0;
+        cfg.get.mcp_max_bytes = 0;
+
+        let yaml = serde_saphyr::to_string(&cfg).expect("serialize");
+        let back: Config = serde_saphyr::from_str(&yaml).expect("deserialize");
+
+        assert_eq!(back.get.cli_max_bytes, 0);
+        assert_eq!(back.get.mcp_max_bytes, 0);
+    }
+
+    #[test]
+    fn yaml_with_explicit_get_caps_overrides_struct_default() {
+        let yaml = "\
+collections: {}
+embedding:
+  model: cl-nagoya/ruri-v3-30m
+get:
+  cli_max_bytes: 2097152
+  mcp_max_bytes: 4194304
+";
+        let cfg: Config = serde_saphyr::from_str(yaml).expect("deserialize");
+        assert_eq!(cfg.get.cli_max_bytes, 2_097_152);
+        assert_eq!(cfg.get.mcp_max_bytes, 4_194_304);
     }
 }
