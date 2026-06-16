@@ -230,13 +230,18 @@ Markdown に整形した人間 / agent 向けビューです。複数行 snippet
 文書の原文を stdout に出力します。検索ヒットから元の文書を取り出すときに使います。
 
 ```sh
-mdya get <collection> <path>
+mdya get <collection> <path> [--chunk <N>] [-f]
 ```
 
 | 引数 | 役割 |
 |---|---|
 | `<collection>` (必須) | コレクション名 (`config.yml` で宣言済みのもの) |
 | `<path>` (必須) | コレクションルートからの相対パス |
+
+| オプション | 役割 |
+|---|---|
+| `--chunk <N>` | document 全文ではなくチャンク `N` (0-indexed) の本文だけを出力する。サイズ check は行わない |
+| `-f`, `--no-size-limit` | `get.cli_max_bytes` の上限を無視してサイズに関わらず出力する |
 
 例:
 
@@ -245,6 +250,8 @@ mdya get notes release.md
 ```
 
 ファイルシステムではなく索引内に保存された原文を返します。`mdya update-all` を実行していない / 取り込まれていない文書は取得できません。
+
+`mdya get` は document が `get.cli_max_bytes` (default 1 MiB、[`configuration.md` の `cli_max_bytes`](configuration.md#cli_max_bytes) 参照) を超えると既定でエラー停止し、巨大なファイルをうっかり取得して端末を埋め尽くすのを防ぎます。意図的に大きな document をリダイレクト / パイプするときは `-f` / `--no-size-limit` を渡すとそのまま出力できます。
 
 ---
 

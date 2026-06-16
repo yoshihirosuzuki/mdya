@@ -35,6 +35,11 @@ pub enum McpErrorCode {
     InvalidLimit,
     UnknownCollection,
     NotFound,
+    /// A full `get_document` response exceeded `get.mcp_max_bytes`. The
+    /// client cannot retry around it (there is no MCP bypass), but it can
+    /// read `details.size_bytes` / `details.limit_bytes` to decide whether
+    /// to narrow the request (e.g. fetch a single `chunk` instead).
+    PayloadTooLarge,
     SchemaMetadataMissing,
     Internal,
 }
@@ -104,6 +109,13 @@ impl From<GetError> for McpToolError {
                     "path": path,
                     "chunk_sequence": chunk_sequence,
                 })),
+            ),
+            GetError::DocumentTooLarge {
+                size_bytes,
+                limit_bytes,
+            } => (
+                McpErrorCode::PayloadTooLarge,
+                Some(json!({ "size_bytes": size_bytes, "limit_bytes": limit_bytes })),
             ),
             GetError::Config(_)
             | GetError::LancedbPathNotUtf8 { .. }
@@ -222,6 +234,27 @@ mod tests {
                 "path": "release.md",
                 "chunk_sequence": 7,
             }))
+        );
+    }
+
+    #[test]
+    fn get_document_too_large_maps_to_payload_too_large_with_byte_details() {
+        let err = McpToolError::from(GetError::DocumentTooLarge {
+            size_bytes: 2_621_440,
+            limit_bytes: 1_048_576,
+        });
+        assert_eq!(err.code, McpErrorCode::PayloadTooLarge);
+        assert_eq!(
+            err.details,
+            Some(json!({ "size_bytes": 2_621_440, "limit_bytes": 1_048_576 }))
+        );
+    }
+
+    #[test]
+    fn payload_too_large_serialises_as_snake_case_token() {
+        assert_eq!(
+            serde_json::to_value(McpErrorCode::PayloadTooLarge).unwrap(),
+            json!("payload_too_large")
         );
     }
 

@@ -230,13 +230,18 @@ When a search fails under a non-`human` format, stdout is empty and the error is
 Prints the original text of a document to stdout. Useful when you want to retrieve the source document for a search hit.
 
 ```sh
-mdya get <collection> <path>
+mdya get <collection> <path> [--chunk <N>] [-f]
 ```
 
 | Argument | Purpose |
 |---|---|
 | `<collection>` (required) | Collection name (must be declared in `config.yml`) |
 | `<path>` (required) | Path relative to the collection root |
+
+| Option | Purpose |
+|---|---|
+| `--chunk <N>` | Print only chunk `N` (0-indexed) of the document instead of the full text. Never size-checked |
+| `-f`, `--no-size-limit` | Print the document regardless of size, bypassing the `get.cli_max_bytes` cap |
 
 Example:
 
@@ -245,6 +250,8 @@ mdya get notes release.md
 ```
 
 It returns the text stored in the index, not the live filesystem contents. Documents not yet ingested (e.g. `mdya update-all` has not been run) cannot be retrieved.
+
+By default `mdya get` stops with an error when a document exceeds `get.cli_max_bytes` (1 MiB by default; see [`cli_max_bytes` in configuration.md](configuration.md#cli_max_bytes)), so an accidental fetch of a very large file does not flood your terminal. Pass `-f` / `--no-size-limit` to print it anyway — useful when you redirect or pipe a large document on purpose.
 
 ---
 

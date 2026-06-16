@@ -73,6 +73,43 @@ pub enum GetError {
         path: String,
         chunk_sequence: u32,
     },
+
+    /// A full document exceeded the configured output-size cap (the
+    /// full-document read path only — chunk reads are never size-checked).
+    /// The message is channel-neutral on purpose: the MCP layer surfaces it
+    /// verbatim, where suggesting the CLI's `--no-size-limit` flag would
+    /// mislead a client that has no such bypass. The CLI re-renders its own
+    /// MiB-with-override sentence from the byte fields.
+    #[error("document too large: {size_bytes} bytes exceeds the {limit_bytes}-byte limit")]
+    DocumentTooLarge { size_bytes: u64, limit_bytes: u64 },
+}
+
+/// Translate a configured byte cap into an enforceable limit: `0` is the
+/// documented "disable" sentinel (mirrors `runtime.memory_limit_mb`), so it
+/// maps to `None` (no check). Any positive value is the cap to enforce.
+pub fn configured_size_limit(max_bytes: u64) -> Option<u64> {
+    (max_bytes != 0).then_some(max_bytes)
+}
+
+/// Reject `content` whose UTF-8 byte length exceeds `limit`. `None` disables
+/// the check (the cap was set to `0`, or the CLI caller passed
+/// `--no-size-limit`). Byte length is `str::len`, an O(1) read of the
+/// already-loaded string — the cap guards what a full-document read *emits*
+/// (a terminal flush or an LLM's context budget), not what ingest consumes.
+/// Callers run this only on the full-document path; chunk bodies are out of
+/// scope (they stay well under the cap by construction).
+pub fn check_size_limit(content: &str, limit: Option<u64>) -> Result<(), GetError> {
+    let Some(limit_bytes) = limit else {
+        return Ok(());
+    };
+    let size_bytes = content.len() as u64;
+    if size_bytes > limit_bytes {
+        return Err(GetError::DocumentTooLarge {
+            size_bytes,
+            limit_bytes,
+        });
+    }
+    Ok(())
 }
 
 /// Return the faithful original text of `collection`/`path` from the
@@ -226,4 +263,59 @@ async fn open_chunks_table(config_dir: &Path) -> Result<Table, GetError> {
         .execute()
         .await
         .map_err(GetError::OpenChunksTable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_size_limit_treats_zero_as_disabled() {
+        assert_eq!(configured_size_limit(0), None);
+    }
+
+    #[test]
+    fn configured_size_limit_passes_positive_value_through() {
+        assert_eq!(configured_size_limit(1_048_576), Some(1_048_576));
+    }
+
+    #[test]
+    fn check_size_limit_allows_content_at_or_below_the_cap() {
+        // Exactly at the cap is allowed: the cap is the largest permitted size.
+        assert!(check_size_limit("abc", Some(3)).is_ok());
+        assert!(check_size_limit("ab", Some(3)).is_ok());
+    }
+
+    #[test]
+    fn check_size_limit_rejects_content_over_the_cap_with_byte_fields() {
+        let err = check_size_limit("abcd", Some(3)).expect_err("4 bytes over a 3-byte cap");
+        match err {
+            GetError::DocumentTooLarge {
+                size_bytes,
+                limit_bytes,
+            } => {
+                assert_eq!(size_bytes, 4);
+                assert_eq!(limit_bytes, 3);
+            }
+            other => panic!("expected DocumentTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_size_limit_counts_utf8_bytes_not_chars() {
+        // "あ" is 3 UTF-8 bytes but 1 char; the cap is a byte budget, so a
+        // 2-byte cap must reject it (a char count would wrongly admit it).
+        let err = check_size_limit("あ", Some(2)).expect_err("3 bytes over a 2-byte cap");
+        assert!(
+            matches!(err, GetError::DocumentTooLarge { size_bytes: 3, .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_size_limit_skips_the_check_when_disabled() {
+        // `None` (cap set to 0, or `--no-size-limit`) lets any size through.
+        let huge = "x".repeat(10_000);
+        assert!(check_size_limit(&huge, None).is_ok());
+    }
 }

@@ -1,6 +1,6 @@
 # Configuration
 
-mdya's configuration lives in a single file at `~/.mdya/config.yml`. `mdya init` generates a template, and `mdya collection add` rewrites the collections section. You usually do not need to edit this file by hand, but you can edit the `embedding` and `runtime` values directly when you need to.
+mdya's configuration lives in a single file at `~/.mdya/config.yml`. `mdya init` generates a template, and `mdya collection add` rewrites the collections section. You usually do not need to edit this file by hand, but you can edit the `embedding`, `runtime`, and `get` values directly when you need to.
 
 ## Directory layout
 
@@ -51,9 +51,12 @@ embedding:
 runtime:
   memory_limit_mb: 8192
   embed_parallelism: 8
+get:
+  cli_max_bytes: 1048576
+  mcp_max_bytes: 1048576
 ```
 
-There are three sections.
+There are four sections.
 
 ### collections
 
@@ -117,3 +120,23 @@ Higher parallelism is faster but proportionally increases memory usage. Worst ca
 - `0` (sequential) ≈ 1.5 GB
 
 If you hit the memory limit and the process exits with `137`, try lowering parallelism first.
+
+### get
+
+Caps on the size of a full document returned by `mdya get` and the MCP `get_document` tool. Measured in UTF-8 bytes.
+
+```yaml
+get:
+  cli_max_bytes: 1048576
+  mcp_max_bytes: 1048576
+```
+
+#### cli_max_bytes
+
+The largest full document `mdya get` prints before it stops with an error. Default `1048576` (= 1 MiB). Set to `0` to disable.
+
+Pass `-f` / `--no-size-limit` to `mdya get` to override the cap for a single run — useful when you are redirecting or piping a large document on purpose. The cap applies only to full-document reads; `mdya get --chunk <N>` is never size-checked.
+
+#### mcp_max_bytes
+
+The largest full document the MCP `get_document` tool returns before it responds with a `payload_too_large` error. Default `1048576` (= 1 MiB). Set to `0` to disable. There is no per-request override on the MCP side. As with the CLI, `chunk` reads are never size-checked.

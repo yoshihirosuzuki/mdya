@@ -474,6 +474,106 @@ async fn get_document_with_out_of_range_chunk_carries_chunk_sequence_in_details(
     Ok(())
 }
 
+// ---------- get_document: output-size guard (get.mcp_max_bytes) ----------
+
+/// Build a seeded server whose `get.mcp_max_bytes` is `mcp_max_bytes` and
+/// whose corpus holds an over-cap `big.md`. Returns the server and the
+/// document's exact bytes so a test can assert against the faithful content.
+async fn seeded_server_with_mcp_cap(tmp: &TempDir, mcp_max_bytes: u64) -> Result<(Server, String)> {
+    let (base, coll_dir) = fresh_corpus(tmp).await?;
+    let cfg_path = base.join("config.yml");
+    let mut cfg = mdya::config::load(&cfg_path)?;
+    cfg.get.mcp_max_bytes = mcp_max_bytes;
+    save(&cfg_path, &cfg)?;
+
+    let big = format!("# Big\n\n{}\n", "lorem ipsum dolor ".repeat(8));
+    write_md(&coll_dir, "big.md", &big);
+    ingest(&base, &coll_dir).await?;
+
+    let engine = SearchEngine::open(&base, DEFAULT_MODEL_ID, DEFAULT_VECTOR_DIM_I32).await?;
+    let server = Server::with_seeded_embedder(
+        &base,
+        Path::new(":seeded-embedder-no-cache-needed:"),
+        Arc::new(engine),
+        Arc::new(MockEmbedder),
+    );
+    Ok((server, big))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_document_over_mcp_cap_is_payload_too_large_with_byte_details() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
+    let (server, big) = seeded_server_with_mcp_cap(&tmp, 64).await?;
+
+    let err = server
+        .get_document(Parameters(GetDocumentRequest {
+            collection: "notes".to_string(),
+            path: "big.md".to_string(),
+            chunk: None,
+        }))
+        .await
+        .err()
+        .expect("over-cap full document rejected")
+        .0;
+    assert_eq!(err.code, McpErrorCode::PayloadTooLarge);
+    // The structured details let an LLM see exactly how far over it went and
+    // decide to narrow the request (e.g. fetch a single chunk instead).
+    assert_eq!(
+        err.details,
+        Some(serde_json::json!({ "size_bytes": big.len(), "limit_bytes": 64 }))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_document_chunk_path_ignores_the_mcp_cap() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
+    // Cap of 1 byte: the full-document path would fail, but a `chunk` read
+    // must still succeed — chunk bodies are out of the guard's scope.
+    let (server, _big) = seeded_server_with_mcp_cap(&tmp, 1).await?;
+
+    let resp = tool_ok(
+        server
+            .get_document(Parameters(GetDocumentRequest {
+                collection: "notes".to_string(),
+                path: "big.md".to_string(),
+                chunk: Some(0),
+            }))
+            .await,
+    );
+    assert!(
+        resp.content.contains("lorem ipsum dolor"),
+        "chunk body returned despite a 1-byte cap: {:?}",
+        resp.content
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_document_with_mcp_cap_zero_returns_the_full_document() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
+    // `0` disables the cap, so an otherwise over-cap document comes back whole.
+    let (server, big) = seeded_server_with_mcp_cap(&tmp, 0).await?;
+
+    let resp = tool_ok(
+        server
+            .get_document(Parameters(GetDocumentRequest {
+                collection: "notes".to_string(),
+                path: "big.md".to_string(),
+                chunk: None,
+            }))
+            .await,
+    );
+    assert_eq!(resp.content, big);
+    Ok(())
+}
+
 // ---------- introspection: list_collections ----------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
