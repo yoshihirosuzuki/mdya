@@ -10,6 +10,7 @@
 //! decisions are encapsulated inside each impl.
 
 mod cache;
+mod embeddinggemma;
 mod minilm;
 mod ollama;
 mod pooling;
@@ -18,6 +19,10 @@ mod ruri_v3;
 use std::sync::Arc;
 
 pub use cache::{ModelCache, ModelCacheError};
+pub use embeddinggemma::{
+    EMBEDDINGGEMMA_MODEL_ID, EMBEDDINGGEMMA_REVISION, EmbeddingGemmaEmbedder,
+    HIDDEN_SIZE as EMBEDDINGGEMMA_DIM,
+};
 pub use minilm::{
     HIDDEN_SIZE as MINILM_L6_V2_DIM, MINILM_L6_V2_MODEL_ID, MINILM_L6_V2_REVISION, MiniLm,
 };
@@ -91,6 +96,8 @@ pub(crate) enum Arch {
     ModernBert,
     /// BERT (all-MiniLM-L6-v2).
     Bert,
+    /// Gemma3 bidirectional encoder (embeddinggemma-300m).
+    Gemma3,
 }
 
 /// Static metadata for one on-device embedding model. [`ON_DEVICE_PRESETS`] is
@@ -123,6 +130,14 @@ const ON_DEVICE_PRESETS: &[OnDevicePreset] = &[
         dim: MINILM_L6_V2_DIM,
         arch: Arch::Bert,
         prefixes: RetrievalPrefixes::new("", ""),
+    },
+    OnDevicePreset {
+        model_id: EMBEDDINGGEMMA_MODEL_ID,
+        dim: EMBEDDINGGEMMA_DIM,
+        arch: Arch::Gemma3,
+        // EmbeddingGemma's task prompts (config_sentence_transformers.json):
+        // query vs document are asymmetric.
+        prefixes: RetrievalPrefixes::new("task: search result | query: ", "title: none | text: "),
     },
 ];
 
@@ -193,6 +208,7 @@ pub async fn build_embedder(
         Some(ModelKind::OnDevice(preset)) => match preset.arch {
             Arch::ModernBert => Ok(Arc::new(RuriV3_30m::new(cache).await?)),
             Arch::Bert => Ok(Arc::new(MiniLm::new(cache).await?)),
+            Arch::Gemma3 => Ok(Arc::new(EmbeddingGemmaEmbedder::new(cache).await?)),
         },
         Some(ModelKind::Ollama) => Ok(Arc::new(OllamaEmbedder::new(model, ollama_endpoint).await?)),
         None => Err(EmbedError::UnsupportedModel(model.to_string())),
@@ -231,6 +247,9 @@ pub enum EmbedError {
     // covers shape invariants and `to_vec2` conversion only.
     #[error("forward pass: {0}")]
     Forward(String),
+
+    #[error("embeddinggemma: {0}")]
+    EmbeddingGemma(String),
 }
 
 #[cfg(test)]
@@ -249,6 +268,14 @@ mod tests {
     fn classify_model_recognizes_the_minilm_preset() {
         assert!(matches!(
             classify_model(MINILM_L6_V2_MODEL_ID),
+            Some(ModelKind::OnDevice(_))
+        ));
+    }
+
+    #[test]
+    fn classify_model_recognizes_the_embeddinggemma_preset() {
+        assert!(matches!(
+            classify_model(EMBEDDINGGEMMA_MODEL_ID),
             Some(ModelKind::OnDevice(_))
         ));
     }
@@ -275,9 +302,26 @@ mod tests {
     }
 
     #[test]
+    fn find_on_device_preset_returns_embeddinggemma_with_task_prompts() {
+        let preset = find_on_device_preset(EMBEDDINGGEMMA_MODEL_ID)
+            .expect("embeddinggemma preset registered");
+        assert_eq!(preset.arch, Arch::Gemma3);
+        assert_eq!(preset.dim, EMBEDDINGGEMMA_DIM);
+        assert_eq!(
+            preset.prefixes.apply_query("q"),
+            "task: search result | query: q"
+        );
+        assert_eq!(preset.prefixes.apply_passage("d"), "title: none | text: d");
+    }
+
+    #[test]
     fn on_device_dim_reports_each_presets_dim_and_none_for_others() {
         assert_eq!(on_device_dim(RURI_V3_30M_MODEL_ID), Some(RURI_V3_30M_DIM));
         assert_eq!(on_device_dim(MINILM_L6_V2_MODEL_ID), Some(MINILM_L6_V2_DIM));
+        assert_eq!(
+            on_device_dim(EMBEDDINGGEMMA_MODEL_ID),
+            Some(EMBEDDINGGEMMA_DIM)
+        );
         assert_eq!(on_device_dim("ollama:nomic-embed-text"), None);
         assert_eq!(on_device_dim("some/other-model"), None);
     }
@@ -292,15 +336,17 @@ mod tests {
     fn is_supported_model_accepts_presets_and_ollama_rejects_unknown() {
         assert!(is_supported_model(RURI_V3_30M_MODEL_ID));
         assert!(is_supported_model(MINILM_L6_V2_MODEL_ID));
+        assert!(is_supported_model(EMBEDDINGGEMMA_MODEL_ID));
         assert!(is_supported_model("ollama:nomic-embed-text"));
         assert!(!is_supported_model("some/other-model"));
     }
 
     #[test]
-    fn on_device_model_ids_lists_both_presets() {
+    fn on_device_model_ids_lists_all_presets() {
         let ids = on_device_model_ids();
         assert!(ids.contains(&RURI_V3_30M_MODEL_ID));
         assert!(ids.contains(&MINILM_L6_V2_MODEL_ID));
+        assert!(ids.contains(&EMBEDDINGGEMMA_MODEL_ID));
     }
 
     #[test]
