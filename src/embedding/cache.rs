@@ -30,6 +30,16 @@ pub enum ModelCacheError {
     },
 }
 
+/// An explicit Hugging Face token from the `HF_TOKEN` environment variable, if
+/// set and non-empty. Returns `None` otherwise so hf-hub keeps its default
+/// token-file discovery (`hf auth login`).
+fn explicit_hf_token() -> Option<String> {
+    std::env::var("HF_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
 /// Single entry point for fetching files from one or more pinned model
 /// revisions. Owns the `hf_hub::Api` configured with a custom cache root.
 pub struct ModelCache {
@@ -42,10 +52,18 @@ impl ModelCache {
     /// is created lazily on the first download by hf-hub; ensuring it exists
     /// ahead of time is the caller's responsibility if they need predictable
     /// behavior on first launch.
+    ///
+    /// Gated models (e.g. `google/embeddinggemma-300m`) require a Hugging Face
+    /// access token. An explicit `HF_TOKEN` environment variable takes
+    /// precedence; otherwise hf-hub falls back to the standard token file
+    /// written by `hf auth login`. Ungated models (the default `ruri-v3-30m`)
+    /// need no token.
     pub fn new(cache_dir: &Path) -> Result<Self, ModelCacheError> {
-        let api = ApiBuilder::new()
-            .with_cache_dir(cache_dir.to_path_buf())
-            .build()?;
+        let mut builder = ApiBuilder::new().with_cache_dir(cache_dir.to_path_buf());
+        if let Some(token) = explicit_hf_token() {
+            builder = builder.with_token(Some(token));
+        }
+        let api = builder.build()?;
         Ok(Self { api })
     }
 
