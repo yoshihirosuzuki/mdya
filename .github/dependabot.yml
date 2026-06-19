@@ -8,6 +8,13 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # arrow must track lancedb's arrow version (currently 58). A standalone
+      # arrow major bump pulls a second arrow into the tree and breaks the
+      # types that cross the lancedb boundary, so it can never merge on its
+      # own. Lift this once lancedb upgrades its arrow and bump arrow by hand.
+      - dependency-name: "arrow-*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
