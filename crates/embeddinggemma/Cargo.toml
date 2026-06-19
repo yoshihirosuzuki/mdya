@@ -9,7 +9,7 @@ repository.workspace = true
 description = "On-device EmbeddingGemma (Gemma3 bidirectional encoder) sentence embeddings on candle"
 
 [dependencies]
-candle-core = { version = "=0.10.1", default-features = false }
+candle-core = { version = "=0.10.2", default-features = false }
 candle-nn = { version = "=0.10.1", default-features = false }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 serde = { version = "1", features = ["derive"] }
