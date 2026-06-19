@@ -687,9 +687,24 @@ fn read_mtime(absolute: &Path) -> Result<DateTime<Utc>, IngestError> {
 fn read_bytes_with_hash(absolute: &Path) -> Result<(Vec<u8>, String), IngestError> {
     let bytes = std::fs::read(absolute)?;
     let digest = Sha256::digest(&bytes);
-    let hex = format!("{digest:x}");
+    let hex = to_lower_hex(&digest);
     debug_assert_eq!(hex.len(), 64, "sha256 hex must be 64 chars");
     Ok((bytes, hex))
+}
+
+/// Lowercase hex encoding of raw bytes.
+///
+/// `digest` 0.11 changed the hash output to `hybrid_array::Array`, which no
+/// longer implements `LowerHex`, so `format!("{digest:x}")` no longer compiles.
+/// Encoding by hand keeps the `source_hash` value byte-identical and avoids a
+/// new direct dependency just for this one call site.
+fn to_lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(hex, "{byte:02x}").expect("writing to a String is infallible");
+    }
+    hex
 }
 
 /// UPSERT the `modified_at` column for one `(collection, path)` row
@@ -1094,6 +1109,23 @@ mod tests {
         assert_eq!(sql_escape("foo'bar"), "foo''bar");
         assert_eq!(sql_escape("'leading"), "''leading");
         assert_eq!(sql_escape("trailing'"), "trailing''");
+    }
+
+    #[test]
+    fn to_lower_hex_encodes_each_byte_as_two_lowercase_digits() {
+        assert_eq!(to_lower_hex(&[0x00, 0x0f, 0xff, 0xa5]), "000fffa5");
+        assert_eq!(to_lower_hex(&[]), "");
+    }
+
+    #[test]
+    fn sha256_hex_of_empty_input_matches_known_vector() {
+        let digest = Sha256::digest(b"");
+        let hex = to_lower_hex(&digest);
+        assert_eq!(
+            hex,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(hex.len(), 64);
     }
 
     #[test]
