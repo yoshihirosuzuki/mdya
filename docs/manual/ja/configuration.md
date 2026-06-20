@@ -91,6 +91,17 @@ embedding:
 - `model` — モデル ID。default は `cl-nagoya/ruri-v3-30m` (256 次元、日本語に強い、約 140 MB、Apache 2.0)。`ollama:<name>` 形式で Ollama を指すこともできます (詳細は [`commands.md` の `mdya vector use`](commands.md#mdya-vector-use-model))。
 - モデルを変えたいときは `config.yml` を手で書き換えるのではなく `mdya vector use <model>` を使ってください。索引と config が整合した状態で切り替わります。
 
+**Ollama エンドポイント。** `model` が `ollama:<name>` 形式のとき、mdya は Ollama サーバへ埋め込みリクエストを送ります。エンドポイントは任意の `ollama` サブセクションで設定できます:
+
+```yaml
+embedding:
+  model: ollama:nomic-embed-text
+  ollama:
+    endpoint: http://127.0.0.1:11434
+```
+
+- `ollama.endpoint` (任意) — Ollama サーバのベース URL。default は `http://127.0.0.1:11434` (loopback)。loopback 以外のアドレスに向けると埋め込みテキストがローカルマシンの外へ送られ、推論が on-device で完結しなくなります。mdya のローカルファースト保証を保つには loopback のままにしてください。
+
 **gated モデルについて。** `google/embeddinggemma-300m` は Hugging Face 上で gated です。ungated な `cl-nagoya/ruri-v3-30m` (default) や `sentence-transformers/all-MiniLM-L6-v2` と違い、mdya が download する前に一度だけライセンス同意とアクセストークンが必要です。
 
 1. Hugging Face にログインし、[モデルページ](https://huggingface.co/google/embeddinggemma-300m) を開きます。Gemma ライセンスに同意してアクセスを申請してください (多くの場合その場で許可されます)。

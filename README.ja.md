@@ -75,7 +75,7 @@ cargo install --path .       # mdya を ~/.cargo/bin へインストール
 ```sh
 mdya init                       # ~/.mdya/ を作成 (config.yml + 索引などのデータディレクトリ)
 mdya collection add ~/notes     # ディレクトリを collection として登録 (名前は basename = notes)
-mdya update-all                 # 登録済み collection を走査し .md / .pdf を取り込んで索引を構築
+mdya update-all                 # 登録済み collection を走査し .md / .markdown / .pdf を取り込んで索引を構築
 mdya search fts "リリース手順"     # BM25 全文検索
 mdya search vector "リリース手順"  # ベクトル検索
 mdya search hybrid "リリース手順"  # hybrid (RRF)

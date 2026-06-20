@@ -108,7 +108,11 @@ mdya MCP サーバは次のツールを提供します。
 }
 ```
 
-検索ヒットの `collection` と `path` をそのまま渡せば原文が取れます。
+- `collection` (必須) — コレクション名 (`config.yml` で宣言済みのもの)。
+- `path` (必須) — コレクションルートからの相対パス。
+- `chunk` (任意) — 0-indexed の `chunk_sequence`。指定すると document 全文ではなくそのチャンク 1 つの本文だけを返します。省略時は忠実な全文を返します。
+
+検索ヒットの `collection` と `path` をそのまま渡せば原文が取れます。hit の `chunk_sequence` を `chunk` に渡せばそのチャンクだけを取得できます。
 
 ### 索引情報ツール
 
@@ -135,7 +139,8 @@ mdya MCP サーバは次のツールを提供します。
 | `empty_query` | `query` が空文字列 / 空白のみ |
 | `invalid_limit` | `k` が `0` |
 | `unknown_collection` | 未知のコレクション名を指定 |
-| `not_found` | `get_document` で該当文書が無い |
+| `not_found` | `get_document` で該当文書が無い、または指定した `chunk` が範囲外 |
+| `payload_too_large` | `get_document` の全文応答が `get.mcp_max_bytes` を超過。`details` に `size_bytes` / `limit_bytes` が入る。単一 `chunk` 取得で絞り込める |
 | `schema_metadata_missing` | 索引が未初期化 / 壊れている |
 | `internal` | I/O / 埋め込み / 設定読み込み等の障害 |
 
