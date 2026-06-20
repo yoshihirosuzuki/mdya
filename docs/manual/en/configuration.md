@@ -91,6 +91,17 @@ embedding:
 - `model` — model ID. The default is `cl-nagoya/ruri-v3-30m` (256 dimensions, strong for Japanese, about 140 MB, Apache 2.0). The `ollama:<name>` form points at an Ollama model (see [`mdya vector use` in commands.md](commands.md#mdya-vector-use-model) for details).
 - When you want to change the model, do not edit `config.yml` by hand — use `mdya vector use <model>`. That keeps the index and the configuration in sync across the switch.
 
+**Ollama endpoint.** When `model` uses the `ollama:<name>` form, mdya sends embedding requests to an Ollama server. The endpoint is configurable via an optional `ollama` subsection:
+
+```yaml
+embedding:
+  model: ollama:nomic-embed-text
+  ollama:
+    endpoint: http://127.0.0.1:11434
+```
+
+- `ollama.endpoint` (optional) — base URL of the Ollama server. Defaults to `http://127.0.0.1:11434` (loopback). Pointing it at a non-loopback address sends embedding text off the local machine, so inference no longer stays on-device; keep it on loopback to preserve mdya's local-first guarantee.
+
 **Gated models.** `google/embeddinggemma-300m` is gated on Hugging Face — unlike the ungated `cl-nagoya/ruri-v3-30m` (the default) and `sentence-transformers/all-MiniLM-L6-v2`, it needs a one-time license acceptance and an access token before mdya can download it:
 
 1. Sign in to Hugging Face and open the [model page](https://huggingface.co/google/embeddinggemma-300m). Accept the Gemma license to request access (granted immediately in most cases).

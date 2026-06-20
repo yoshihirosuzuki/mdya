@@ -18,7 +18,7 @@ It is local-first by construction. There is no path to any cloud LLM API; infere
 
 What it can do:
 
-- **BM25 full-text search** — full-text search with Japanese morphological analysis support.
+- **BM25 full-text search** — full-text search with Japanese morphological analysis (lindera/ipadic) support.
 - **Vector search** — cosine similarity over on-device embeddings (default `cl-nagoya/ruri-v3-30m`, 256 dimensions).
 - **Hybrid search** — fuses BM25 and vector results via Reciprocal Rank Fusion (RRF).
 - **Markdown chunking** — splits along heading and code-fence boundaries.
@@ -75,7 +75,7 @@ The shortest path is `init` → `collection add` → `update-all` → `search`.
 ```sh
 mdya init                       # create ~/.mdya/ (config.yml + data directories for the index)
 mdya collection add ~/notes     # register a directory as a collection (name = basename, here: notes)
-mdya update-all                 # walk every registered collection, ingest .md / .pdf, build the index
+mdya update-all                 # walk every registered collection, ingest .md / .markdown / .pdf, build the index
 mdya search fts "release plan"     # BM25 full-text search
 mdya search vector "release plan"  # vector search
 mdya search hybrid "release plan"  # hybrid (RRF)

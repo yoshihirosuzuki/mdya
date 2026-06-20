@@ -8,7 +8,7 @@ This page lists every mdya subcommand. All subcommands accept the following glob
 |---|---|---|
 | `--config-dir <PATH>` | Override the configuration directory | `$HOME/.mdya/` |
 | `--model-cache-dir <PATH>` | Override the embedding model cache directory | `$HOME/.mdya-models/` |
-| `--log-level <LEVEL>` | Log verbosity (`trace` / `debug` / `info` / `warn` / `error`). Also settable via the `RUST_LOG` environment variable | `info` |
+| `--log-level <LEVEL>` | Log verbosity (`trace` / `debug` / `info` / `warn` / `error`). Also settable via the `RUST_LOG` environment variable | `warn` |
 | `--log-format <FORMAT>` | Log format (`compact` / `pretty` / `json`) | `compact` |
 | `--no-color` | Suppress terminal colors. Also settable via the `NO_COLOR` environment variable | TTY auto-detect |
 | `-h, --help` | Show help | — |
@@ -102,13 +102,13 @@ $ mdya collection list --format json
 
 ## `mdya update-all`
 
-Walks every registered collection, ingests new and changed `.md` / `.pdf` files, and removes index entries for files that no longer exist.
+Walks every registered collection, ingests new and changed `.md` / `.markdown` / `.pdf` files, and removes index entries for files that no longer exist.
 
 ```sh
 mdya update-all
 ```
 
-- Files with the `.md` or `.pdf` extension are indexed. `.pdf` is converted to plain text at ingest time and flows through the same chunker and embedder as `.md`.
+- Files with the `.md`, `.markdown`, or `.pdf` extension are indexed. `.pdf` is converted to plain text at ingest time and flows through the same chunker and embedder as Markdown.
 - Symbolic links under a collection root are not followed (see [`collections` in configuration.md](configuration.md#collections)).
 - Parallelism is controlled by `runtime.embed_parallelism`.
 - Progress is shown as a progress bar on stderr, and a one-line summary is written to stdout at the end.

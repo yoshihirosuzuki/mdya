@@ -108,7 +108,11 @@ Output:
 }
 ```
 
-You can pass the `collection` and `path` from a search hit directly to retrieve its source text.
+- `collection` (required) — collection name (must be declared in `config.yml`).
+- `path` (required) — document path relative to the collection root.
+- `chunk` (optional) — a 0-indexed `chunk_sequence`. When given, only that single chunk's body is returned instead of the full document; omit it for the faithful full document.
+
+You can pass the `collection` and `path` from a search hit directly to retrieve its source text, or pass a hit's `chunk_sequence` as `chunk` to fetch just that chunk.
 
 ### Index introspection tool
 
@@ -135,7 +139,8 @@ When a tool call fails, a structured error is returned.
 | `empty_query` | `query` is empty or whitespace-only |
 | `invalid_limit` | `k` is `0` |
 | `unknown_collection` | An unknown collection name was given |
-| `not_found` | `get_document` found no matching document |
+| `not_found` | `get_document` found no matching document, or the requested `chunk` is out of range |
+| `payload_too_large` | A full `get_document` response exceeded `get.mcp_max_bytes`. `details` carries `size_bytes` / `limit_bytes`; fetch a single `chunk` to narrow it |
 | `schema_metadata_missing` | The index is uninitialized or corrupted |
 | `internal` | I/O, embedding, configuration-load, or other failure |
 

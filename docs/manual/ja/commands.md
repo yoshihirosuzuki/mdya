@@ -8,7 +8,7 @@ mdya のサブコマンド一覧と詳細です。すべてのサブコマンド
 |---|---|---|
 | `--config-dir <PATH>` | 設定ディレクトリの上書き | `$HOME/.mdya/` |
 | `--model-cache-dir <PATH>` | 埋め込みモデルキャッシュディレクトリの上書き | `$HOME/.mdya-models/` |
-| `--log-level <LEVEL>` | ログの詳細度 (`trace` / `debug` / `info` / `warn` / `error`)。`RUST_LOG` 環境変数でも可 | `info` |
+| `--log-level <LEVEL>` | ログの詳細度 (`trace` / `debug` / `info` / `warn` / `error`)。`RUST_LOG` 環境変数でも可 | `warn` |
 | `--log-format <FORMAT>` | ログのフォーマット (`compact` / `pretty` / `json`) | `compact` |
 | `--no-color` | 端末色出力の抑制。`NO_COLOR` 環境変数でも可 | TTY 自動判定 |
 | `-h, --help` | ヘルプ表示 | — |
@@ -102,13 +102,13 @@ $ mdya collection list --format json
 
 ## `mdya update-all`
 
-登録済みの全コレクションを走査し、新規 / 変更された `.md` / `.pdf` ファイルを取り込み、削除されたファイルに対応する索引データを掃除します。
+登録済みの全コレクションを走査し、新規 / 変更された `.md` / `.markdown` / `.pdf` ファイルを取り込み、削除されたファイルに対応する索引データを掃除します。
 
 ```sh
 mdya update-all
 ```
 
-- 索引対象は `.md` / `.pdf` 拡張子のファイルです。`.pdf` は取り込み時に plain text に変換して `.md` と共通の chunker と embedding に流します。
+- 索引対象は `.md` / `.markdown` / `.pdf` 拡張子のファイルです。`.pdf` は取り込み時に plain text に変換して Markdown と共通の chunker と embedding に流します。
 - コレクションルート配下のシンボリックリンクは辿りません ([configuration.md の `collections`](configuration.md#collections) 参照)。
 - 並列度は `runtime.embed_parallelism` で調整します。
 - 進捗は stderr にプログレスバーで表示され、最後に stdout へサマリ 1 行を出します。
