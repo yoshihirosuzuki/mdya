@@ -91,6 +91,12 @@ embedding:
 - `model` — モデル ID。default は `cl-nagoya/ruri-v3-30m` (256 次元、日本語に強い、約 140 MB、Apache 2.0)。`ollama:<name>` 形式で Ollama を指すこともできます (詳細は [`commands.md` の `mdya vector use`](commands.md#mdya-vector-use-model))。
 - モデルを変えたいときは `config.yml` を手で書き換えるのではなく `mdya vector use <model>` を使ってください。索引と config が整合した状態で切り替わります。
 
+**gated モデルについて。** `google/embeddinggemma-300m` は Hugging Face 上で gated です。ungated な `cl-nagoya/ruri-v3-30m` (default) や `sentence-transformers/all-MiniLM-L6-v2` と違い、mdya が download する前に一度だけライセンス同意とアクセストークンが必要です。
+
+1. Hugging Face にログインし、[モデルページ](https://huggingface.co/google/embeddinggemma-300m) を開きます。Gemma ライセンスに同意してアクセスを申請してください (多くの場合その場で許可されます)。
+2. mdya が重みを download できるよう認証します。`hf auth login` を一度実行するか、`HF_TOKEN` 環境変数を設定してください。両方ある場合は `HF_TOKEN` が優先されます。
+3. あとは通常どおり実行します。token は一度きりの download にのみ使われ、推論は常に on-device で動きます。
+
 `config.yml` の `embedding.model` と索引内のモデルが食い違うと、`mdya update-all` は安全のため停止し、`mdya search vector` / `hybrid` は警告を出して検索を続けます。
 
 ### runtime

@@ -338,6 +338,10 @@ When `failed > 0`, the command exits with `1`. The rest can be resumed by re-run
 
 Specifying the `ollama:<model>` form uses the Ollama embedding API. Make sure Ollama is running and that the model has been pulled (e.g. `ollama pull <model>`) ahead of time.
 
+### Using a gated model
+
+Switching to the gated `google/embeddinggemma-300m` first requires a one-time Hugging Face license acceptance and login — see [`embedding` in configuration.md](configuration.md#embedding).
+
 ---
 
 ## `mdya mcp`
