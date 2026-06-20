@@ -338,6 +338,10 @@ Switched embedding model to 'ollama:nomic-embed-text'. Re-embedded 312 document(
 
 `ollama:<model>` 形式を指定すると、Ollama の埋め込み API を使います。事前に Ollama を起動し、対象モデルを `ollama pull <model>` などで用意しておいてください。
 
+### gated モデルを使う場合
+
+gated な `google/embeddinggemma-300m` に切り替えるには、事前に Hugging Face でのライセンス同意とログインが必要です ([`configuration.md` の `embedding`](configuration.md#embedding) を参照)。
+
 ---
 
 ## `mdya mcp`

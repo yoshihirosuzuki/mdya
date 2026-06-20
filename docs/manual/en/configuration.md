@@ -91,6 +91,12 @@ embedding:
 - `model` — model ID. The default is `cl-nagoya/ruri-v3-30m` (256 dimensions, strong for Japanese, about 140 MB, Apache 2.0). The `ollama:<name>` form points at an Ollama model (see [`mdya vector use` in commands.md](commands.md#mdya-vector-use-model) for details).
 - When you want to change the model, do not edit `config.yml` by hand — use `mdya vector use <model>`. That keeps the index and the configuration in sync across the switch.
 
+**Gated models.** `google/embeddinggemma-300m` is gated on Hugging Face — unlike the ungated `cl-nagoya/ruri-v3-30m` (the default) and `sentence-transformers/all-MiniLM-L6-v2`, it needs a one-time license acceptance and an access token before mdya can download it:
+
+1. Sign in to Hugging Face and open the [model page](https://huggingface.co/google/embeddinggemma-300m). Accept the Gemma license to request access (granted immediately in most cases).
+2. Authenticate so mdya can download the weights — either run `hf auth login` once, or set the `HF_TOKEN` environment variable. When both are present, `HF_TOKEN` takes precedence.
+3. Run mdya as usual. The token is only used for the one-time download; inference always runs on-device.
+
 When `embedding.model` in `config.yml` disagrees with the model recorded in the index, `mdya update-all` stops for safety and `mdya search vector` / `hybrid` print a warning and continue.
 
 ### runtime
