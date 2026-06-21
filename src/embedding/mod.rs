@@ -11,6 +11,7 @@
 
 mod cache;
 mod embeddinggemma;
+mod embeddinggemma_model;
 mod minilm;
 mod ollama;
 mod pooling;

@@ -1,5 +1,6 @@
-The Gemma3 encoder and rotary-embedding implementation in this crate is
-adapted from Hugging Face's text-embeddings-inference project
+The Gemma3 encoder and rotary-embedding implementation in mdya's
+`src/embedding/embeddinggemma_model/` module is adapted from Hugging Face's
+text-embeddings-inference project
 (https://github.com/huggingface/text-embeddings-inference), specifically its
 candle backend (backends/candle/src/models/gemma3.rs, dense.rs, and
 layers/rotary.rs).
@@ -21,5 +22,5 @@ text-embeddings-inference is licensed under the Apache License, Version 2.0:
     limitations under the License.
 
 The EmbeddingGemma model weights are produced by Google and governed by the
-Gemma Terms of Use (https://ai.google.dev/gemma/terms); this crate distributes
-no weights.
+Gemma Terms of Use (https://ai.google.dev/gemma/terms); mdya distributes no
+weights.

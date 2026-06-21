@@ -5,9 +5,9 @@
 //! responsibility; this module deliberately stops at the final RMSNorm output.
 //!
 //! Adapted from Hugging Face's text-embeddings-inference `gemma3.rs`
-//! (Apache-2.0; see the crate `NOTICE`). The TEI flash-attention / cuBLASLt /
+//! (Apache-2.0; see the root `NOTICE`). The TEI flash-attention / cuBLASLt /
 //! batching / tracing infrastructure is dropped in favour of a plain candle CPU
-//! path. Rotary embedding is provided by [`crate::rotary`].
+//! path. Rotary embedding is provided by [`super::rotary`].
 
 use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Linear, Module, VarBuilder};
@@ -170,8 +170,8 @@ impl Attention {
         let k = k.transpose(1, 2)?.contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
-        let q = crate::rotary::apply(&q, cos, sin, self.head_dim)?;
-        let k = crate::rotary::apply(&k, cos, sin, self.head_dim)?;
+        let q = super::rotary::apply(&q, cos, sin, self.head_dim)?;
+        let k = super::rotary::apply(&k, cos, sin, self.head_dim)?;
 
         // GQA: repeat the kv heads to match the number of query heads.
         let k = repeat_kv(&k, self.num_heads / self.num_kv_heads)?;
@@ -356,11 +356,11 @@ impl Gemma3Model {
 
         // Sequential positions 0..seq (encoder, no KV-cache offset).
         let inv_full =
-            crate::rotary::inverse_frequencies(self.head_dim, self.rope_theta_full, &self.device)?;
-        let (cos_full, sin_full) = crate::rotary::cos_sin(seq, &inv_full, self.dtype)?;
+            super::rotary::inverse_frequencies(self.head_dim, self.rope_theta_full, &self.device)?;
+        let (cos_full, sin_full) = super::rotary::cos_sin(seq, &inv_full, self.dtype)?;
         let inv_local =
-            crate::rotary::inverse_frequencies(self.head_dim, self.rope_theta_local, &self.device)?;
-        let (cos_local, sin_local) = crate::rotary::cos_sin(seq, &inv_local, self.dtype)?;
+            super::rotary::inverse_frequencies(self.head_dim, self.rope_theta_local, &self.device)?;
+        let (cos_local, sin_local) = super::rotary::cos_sin(seq, &inv_local, self.dtype)?;
 
         let padding_bias = self.padding_bias(attention_mask, b, seq)?;
         let full_mask = self.build_mask(&padding_bias, b, seq, AttentionKind::Full)?;

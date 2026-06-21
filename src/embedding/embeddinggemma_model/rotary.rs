@@ -1,7 +1,7 @@
 //! Rotary position embedding (rotate-half / GPT-NeoX style).
 //!
 //! Adapted from text-embeddings-inference's `layers/rotary.rs` (Apache-2.0; see
-//! crate `NOTICE`), trimmed to the plain base-frequency case EmbeddingGemma
+//! the root `NOTICE`), trimmed to the plain base-frequency case EmbeddingGemma
 //! uses. EmbeddingGemma applies two frequencies — a local base for
 //! sliding-window layers and a global base for full-attention layers — so the
 //! per-layer cos/sin tables are built from [`inverse_frequencies`] with the
