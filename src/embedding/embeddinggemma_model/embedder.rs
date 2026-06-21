@@ -11,7 +11,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 
-use crate::model::{Config, Gemma3Model};
+use super::model::{Config, Gemma3Model};
 
 /// EmbeddingGemma's two dense layers (`2_Dense` then `3_Dense`).
 const DENSE_IN: usize = 768;

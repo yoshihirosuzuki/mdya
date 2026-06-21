@@ -1,5 +1,5 @@
-//! `EmbeddingGemmaEmbedder` — `google/embeddinggemma-300m` via the
-//! `embeddinggemma` crate.
+//! `EmbeddingGemmaEmbedder` — `google/embeddinggemma-300m` via the inline
+//! `embeddinggemma_model` module.
 //!
 //! A Gemma3 bidirectional sentence encoder (768-dim). The model is **gated** on
 //! Hugging Face: using it requires accepting Google's Gemma terms once on the
@@ -8,7 +8,7 @@
 //! wraps the crate's network-free encoder, applying EmbeddingGemma's distinct
 //! query / document task prompts (sourced from the preset registry).
 
-use ::embeddinggemma::{EmbeddingGemma, ModelFiles};
+use super::embeddinggemma_model::{EmbeddingGemma, ModelFiles};
 
 use super::{EmbedError, Embedder, ModelCache, RetrievalPrefixes, find_on_device_preset};
 

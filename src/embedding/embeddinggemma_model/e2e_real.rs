@@ -6,7 +6,7 @@
 //! `3_Dense/model.safetensors`, then run:
 //!
 //! ```text
-//! EMBEDDINGGEMMA_DIR=/path cargo test -p embeddinggemma --test e2e_real -- --ignored
+//! EMBEDDINGGEMMA_DIR=/path cargo test embeddinggemma_model::e2e_real -- --ignored
 //! ```
 //!
 //! This is a functional check (output dimension, unit L2 norm, and query↔
@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use embeddinggemma::{EmbeddingGemma, ModelFiles};
+use super::{EmbeddingGemma, ModelFiles};
 
 /// Cosine similarity of two L2-normalized vectors (a dot product).
 fn cosine(a: &[f32], b: &[f32]) -> f32 {

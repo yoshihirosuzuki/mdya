@@ -7,14 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-21
+
 ### Added
 
+- Two more on-device embedding presets, selectable through `embedding.model` in `config.yml` alongside the default `cl-nagoya/ruri-v3-30m` (256-dim): `sentence-transformers/all-MiniLM-L6-v2` (384-dim) and `google/embeddinggemma-300m` (768-dim, gated on Hugging Face — requires accepting Google's Gemma terms and supplying an access token). An unrecognized `embedding.model` is now rejected at startup with the list of supported values, before any indexing begins.
 - Published to [crates.io](https://crates.io/crates/mdya): `cargo install mdya` now works alongside the prebuilt installers. This path builds from source and requires `protoc`.
 - A `get` section in `config.yml` with `cli_max_bytes` and `mcp_max_bytes` (both default 1 MiB; `0` disables) capping the size of a full document returned by `mdya get` and the MCP `get_document` tool. `mdya get` gained a `-f` / `--no-size-limit` flag to bypass the cap for a single run.
 
 ### Changed
 
+- Markdown chunking now fills each chunk with whole blocks (paragraphs, list items, and so on) up to the target size, splitting only at block boundaries.
 - `mdya get` and the MCP `get_document` tool now refuse to return a full document larger than 1 MiB by default, to avoid flooding a terminal or an LLM's context budget. Restore the previous unlimited behavior by passing `-f` / `--no-size-limit` to `mdya get`, or by raising / disabling (`0`) the new `get.cli_max_bytes` / `get.mcp_max_bytes` caps in `config.yml`. Single-chunk reads (`--chunk` / the MCP `chunk` parameter) are not size-checked.
+
+### Fixed
+
+- `mdya vector use` now rebuilds a stale vector index even when `config.yml` already names the target model, instead of skipping the rebuild.
 
 ## [0.3.2] - 2026-06-13
 
@@ -65,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP server (`mdya mcp`) exposing `search_fts`, `search_vector`, and `search_hybrid` over stdio and streamable HTTP.
 - Prebuilt binaries and `curl | sh` / `irm | iex` installers for macOS (Apple Silicon, Intel), Linux (x86_64, aarch64), and Windows (x86_64).
 
-[Unreleased]: https://github.com/yoshihirosuzuki/mdya/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/yoshihirosuzuki/mdya/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.4.0
+[0.3.2]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.3.2
 [0.3.1]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.3.1
 [0.3.0]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.3.0
