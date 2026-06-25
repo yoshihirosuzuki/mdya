@@ -4255,7 +4255,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39b7f5ed9d0c0b716bf599b559d888267ed1dfe4c4e29d3648b51d2a28940cf"
 dependencies = [
  "jieba-rs",
- "lindera",
+ "lindera 3.0.7",
  "rust-stemmers",
  "serde",
  "unicode-normalization",
@@ -4444,7 +4444,34 @@ dependencies = [
  "csv",
  "daachorse 2.1.1",
  "kanaria",
- "lindera-dictionary",
+ "lindera-dictionary 3.0.7",
+ "log",
+ "once_cell",
+ "percent-encoding",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "strum 0.28.0",
+ "strum_macros 0.28.0",
+ "unicode-blocks",
+ "unicode-normalization",
+ "unicode-segmentation",
+ "url",
+]
+
+[[package]]
+name = "lindera"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "947b566e47adbe67d50c6be170309c3b18259877cb36e7f2c70c7edae8c7282f"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "csv",
+ "daachorse 2.1.1",
+ "kanaria",
+ "lindera-dictionary 4.0.0",
  "lindera-ipadic",
  "log",
  "once_cell",
@@ -4466,6 +4493,33 @@ name = "lindera-dictionary"
 version = "3.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2385456ca9fe87c29072c5f156b52fdd5e28d5b5738ddfb3979501dbd736530"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "csv",
+ "daachorse 2.1.1",
+ "derive_builder",
+ "encoding_rs",
+ "encoding_rs_io",
+ "glob",
+ "log",
+ "memmap2",
+ "num_cpus",
+ "once_cell",
+ "regex",
+ "rkyv",
+ "serde",
+ "serde_json",
+ "strum 0.28.0",
+ "strum_macros 0.28.0",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lindera-dictionary"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ee9be0de7cbe3f2764b9e7f6715243958e43140703114acdcae8be2b2e6f24d"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -4496,15 +4550,11 @@ dependencies = [
 
 [[package]]
 name = "lindera-ipadic"
-version = "3.0.7"
+version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "130c598519a40bbfb762c4c06d6ad29315331eb4c154fcb2d1d6b46776cee7d9"
+checksum = "b547c618c4b26471f8ff6f9822ada23c3c0d659a3eca0412721fd2becc4b8ff9"
 dependencies = [
- "anyhow",
- "byteorder",
- "csv",
- "lindera-dictionary",
- "serde_json",
+ "lindera-dictionary 4.0.0",
  "tokio",
 ]
 
@@ -4701,7 +4751,7 @@ dependencies = [
  "insta",
  "lance-index",
  "lancedb",
- "lindera",
+ "lindera 4.0.0",
  "pdf-extract",
  "predicates",
  "pulldown-cmark",

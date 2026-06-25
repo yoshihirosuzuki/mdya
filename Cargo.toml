@@ -88,7 +88,7 @@ lancedb = { version = "=0.30.0", default-features = false }
 # itself does not call any lindera API; the direct dep exists solely to
 # set features and pin the version in `Cargo.lock`. Verified in
 # `tests/verify_lindera_ipadic.rs`.
-lindera = { version = "=3.0.7", default-features = false, features = ["embed-ipadic", "mmap"] }
+lindera = { version = "=4.0.0", default-features = false, features = ["embed-ipadic", "mmap"] }
 # Exact-pinned to 0.10.1: crates.io candle-core 0.10.2 was published without
 # a matching git tag (huggingface/candle has tags up to 0.10.1 only), so we
 # stay on the last verifiably tagged release. Bump only after the upstream
