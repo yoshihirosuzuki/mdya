@@ -148,7 +148,7 @@ walkdir = "2"
 # + RustCrypto (aes/cbc/ecb for encrypted-PDF read path). Audited via
 # `cargo tree -p pdf-extract --edges normal | grep -E '(-sys$| -sys )'` —
 # no new `*-sys` / C-FFI binding beyond mdya's existing tree.
-pdf-extract = "0.10"
+pdf-extract = "0.12"
 # SHA-256 for `chunks.source_hash` two-stage incremental judgment.
 # RustCrypto, pure Rust.
 sha2 = "0.11"
