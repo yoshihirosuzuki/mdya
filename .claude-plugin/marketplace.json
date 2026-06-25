@@ -1,0 +1,14 @@
+{
+  "name": "mdya-plugins",
+  "description": "Claude Code plugins for mdya, the local-first Markdown knowledge base.",
+  "owner": {
+    "name": "yoshihirosuzuki"
+  },
+  "plugins": [
+    {
+      "name": "mdya",
+      "source": "./integrations/claude-code",
+      "description": "Query and search a local Markdown corpus indexed by mdya, from inside Claude Code."
+    }
+  ]
+}
