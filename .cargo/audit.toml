@@ -23,4 +23,7 @@ ignore = [
     # bincode (unmaintained, via lindera and lance-tokenizer)
     # https://rustsec.org/advisories/RUSTSEC-2025-0141.html
     "RUSTSEC-2025-0141",
+    # ttf-parser (unmaintained, via pdf-extract -> lopdf and via xtask -> krilla -> rustybuzz)
+    # https://rustsec.org/advisories/RUSTSEC-2026-0192.html
+    "RUSTSEC-2026-0192",
 ]
