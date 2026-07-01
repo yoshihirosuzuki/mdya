@@ -82,18 +82,21 @@ async fn mcp_stdio_advertises_search_tools_and_surfaces_validation_error() -> Re
         "expected validation message, got: {text}"
     );
 
-    // An unknown `mode` value fails rmcp's request deserialization before
-    // the tool body runs, so the call is rejected at the protocol layer
-    // rather than reaching the tool's structured-error path.
+    // An unknown `mode` value fails rmcp's argument deserialization
+    // before the tool body runs. The deserialization failure surfaces as
+    // a `CallToolResult` flagged `is_error` (carrying the validator
+    // message back to the model), mirroring the empty-query path above,
+    // rather than as a JSON-RPC protocol error on the wire.
     let mut bad_mode = Map::new();
     bad_mode.insert("query".to_string(), json!("release"));
     bad_mode.insert("mode".to_string(), json!("keyword"));
     let invalid_mode = client
         .call_tool(CallToolRequestParams::new("search").with_arguments(bad_mode))
-        .await;
-    assert!(
-        invalid_mode.is_err(),
-        "unknown `mode` should be rejected at the protocol layer"
+        .await?;
+    assert_eq!(
+        invalid_mode.is_error,
+        Some(true),
+        "unknown `mode` should produce a tool error result"
     );
 
     // Best-effort shutdown: propagating a JoinError here would mask the
