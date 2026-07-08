@@ -70,7 +70,7 @@ serde_json = "1"
 # exact-pinned (`^0.0.27` resolves only to `0.0.27`), so any future
 # bump is a deliberate Cargo.toml edit rather than a transitive
 # surprise.
-serde-saphyr = "0.0.28"
+serde-saphyr = "0.0.29"
 dirs = "6"
 shellexpand = "3"
 lancedb = { version = "=0.30.0", default-features = false }
