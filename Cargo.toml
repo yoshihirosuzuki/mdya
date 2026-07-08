@@ -158,7 +158,7 @@ sha2 = "0.11"
 # version.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # JSON Schema derive for `SearchResponse` / `SearchHit` / `SearchMode`.
-# Already pulled transitively by `rmcp` 1.7 (default +
+# Already pulled transitively by `rmcp` 2.1 (default +
 # `chrono04` features), lifted to a direct dep so the search module's
 # `#[derive(JsonSchema)]` invocations have an explicit version pin and
 # do not regress if rmcp narrows its feature set later. `derive` is
