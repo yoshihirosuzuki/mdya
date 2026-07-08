@@ -89,13 +89,14 @@ lancedb = { version = "=0.30.0", default-features = false }
 # set features and pin the version in `Cargo.lock`. Verified in
 # `tests/verify_lindera_ipadic.rs`.
 lindera = { version = "=3.0.7", default-features = false, features = ["embed-ipadic", "mmap"] }
-# Exact-pinned to 0.10.1: crates.io candle-core 0.10.2 was published without
-# a matching git tag (huggingface/candle has tags up to 0.10.1 only), so we
-# stay on the last verifiably tagged release. Bump only after the upstream
-# tag catches up or the discrepancy is explained.
-candle-core = { version = "=0.10.1", default-features = false }
-candle-nn = { version = "=0.10.1", default-features = false }
-candle-transformers = { version = "=0.10.1", default-features = false }
+# Lockstep: the three `candle-*` crates must move together. Bumping only
+# one leaves two versions of `candle_core::Tensor` in the dep graph, and
+# any code that crosses the boundary fails to compile because the two
+# `Tensor` types are distinct. Dependabot's per-crate bump PRs therefore
+# cannot be merged individually.
+candle-core = { version = "=0.11.0", default-features = false }
+candle-nn = { version = "=0.11.0", default-features = false }
+candle-transformers = { version = "=0.11.0", default-features = false }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls"] }
 # HTTP client for the optional `ollama:<model>` embedding backend.

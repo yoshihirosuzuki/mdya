@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bumped `candle-core` / `candle-nn` / `candle-transformers` 0.10.1 → 0.11.0 (lockstep). The historical `=0.10.1` exact-pin was in place because crates.io candle-core 0.10.2 had been published without a matching git tag; upstream tagging has since caught up (`0.10.2` and `0.11.0` both tagged), so we lift the hold and move all three crates in one step.
+
 ## [0.4.0] - 2026-06-21
 
 ### Added
