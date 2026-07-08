@@ -8,6 +8,14 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # The three `candle-*` crates must move together: a single-crate bump
+      # leaves two versions of `candle_core::Tensor` in the dep graph and
+      # the mdya embedding modules that cross the boundary fail to compile.
+      # Group them so dependabot ships one PR per candle release.
+      candle:
+        patterns:
+          - "candle-*"
     ignore:
       # arrow must track lancedb's arrow version (currently 58). A standalone
       # arrow major bump pulls a second arrow into the tree and breaks the
