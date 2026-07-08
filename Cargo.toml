@@ -93,7 +93,7 @@ lindera = { version = "=3.0.7", default-features = false, features = ["embed-ipa
 # a matching git tag (huggingface/candle has tags up to 0.10.1 only), so we
 # stay on the last verifiably tagged release. Bump only after the upstream
 # tag catches up or the discrepancy is explained.
-candle-core = { version = "=0.10.1", default-features = false }
+candle-core = { version = "=0.11.0", default-features = false }
 candle-nn = { version = "=0.10.1", default-features = false }
 candle-transformers = { version = "=0.10.1", default-features = false }
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }

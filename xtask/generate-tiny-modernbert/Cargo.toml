@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 ahash = "0.8"
 anyhow = "1"
-candle-core = { version = "=0.10.1", default-features = false }
+candle-core = { version = "=0.11.0", default-features = false }
 candle-nn = { version = "=0.10.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
