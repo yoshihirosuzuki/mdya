@@ -73,7 +73,7 @@ serde_json = "1"
 serde-saphyr = "0.0.28"
 dirs = "6"
 shellexpand = "3"
-lancedb = { version = "=0.30.0", default-features = false }
+lancedb = { version = "=0.31.0", default-features = false }
 # Embedded IPADIC dictionary for Lance's FTS `lindera/ipadic` tokenizer.
 # The `embed-ipadic` feature triggers `lindera-ipadic`'s build.rs to fetch
 # `mecab-ipadic-2.7.0-20070801.tar.gz` from Lindera.dev (md5-verified)
@@ -168,12 +168,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # Rust, no `*-sys`.
 schemars = "1"
 # `FullTextSearchQuery` / `SCORE_COL` for `mdya search fts`.
-# lancedb v0.30's `query.rs` doc example also imports them directly
+# lancedb v0.31's `query.rs` doc example also imports them directly
 # from `lance-index`; lancedb does not re-export them. Pinned to
-# `=7.0.0` to mirror the existing `[dev-dependencies]` pin, which
-# itself matches the transitive version lancedb 0.30 resolves to.
+# `=8.0.0` to mirror the existing `[dev-dependencies]` pin, which
+# itself matches the transitive version lancedb 0.31 resolves to.
 # Pure Rust, no `*-sys`.
-lance-index = "=7.0.0"
+lance-index = "=8.0.0"
 
 [features]
 default = []
@@ -191,7 +191,7 @@ tempfile = "3"
 futures = "0.3"
 arrow-array = "58"
 arrow-schema = "58"
-lance-index = "=7.0.0"
+lance-index = "=8.0.0"
 
 [profile.release]
 lto = "thin"
