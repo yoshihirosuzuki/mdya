@@ -26,4 +26,7 @@ ignore = [
     # ttf-parser (unmaintained, via pdf-extract -> lopdf and via xtask -> krilla -> rustybuzz)
     # https://rustsec.org/advisories/RUSTSEC-2026-0192.html
     "RUSTSEC-2026-0192",
+    # rustybuzz (unmaintained, via xtask -> krilla)
+    # https://rustsec.org/advisories/RUSTSEC-2026-0206.html
+    "RUSTSEC-2026-0206",
 ]
