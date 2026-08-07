@@ -1,0 +1,9 @@
+{
+  "name": "mdya",
+  "description": "Query and search a local Markdown corpus indexed by mdya, from inside Claude Code.",
+  "homepage": "https://github.com/yoshihirosuzuki/mdya",
+  "license": "MIT OR Apache-2.0",
+  "author": {
+    "name": "yoshihirosuzuki"
+  }
+}
