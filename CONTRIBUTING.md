@@ -11,7 +11,7 @@ Thanks for your interest in mdya. This document covers how to report issues and 
 ## Submitting a pull request
 
 1. Open or reference an issue describing the change.
-2. Branch from `main`, make your change, and run `just check` (fmt + clippy + tests) before pushing.
+2. Branch from `main`, make your change, and run `just check` (fmt + clippy + tests + advisory scan) before pushing. See [README.md](README.md#development) for what `just check` needs installed.
 3. Open a pull request. The PR template prompts for a summary and a test plan.
 
 Build and test setup is documented in [README.md](README.md#development).

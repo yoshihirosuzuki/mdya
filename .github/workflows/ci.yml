@@ -1,7 +1,11 @@
 # Lint and test gate for pull requests and pushes to `main`.
 #
-# Mirrors `just check` (cargo fmt + clippy + test) so the workspace is exercised
-# the same way locally and in CI. The release build of the distribution binary
+# Mirrors the fmt / clippy / test part of `just check` so the workspace is
+# exercised the same way locally and in CI. `just check` also runs `cargo
+# audit`, which has no pull-request trigger at all — it is a scheduled monitor
+# in `audit.yml` that reports by opening an issue — so this workflow is
+# narrower than the local gate by exactly that step. The release build of the
+# distribution binary
 # is verified by `release.yml` (cargo-dist tag push trigger, 5 platforms) and
 # is intentionally NOT duplicated here per PR — `cargo build --release` from
 # cold cache exceeded `timeout-minutes` in early experiments and the per-PR

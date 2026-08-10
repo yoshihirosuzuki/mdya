@@ -140,10 +140,12 @@ runtime:
 ## 開発
 
 ```sh
-just check    # fmt-check + clippy (-D warnings) + cargo test (全 workspace)
+just check    # fmt-check + clippy (-D warnings) + cargo test (全 workspace) + cargo audit
 just smoke    # smoke テストのみ実行
 just          # recipe 一覧を表示
 ```
+
+`just check` には `cargo install cargo-audit --locked` とネットワーク接続が必要です（advisory データベースを毎回取得します）。オフラインでは代わりに `cargo audit --no-fetch --stale` を実行してください。
 
 ## コントリビュート
 

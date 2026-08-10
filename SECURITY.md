@@ -26,4 +26,4 @@ Acknowledgement of reports usually happens within a few business days. There is 
 
 ## Informational advisories
 
-`cargo audit` is run weekly and on every change to `Cargo.toml` / `Cargo.lock`. Upstream crates flagged as `unmaintained` (informational, not CVE) that mdya cannot fix directly are tracked in [`.cargo/audit.toml`](.cargo/audit.toml). Each ignored advisory is reviewed when an upstream release drops the crate. CVE / RUSTSEC security advisories are never suppressed.
+`cargo audit` runs daily on a schedule, and a failing run opens an issue labelled `security-advisory`. It also runs locally as part of `just check`. Upstream crates flagged as `unmaintained` (informational, not CVE) that mdya cannot fix directly are tracked in [`.cargo/audit.toml`](.cargo/audit.toml). Each ignored advisory is reviewed when an upstream release drops the crate. CVE / RUSTSEC security advisories are never suppressed.
