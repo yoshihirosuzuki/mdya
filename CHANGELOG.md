@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `just check` now also runs `cargo audit`, so it requires [cargo-audit](https://github.com/rustsec/rustsec/tree/main/cargo-audit) (`cargo install cargo-audit --locked`) and network access. See the README's Development section for the offline alternative.
+- The `cargo audit` workflow is now a daily scheduled monitor that opens an issue labelled `security-advisory` when the scan fails, replacing the previous weekly + per-dependency-change pull request trigger. The advisory database changes outside this repository, so a pull request check reported on `main`'s state rather than on the pull request.
 - Bumped `candle-core` / `candle-nn` / `candle-transformers` 0.10.1 → 0.11.0 (lockstep). The historical `=0.10.1` exact-pin was in place because crates.io candle-core 0.10.2 had been published without a matching git tag; upstream tagging has since caught up (`0.10.2` and `0.11.0` both tagged), so we lift the hold and move all three crates in one step.
 
 ## [0.4.0] - 2026-06-21

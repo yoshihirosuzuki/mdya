@@ -1,8 +1,12 @@
 default:
     @just --list
 
-# Format check + lint + test, the gate used by CI.
-check: fmt-check lint test
+# CI runs the first three per pull request (`ci.yml`). The advisory scan is a
+# scheduled monitor there (`audit.yml`), not a pull-request gate, so a local
+# run is the only per-change signal for it.
+
+# Format check + lint + test + advisory scan.
+check: fmt-check lint test audit
 
 # Verify formatting.
 fmt-check:
@@ -19,6 +23,19 @@ lint:
 # Run the full test suite.
 test:
     cargo test --workspace
+
+# The advisory database is fetched over the network on every run: a stale copy
+# would miss exactly the advisories published since the last run. Offline, run
+# `cargo audit --no-fetch --stale` by hand — `--no-fetch` alone still errors
+# once the local database is 90 days old. Unlike the e2e recipes further down,
+# this one is part of `check` despite needing the network: the scan takes
+# seconds, and a dependency bump that pulls in a vulnerable crate should not
+# have to wait for the nightly job to surface.
+
+# Scan deps against RustSec; needs cargo-audit and network access.
+audit:
+    @command -v cargo-audit >/dev/null || { echo "cargo-audit not found; install it with: cargo install cargo-audit --locked"; exit 1; }
+    cargo audit --deny warnings
 
 # Run only the integration smoke tests.
 smoke:

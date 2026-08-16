@@ -1,10 +1,21 @@
 # RustSec advisory database scan.
 #
-# Runs weekly to catch newly published advisories against the pinned
-# dependency tree, and on every `Cargo.toml` / `Cargo.lock` change so dep
-# additions are checked at PR time. The GitHub Dependabot security alert
-# carries the GitHub Advisory Database (a subset of RustSec); this workflow
-# closes the gap by querying RustSec directly.
+# This is a monitor, not a gate. The result of `cargo audit` is a function of
+# two inputs — this repo's dependency tree and the RustSec advisory database —
+# and only the first is under version control. A green tree turns red with no
+# commit at all when an advisory is published, which means a pull-request
+# trigger would mostly report on `main`'s state rather than on the pull
+# request, and would fail contributors on something they cannot fix. So the
+# scan runs on a schedule and reports by opening an issue.
+#
+# `just check` runs the same scan for anyone working in the repo, which is the
+# faster signal. This workflow covers what a local run cannot: advisories
+# published against an untouched tree, and dependency bumps merged without a
+# local run (dependabot opens roughly half the pull requests here).
+#
+# The GitHub Dependabot security alert carries the GitHub Advisory Database,
+# which is a subset of RustSec — not every RustSec advisory has a GHSA entry.
+# This workflow closes the gap by querying RustSec directly.
 #
 # Third-party actions are SHA-pinned, except `dtolnay/rust-toolchain@stable`
 # which is a channel ref by design (tracks latest stable Rust).
@@ -13,17 +24,10 @@ name: audit
 
 on:
   schedule:
-    # Monday 00:00 UTC.
-    - cron: '0 0 * * 1'
-  pull_request:
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-  push:
-    branches: [main]
-    paths:
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
+    # Daily at 21:37 UTC. The minute is deliberately off the top of the hour:
+    # GitHub delays scheduled runs during high-load windows and may drop
+    # queued ones outright, and the start of every hour is such a window.
+    - cron: '37 21 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -33,11 +37,21 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Open issues carrying this label are the deduplication key: while one is
+  # open, a failing run does not file another.
+  ALERT_LABEL: security-advisory
+
 jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      # Needed by the reporting step below; `GITHUB_TOKEN` cannot open issues
+      # with the default read-only permission set.
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -50,5 +64,50 @@ jobs:
 
       # `--deny warnings` is intentional. Per-advisory suppressions live in
       # `.cargo/audit.toml` at the project root.
+      #
+      # `--color never` overrides the `CARGO_TERM_COLOR: always` that
+      # `Swatinem/rust-cache` exports, so the captured output can be pasted
+      # into an issue body without ANSI escapes. `continue-on-error` lets the
+      # reporting step run; the last step restores the failure.
       - name: cargo audit
-        run: cargo audit --deny warnings
+        id: scan
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo audit --deny warnings --color never 2>&1 | tee "$RUNNER_TEMP/audit.txt"
+
+      # One open alert at a time. Closing it is manual, so a still-unfixed
+      # advisory does not refile every day; the next failing run after a close
+      # opens a fresh one.
+      - name: Report the failure as an issue
+        if: steps.scan.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          open_alerts=$(gh issue list --label "$ALERT_LABEL" --state open --json number --jq 'length')
+          if [ "$open_alerts" -gt 0 ]; then
+            echo "An alert issue is already open; not filing another."
+            exit 0
+          fi
+          {
+            echo "\`cargo audit --deny warnings\` failed on \`$GITHUB_REF_NAME\`."
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/audit.txt"
+            echo '```'
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "Filed automatically by \`.github/workflows/audit.yml\`. Close this issue once the tree is clean — while it stays open, later failing runs will not file another."
+          } > "$RUNNER_TEMP/issue-body.md"
+          gh issue create \
+            --title "cargo audit: RustSec advisories in the dependency tree" \
+            --label "$ALERT_LABEL" \
+            --body-file "$RUNNER_TEMP/issue-body.md"
+
+      # `continue-on-error` above swallowed the exit status; put it back so the
+      # run itself is red and the Actions history stays an accurate record.
+      - name: Restore the scan's exit status
+        if: steps.scan.outcome == 'failure'
+        run: exit 1

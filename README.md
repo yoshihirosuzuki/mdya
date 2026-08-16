@@ -140,10 +140,12 @@ runtime:
 ## Development
 
 ```sh
-just check    # fmt-check + clippy (-D warnings) + cargo test (full workspace)
+just check    # fmt-check + clippy (-D warnings) + cargo test (full workspace) + cargo audit
 just smoke    # smoke tests only
 just          # list available recipes
 ```
+
+`just check` needs `cargo install cargo-audit --locked` and network access — the advisory database is fetched on every run. Offline, run `cargo audit --no-fetch --stale` instead.
 
 ## Contributing
 
