@@ -1,3 +1,10 @@
 * text=auto eol=lf
 
+# Committed binary fixtures. `text=auto` above would otherwise leave the call
+# to Git's content inspection, which reads the whole blob and treats it as
+# binary only if it holds a NUL byte, a bare CR, or enough non-printable bytes.
+# These files qualify today, but declaring `binary` drops the dependence on
+# what regeneration happens to emit: check-in conversion then returns before it
+# inspects them, so `eol=lf` can never rewrite bytes inside them.
 *.safetensors binary
+*.pdf binary

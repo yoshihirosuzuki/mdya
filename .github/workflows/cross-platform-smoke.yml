@@ -11,9 +11,8 @@
 # full lint + test suite on that platform, so this workflow covers only
 # the additional OS / arch combinations.
 #
-# `lance-encoding` invokes `protoc` and `xtask-generate-test-pdfs`
-# `include_bytes!`s Noto Sans CJK JP at compile time; both must be present
-# even for `cargo check`.
+# `lance-encoding` invokes `protoc` from its build script, so it must be
+# present even for `cargo check`.
 #
 # Third-party actions are SHA-pinned, except `dtolnay/rust-toolchain@stable`
 # which is a channel ref by design (tracks latest stable Rust).
@@ -68,21 +67,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: choco install protoc -y
-
-      - name: Download Noto Sans CJK JP font for xtask (Linux/macOS)
-        if: runner.os != 'Windows'
-        run: |
-          curl --proto '=https' --tlsv1.2 -fLsS \
-            -o xtask/generate-test-pdfs/fonts/NotoSansCJKjp-Regular.otf \
-            https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf
-
-      - name: Download Noto Sans CJK JP font for xtask (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Invoke-WebRequest -UseBasicParsing `
-            -Uri https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf `
-            -OutFile xtask/generate-test-pdfs/fonts/NotoSansCJKjp-Regular.otf
 
       - name: cargo check --workspace
         run: cargo check --workspace

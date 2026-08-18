@@ -27,7 +27,15 @@ use krilla::geom::Point;
 use krilla::page::PageSettings;
 use krilla::text::{Font, TextDirection};
 
-const NOTO_SANS_CJK_JP: &[u8] = include_bytes!("../fonts/NotoSansCJKjp-Regular.otf");
+const FONT_FILE_NAME: &str = "NotoSansCJKjp-Regular.otf";
+
+/// Upstream source for the `.gitignore`d font, printed when the file is
+/// missing. Mirrored in `fonts/README.md`.
+///
+/// Pinned to a release tag rather than `main` so regenerating the fixtures
+/// years apart still starts from the same font, and so a rename upstream
+/// cannot silently change what this downloads.
+const FONT_DOWNLOAD_URL: &str = "https://github.com/notofonts/noto-cjk/raw/Sans2.004/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf";
 
 /// A4 portrait in PDF points (1 pt = 1/72 inch). 595 × 842 ≈ 210 × 297 mm.
 const PAGE_WIDTH_PT: f32 = 595.0;
@@ -39,8 +47,7 @@ const LEFT_MARGIN: f32 = 60.0;
 const TOP_MARGIN: f32 = 80.0;
 
 fn main() -> Result<()> {
-    let font = Font::new(Arc::new(NOTO_SANS_CJK_JP.to_vec()).into(), 0)
-        .context("parse Noto Sans CJK JP font (Font::new returned None)")?;
+    let font = load_font()?;
 
     let out_dir = fixtures_dir()?;
     std::fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
@@ -74,6 +81,45 @@ fn main() -> Result<()> {
     )?;
 
     Ok(())
+}
+
+/// Read the CJK font from `fonts/` at run time.
+///
+/// Deliberately not `include_bytes!`: this crate is a workspace member, so
+/// embedding the file at compile time made `cargo check` / `clippy` / `test`
+/// over the workspace fail on a fresh clone, where the ~16 MB font is absent
+/// because it is `.gitignore`d. Nothing runs this binary automatically — the
+/// fixture PDFs it writes are committed — so the font is only needed when
+/// the xtask is actually invoked.
+fn load_font() -> Result<Font> {
+    let path = font_path();
+    let bytes = std::fs::read(&path).with_context(|| missing_font_message(&path))?;
+    Font::new(Arc::new(bytes).into(), 0)
+        .context("parse Noto Sans CJK JP font (Font::new returned None)")
+}
+
+/// `<this crate>/fonts/<font file>`, independent of the caller's cwd.
+fn font_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fonts")
+        .join(FONT_FILE_NAME)
+}
+
+/// Absolute paths keep the printed command pasteable from any directory.
+///
+/// `--proto` is double-quoted rather than single-quoted so the line survives
+/// every shell a contributor might paste it into: zsh expands a bare `=https`
+/// to a command path, and `cmd.exe` passes single quotes through literally,
+/// which `curl` then rejects.
+fn missing_font_message(path: &Path) -> String {
+    format!(
+        "read {}\n\n\
+         The font is not committed (~16 MB, see fonts/README.md). Download it with:\n\n\
+         curl --proto \"=https\" --tlsv1.2 -fLsS -o {} {}",
+        path.display(),
+        path.display(),
+        FONT_DOWNLOAD_URL,
+    )
 }
 
 /// Resolve `tests/fixtures/pdfs/` relative to the workspace root. `cargo

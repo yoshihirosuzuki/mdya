@@ -6,8 +6,8 @@ Only the latest minor release of mdya receives security updates. Older minor ver
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.3.x   | :white_check_mark: |
-| < 0.3   | :x:                |
+| 0.4.x   | :white_check_mark: |
+| < 0.4   | :x:                |
 
 ## Reporting a vulnerability
 

@@ -145,7 +145,7 @@ just smoke    # smoke tests only
 just          # list available recipes
 ```
 
-`just check` needs `cargo install cargo-audit --locked` and network access — the advisory database is fetched on every run. Offline, run `cargo audit --no-fetch --stale` instead.
+`just check` needs the [build-from-source prerequisites](#build-from-source) — Rust, `just`, `protoc` — plus `cargo install cargo-audit --locked` and network access, since the advisory database is fetched on every run. Offline, run `cargo audit --no-fetch --stale` instead.
 
 ## Contributing
 
