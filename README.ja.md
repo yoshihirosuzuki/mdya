@@ -145,7 +145,7 @@ just smoke    # smoke テストのみ実行
 just          # recipe 一覧を表示
 ```
 
-`just check` には `cargo install cargo-audit --locked` とネットワーク接続が必要です（advisory データベースを毎回取得します）。オフラインでは代わりに `cargo audit --no-fetch --stale` を実行してください。
+`just check` には[ソースからビルド](#ソースからビルド)の前提（Rust、`just`、`protoc`）に加えて `cargo install cargo-audit --locked` とネットワーク接続が必要です（advisory データベースを毎回取得します）。オフラインでは代わりに `cargo audit --no-fetch --stale` を実行してください。
 
 ## コントリビュート
 

@@ -23,7 +23,7 @@ strings in `xtask/generate-test-pdfs/src/main.rs`):
 Both PDFs are mdya-authored. The text content is original to this
 project (no third-party content embedded). The font subset embedded in
 each PDF is **Noto Sans CJK JP** under the
-[SIL Open Font License v1.1](https://scripts.sil.org/OFL), which permits
+[SIL Open Font License v1.1](https://openfontlicense.org/documents/OFL.txt), which permits
 distribution of subsetted derivatives in document files. The mdya
 repository's `MIT OR Apache-2.0` dual license applies to the PDF
 container and the original text content.

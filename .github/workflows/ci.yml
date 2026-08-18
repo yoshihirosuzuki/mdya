@@ -78,17 +78,6 @@ jobs:
       - name: Install protoc and lld
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler lld
 
-      # `xtask-generate-test-pdfs` embeds Noto Sans CJK JP at compile time via
-      # `include_bytes!`. The font (~16 MB) is `.gitignore`d to keep the repo
-      # small; the workspace clippy / test steps below need it on disk before
-      # they can compile the xtask member. Matches the manual download step
-      # documented in `xtask/generate-test-pdfs/fonts/README.md`.
-      - name: Download Noto Sans CJK JP font for xtask
-        run: |
-          curl --proto '=https' --tlsv1.2 -fLsS \
-            -o xtask/generate-test-pdfs/fonts/NotoSansCJKjp-Regular.otf \
-            https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf
-
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
 

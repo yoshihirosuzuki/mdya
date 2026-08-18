@@ -51,8 +51,8 @@ jobs:
       # `dist generate --check` runs `cargo metadata`, so it needs cargo. No
       # toolchain action is set up: the ubuntu-latest runner ships rustup, and
       # the repo's rust-toolchain.toml (channel 1.95.0) makes the first cargo
-      # call auto-install the pinned toolchain. No build runs, so protoc / the
-      # xtask font (needed by ci.yml) are not required here.
+      # call auto-install the pinned toolchain. No build runs, so protoc is not
+      # required here.
       - name: Install dist
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf \

@@ -5,8 +5,12 @@ default:
 # scheduled monitor there (`audit.yml`), not a pull-request gate, so a local
 # run is the only per-change signal for it.
 
+# The cargo-audit check runs first even though the scan itself runs last: it
+# is the only step that fails on a missing tool rather than on the code, and
+# learning that after a cold-cache `cargo test --workspace` costs half an hour.
+
 # Format check + lint + test + advisory scan.
-check: fmt-check lint test audit
+check: _require-cargo-audit fmt-check lint test audit
 
 # Verify formatting.
 fmt-check:
@@ -33,9 +37,11 @@ test:
 # have to wait for the nightly job to surface.
 
 # Scan deps against RustSec; needs cargo-audit and network access.
-audit:
-    @command -v cargo-audit >/dev/null || { echo "cargo-audit not found; install it with: cargo install cargo-audit --locked"; exit 1; }
+audit: _require-cargo-audit
     cargo audit --deny warnings
+
+_require-cargo-audit:
+    @command -v cargo-audit >/dev/null || { echo "cargo-audit not found; install it with: cargo install cargo-audit --locked"; exit 1; }
 
 # Run only the integration smoke tests.
 smoke:

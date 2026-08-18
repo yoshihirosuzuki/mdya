@@ -1,6 +1,6 @@
 # Noto Sans CJK JP (SIL OFL 1.1) is fetched on demand — keeping the binary
 # out of git keeps the repo small. Download instructions live in this
-# directory's README. The xtask `include_bytes!`'s the file from here at
-# build time, so `cargo run -p xtask-generate-test-pdfs` will fail with a
-# helpful message until the file is present.
+# directory's README. The xtask reads the file from here at run time, so
+# `cargo run -p xtask-generate-test-pdfs` fails with the download command
+# until it is present. Compiling the workspace does not need it.
 NotoSansCJKjp-Regular.otf
