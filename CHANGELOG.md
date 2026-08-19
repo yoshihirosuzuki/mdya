@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A fresh clone can now run `cargo build`, `cargo clippy` and `cargo test` across the workspace without first downloading the 16 MB Noto Sans CJK JP font. The `xtask-generate-test-pdfs` helper embedded the font with `include_bytes!`, which turned a `.gitignore`d file into a compile-time input for a workspace member and stopped `just check` before a single test ran. It now reads the font at run time, so only regenerating the PDF fixtures needs the file present.
 
+### Security
+
+- Bumped `rkyv` (and `rkyv_derive`) 0.8.16 → 0.8.18 in the lockfile, clearing RUSTSEC-2026-0233, RUSTSEC-2026-0234 and RUSTSEC-2026-0235: a crafted archive could trigger a use-after-free during deserialization, and insufficient validation of archives containing hash tables or `Rc`/`Arc` could read out of bounds. rkyv reaches mdya through the tokenizer dictionaries that back full-text search (`lindera-dictionary` → `lindera` → `lance-tokenizer` → `lancedb`), so the archive it deserializes is the IPADIC dictionary compiled into the binary rather than anything a user supplies. `event-listener` 5.4.1 → 5.4.2 moved at the same time for RUSTSEC-2026-0221, which the advisory marks informational (unsound) rather than a vulnerability.
+- Bumped `h2` 0.4.14 → 0.4.16 in the lockfile, clearing RUSTSEC-2026-0258 (GHSA-q83h-524g-xf6h): empty HTTP/2 DATA frames were accepted and queued without limit, so a stream that is not actively drained could grow memory without bound, or panic once the length overflowed. Upstream rates it low severity, denial of service only. h2 sits on both sides of mdya's HTTP surface — the server behind `mdya mcp --http`, which binds to loopback (`127.0.0.1:8000`) unless `--addr` says otherwise, and the client that fetches embedding models. No manifest change was needed, because `hyper` already admitted the patched release.
+
 ## [0.4.0] - 2026-06-21
 
 ### Added
