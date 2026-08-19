@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-19
+
 ### Changed
 
 - `just check` now also runs `cargo audit`, so it requires [cargo-audit](https://github.com/rustsec/rustsec/tree/main/cargo-audit) (`cargo install cargo-audit --locked`) and network access. See the README's Development section for the offline alternative.
@@ -25,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bumped `rkyv` (and `rkyv_derive`) 0.8.16 → 0.8.18 in the lockfile, clearing RUSTSEC-2026-0233, RUSTSEC-2026-0234 and RUSTSEC-2026-0235: a crafted archive could trigger a use-after-free during deserialization, and insufficient validation of archives containing hash tables or `Rc`/`Arc` could read out of bounds. rkyv reaches mdya through the tokenizer dictionaries that back full-text search (`lindera-dictionary` → `lindera` → `lance-tokenizer` → `lancedb`), so the archive it deserializes is the IPADIC dictionary compiled into the binary rather than anything a user supplies. `event-listener` 5.4.1 → 5.4.2 moved at the same time for RUSTSEC-2026-0221, which the advisory marks informational (unsound) rather than a vulnerability.
 - Bumped `h2` 0.4.14 → 0.4.16 in the lockfile, clearing RUSTSEC-2026-0258 (GHSA-q83h-524g-xf6h): empty HTTP/2 DATA frames were accepted and queued without limit, so a stream that is not actively drained could grow memory without bound, or panic once the length overflowed. Upstream rates it low severity, denial of service only. h2 sits on both sides of mdya's HTTP surface — the server behind `mdya mcp --http`, which binds to loopback (`127.0.0.1:8000`) unless `--addr` says otherwise, and the client that fetches embedding models. No manifest change was needed, because `hyper` already admitted the patched release.
+- Accepted two more upstream `unmaintained` advisories as WONTFIX in `.cargo/audit.toml`: RUSTSEC-2026-0192 (`ttf-parser`) and RUSTSEC-2026-0206 (`rustybuzz`). Both are informational rather than vulnerabilities. `ttf-parser` is in the released binary, reached through `pdf-extract` → `lopdf` for PDF ingest; `rustybuzz` is not, reaching only the `xtask` fixture generator through `krilla`. See the file header and `SECURITY.md` for the policy.
 
 ## [0.4.0] - 2026-06-21
 
@@ -92,7 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP server (`mdya mcp`) exposing `search_fts`, `search_vector`, and `search_hybrid` over stdio and streamable HTTP.
 - Prebuilt binaries and `curl | sh` / `irm | iex` installers for macOS (Apple Silicon, Intel), Linux (x86_64, aarch64), and Windows (x86_64).
 
-[Unreleased]: https://github.com/yoshihirosuzuki/mdya/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/yoshihirosuzuki/mdya/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.4.1
 [0.4.0]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.4.0
 [0.3.2]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.3.2
 [0.3.1]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.3.1
