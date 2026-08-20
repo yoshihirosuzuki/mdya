@@ -52,8 +52,15 @@ jobs:
     name: check (ubuntu-latest)
     runs-on: ubuntu-latest
     # Headroom for the cold-cache compile of the workspace; also acts as a
-    # hang guard if a step gets stuck.
-    timeout-minutes: 30
+    # hang guard if a step gets stuck. 30 minutes turned out to be too tight.
+    # Any change to `Cargo.lock` invalidates the cache key, and when the crate
+    # that moves sits deep in the graph — under `hyper` or `reqwest`, say —
+    # almost everything downstream recompiles. On one such run the limit
+    # cancelled the job while `cargo clippy` was still going, before `cargo
+    # test` had even started; the same job finished in about eleven minutes on
+    # a re-run once the cache had been repopulated. 60 keeps the hang guard
+    # useful while leaving room for a genuinely cold clippy-plus-test pass.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
