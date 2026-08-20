@@ -107,9 +107,14 @@ hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rust
 # model downloads and by lancedb's namespace client), so this direct entry
 # adds no new top-level dependency — it only pins the version/features mdya
 # relies on. `default-features = false` drops `default-tls` (native-tls =
-# OpenSSL C) and `http2`; `rustls-tls` reuses the ring/rustls stack already
-# present, `json` enables the `/api/embed` (de)serialization. The Ollama
-# endpoint is plain HTTP/1 loopback, so http2/native-tls are unnecessary.
+# OpenSSL C), and that one sticks: the resolved feature set has no
+# `native-tls`. `rustls-tls` reuses the ring/rustls stack already present,
+# `json` enables the `/api/embed` (de)serialization. The Ollama endpoint is
+# plain HTTP/1 loopback, so mdya does not ask for `http2` — but the build
+# gets it anyway, because `hf-hub`'s `tokio` feature and
+# `lance-namespace-reqwest-client` each enable it and cargo unifies features
+# across the graph. Turning a feature off here narrows what mdya requires,
+# not what the final binary contains.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmcp = { version = "3.1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 # axum HTTP layer hosting rmcp's `StreamableHttpService` as a tower service for
