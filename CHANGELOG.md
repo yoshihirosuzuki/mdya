@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Bumped `serde_with` (and `serde_with_macros`) 3.20.0 → 3.22.0 in the lockfile, clearing GHSA-7gcf-g7xr-8hxj: serializing a `KeyValueMap` entry whose sequence or map was empty panicked. Upstream rates it moderate severity, a panic rather than memory unsafety. `serde_with` reaches mdya as a transitive dependency of `lance-namespace-reqwest-client` under `lancedb`; whether the affected paths are reachable here was not established. The lockfile moves to 3.22.0 rather than the 3.21.0 the advisory names because 3.21.0 fixed `KeyValueMap` alone, and 3.22.0 extends the same fix to `rust::sets_duplicate_value_is_error`, `rust::maps_duplicate_key_is_error`, `rust::sets_last_value_wins` and `rust::maps_first_key_wins`, which share the defect. The advisory was published through the GitHub Advisory Database and has no RustSec entry, so `cargo audit` did not flag it — the Dependabot alert was the only signal.
+
 ## [0.4.1] - 2026-08-19
 
 ### Changed
