@@ -27,3 +27,9 @@ Acknowledgement of reports usually happens within a few business days. There is 
 ## Informational advisories
 
 `cargo audit` runs daily on a schedule, and a failing run opens an issue labelled `security-advisory`. It also runs locally as part of `just check`. Upstream crates flagged as `unmaintained` (informational, not CVE) that mdya cannot fix directly are tracked in [`.cargo/audit.toml`](.cargo/audit.toml). Each ignored advisory is reviewed when an upstream release drops the crate. CVE / RUSTSEC security advisories are never suppressed.
+
+## How fixes are shipped
+
+A vulnerability in one of mdya's dependencies is fixed by moving that dependency and shipping the result in the next release, recorded under `Security` in [CHANGELOG.md](CHANGELOG.md). A separate GitHub Security Advisory is published only when mdya's own code is at fault, or when a dependency flaw is reachable from outside the machine in a default configuration — the MCP server binds to loopback unless you point `--addr` elsewhere.
+
+How you installed mdya decides when a fix reaches you. Prebuilt binaries and the shell / PowerShell installers are built from the lockfile of the tag they were cut from, so they pick up a dependency fix only when a new version is released. `cargo install mdya` ignores the packaged lockfile by default and re-resolves dependencies, which can pull in a patched dependency without waiting for an mdya release; `cargo install --locked mdya` opts out and reproduces the exact tree the release was built with.
