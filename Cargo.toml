@@ -76,7 +76,7 @@ shellexpand = "3"
 # Lockstep with the `lance-index` pin further down: lancedb requires the whole
 # `lance-*` ecosystem at one exact version, so bumping either crate on its own
 # cannot compile. See the note on `lance-index` for the detail.
-lancedb = { version = "=0.37.1", default-features = false }
+lancedb = { version = "=0.38.0", default-features = false }
 # Embedded IPADIC dictionary for Lance's FTS `lindera/ipadic` tokenizer.
 # The `embed-ipadic` feature triggers `lindera-ipadic`'s build.rs to fetch
 # `mecab-ipadic-2.7.0-20070801.tar.gz` from Lindera.dev (md5-verified)
