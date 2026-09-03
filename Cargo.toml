@@ -183,7 +183,7 @@ schemars = "1"
 # `FullTextSearchQuery` types in the tree, so `full_text_search` fails to
 # typecheck. Bump this, the `[dev-dependencies]` copy, and `lancedb` in one
 # step. Pure Rust, no `*-sys`.
-lance-index = "=10.0.0"
+lance-index = "=11.0.0"
 
 [features]
 default = []
@@ -201,7 +201,7 @@ tempfile = "3"
 futures = "0.3"
 arrow-array = "58"
 arrow-schema = "58"
-lance-index = "=10.0.0"
+lance-index = "=11.0.0"
 
 [profile.release]
 lto = "thin"
