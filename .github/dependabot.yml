@@ -16,6 +16,19 @@ updates:
       candle:
         patterns:
           - "candle-*"
+      # `lancedb` pins the whole `lance-*` family at an exact version, so a
+      # single-crate bump leaves two `lance_index::scalar::FullTextSearchQuery`
+      # types in the tree and `full_text_search` fails to typecheck. Group them
+      # so a matching pair lands as one PR. No `update-types` filter: dependabot
+      # reads lancedb 0.37 -> 0.38 as semver-minor and lance-index 10 -> 11 as
+      # semver-major, so a level filter would split them apart again. Grouping
+      # is not a guarantee: the two are not published at the same moment and the
+      # default 3-day per-dependency cooldown can leave only one of them in a
+      # weekly run. A group PR carrying one crate must not be merged: it fails
+      # CI on every platform.
+      lance:
+        patterns:
+          - "lance*"
     ignore:
       # arrow must track lancedb's arrow version (currently 58). A standalone
       # arrow major bump pulls a second arrow into the tree and breaks the
