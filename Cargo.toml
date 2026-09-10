@@ -71,7 +71,7 @@ serde_json = "1"
 # `Cargo.lock`, not this file, is what keeps the resolved version
 # from drifting.
 serde-saphyr = "1"
-dirs = "6"
+dirs = "7"
 shellexpand = "3"
 # Lockstep with the `lance-index` pin further down: lancedb requires the whole
 # `lance-*` ecosystem at one exact version, so bumping either crate on its own
