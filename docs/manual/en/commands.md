@@ -102,7 +102,7 @@ $ mdya collection list --format json
 
 ## `mdya update-all`
 
-Walks every registered collection, ingests new and changed `.md` / `.markdown` / `.pdf` files, and removes index entries for files that no longer exist.
+Walks every registered collection, ingests new and changed `.md` / `.markdown` / `.pdf` files, and removes index entries for files that are gone from the walk — deleted, renamed, or newly excluded by `.gitignore`.
 
 ```sh
 mdya update-all
@@ -110,6 +110,7 @@ mdya update-all
 
 - Files with the `.md`, `.markdown`, or `.pdf` extension are indexed. `.pdf` is converted to plain text at ingest time and flows through the same chunker and embedder as Markdown.
 - Symbolic links under a collection root are not followed (see [`collections` in configuration.md](configuration.md#collections)).
+- Paths excluded by `.gitignore` are not indexed when the collection root is inside a git repository (see [`collections` in configuration.md](configuration.md#collections)).
 - Parallelism is controlled by `runtime.embed_parallelism`.
 - Progress is shown as a progress bar on stderr, and a one-line summary is written to stdout at the end.
 
@@ -122,7 +123,7 @@ What each counter means:
 - `new` — files ingested for the first time
 - `updated` — files re-ingested because their content changed
 - `skipped` — files left alone because nothing changed
-- `removed` — index entries dropped because the file disappeared
+- `removed` — index entries dropped because the file disappeared or is now excluded by `.gitignore`
 - `failed` — files that failed to ingest
 
 When `failed > 0`, the command exits with `1` (the summary is still printed).
@@ -309,7 +310,7 @@ mdya vector use <model> [--yes]
 
 1. Rewrites `embedding.model` in `config.yml` to the new model.
 2. Drops the vector table inside the index.
-3. Walks every registered collection and re-embeds documents with the new model.
+3. Walks every registered collection and re-embeds documents with the new model. This is the same walk as `update-all`, so `.gitignore` exclusions apply.
 
 The document index (the source text returned by `mdya get`) is model-independent and stays in place. Only the vector portion is recomputed.
 

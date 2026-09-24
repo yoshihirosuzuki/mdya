@@ -102,7 +102,7 @@ $ mdya collection list --format json
 
 ## `mdya update-all`
 
-登録済みの全コレクションを走査し、新規 / 変更された `.md` / `.markdown` / `.pdf` ファイルを取り込み、削除されたファイルに対応する索引データを掃除します。
+登録済みの全コレクションを走査し、新規 / 変更された `.md` / `.markdown` / `.pdf` ファイルを取り込み、走査に現れなくなったファイル (削除・改名・`.gitignore` で新たに除外されたもの) の索引データを掃除します。
 
 ```sh
 mdya update-all
@@ -110,6 +110,7 @@ mdya update-all
 
 - 索引対象は `.md` / `.markdown` / `.pdf` 拡張子のファイルです。`.pdf` は取り込み時に plain text に変換して Markdown と共通の chunker と embedding に流します。
 - コレクションルート配下のシンボリックリンクは辿りません ([configuration.md の `collections`](configuration.md#collections) 参照)。
+- コレクションルートが git リポジトリ内にある場合、`.gitignore` で除外されるパスは索引化しません ([configuration.md の `collections`](configuration.md#collections) 参照)。
 - 並列度は `runtime.embed_parallelism` で調整します。
 - 進捗は stderr にプログレスバーで表示され、最後に stdout へサマリ 1 行を出します。
 
@@ -122,7 +123,7 @@ Indexed 43 documents (new: 5, updated: 3, skipped: 34, removed: 0, failed: 1).
 - `new` — 新規に取り込んだファイル数
 - `updated` — 内容が変わったので再取り込みしたファイル数
 - `skipped` — 変更がなくスキップしたファイル数
-- `removed` — ファイルが消えたので索引から消した数
+- `removed` — ファイルが消えた、または `.gitignore` で除外されるようになったので索引から消した数
 - `failed` — 取り込みに失敗したファイル数
 
 `failed > 0` の場合は終了コード `1` を返します (サマリは表示されます)。
@@ -309,7 +310,7 @@ mdya vector use <model> [--yes]
 
 1. `config.yml` の `embedding.model` を新しいモデルに書き換え
 2. 索引内のベクトルテーブルを削除
-3. 登録済みコレクションを全部スキャンし、新しいモデルで再度埋め込み計算
+3. 登録済みコレクションを全部スキャンし、新しいモデルで再度埋め込み計算 (`update-all` と同じ走査なので、`.gitignore` の除外が効きます)
 
 文書本文の索引 (`mdya get` で取れる原文) はモデル非依存なので残ります。再計算が走るのはベクトル部分だけです。
 
