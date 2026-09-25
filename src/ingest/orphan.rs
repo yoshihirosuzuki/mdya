@@ -1,9 +1,10 @@
 //! Per-collection orphan cleanup.
 //!
 //! "Orphan" = a `(collection, path)` row in the `chunks` table whose
-//! file no longer exists on disk. The user removed / renamed the file
-//! between `mdya update-all` runs; we delete the now-pointless chunks
-//! so search results stay accurate.
+//! file the walker no longer yields: the user removed / renamed it
+//! between `mdya update-all` runs, or a `.gitignore` rule now excludes
+//! it. We delete the now-pointless chunks so search results stay
+//! accurate.
 //!
 //! Algorithm: full scan diff. The walker has already produced the
 //! current filesystem set; we ask the DB for its set and delete what
