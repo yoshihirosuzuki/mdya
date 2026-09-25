@@ -116,7 +116,7 @@ hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rust
 # across the graph. Turning a feature off here narrows what mdya requires,
 # not what the final binary contains.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rmcp = { version = "3.1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "3.4", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 # axum HTTP layer hosting rmcp's `StreamableHttpService` as a tower service for
 # the `mdya mcp --http` daemon. `default-features = false` + `http1` +
 # `tokio` is the minimal set rmcp's own example builds against — no multipart,
@@ -194,7 +194,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 assert_cmd = "2"
 insta = "1"
 predicates = "3"
-rmcp = { version = "3.1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.4", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "process"] }
 anyhow = "1"
 tempfile = "3"
