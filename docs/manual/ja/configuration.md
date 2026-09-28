@@ -79,12 +79,7 @@ collections:
 
 `mdya update-all` の走査は**コレクションルート配下のシンボリックリンクを辿りません**。ルート自身がシンボリックリンクの場合 (例: `~/notes -> ~/Dropbox/notes`) は辿ります。別ディスクに散らばった領域を索引化したいときは、別コレクションとして追加してください。
 
-`mdya update-all` (と `mdya vector use` の再埋め込み) は `.gitignore` を尊重します。コレクションルートが git リポジトリの中にある (ルートかその上位に `.git` がある) 場合、`.gitignore` で除外されているファイルとディレクトリは索引化しません。ルートより上の階層の `.gitignore` も適用されます。
-
-- 読むのは `.gitignore` だけです。`.git/info/exclude`、global excludes、`.ignore` ファイルは読みません。
-- `.github/` のような隠しディレクトリは、`.gitignore` の規則に当たらない限り走査します。
-- git では無視したままで mdya には索引化させたいファイルがある場合は、その規則を `.gitignore` から `.git/info/exclude` に移してください。git は `.git/info/exclude` も読みますが mdya は読まないため、そのファイルは索引化の対象に戻ります。
-- 除外されたディレクトリを別コレクションとして登録する方法は、規則が `notes/` のようにディレクトリ名だけを指すときにしか効きません。`notes/*` や `*.pdf` のような規則は、登録後も配下のファイルに適用されるためです。
+コレクションルートが git リポジトリの中にある場合、`mdya update-all` は `.gitignore` で除外されているファイルとディレクトリを索引化しません (ルートより上の階層の `.gitignore` も適用されます)。
 
 ### embedding
 

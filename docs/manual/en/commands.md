@@ -102,7 +102,7 @@ $ mdya collection list --format json
 
 ## `mdya update-all`
 
-Walks every registered collection, ingests new and changed `.md` / `.markdown` / `.pdf` files, and removes index entries for files that are gone from the walk — deleted, renamed, or newly excluded by `.gitignore`.
+Walks every registered collection, ingests new and changed `.md` / `.markdown` / `.pdf` files, and removes index entries for files that are gone from the walk — deleted or newly excluded by `.gitignore`.
 
 ```sh
 mdya update-all
@@ -310,7 +310,7 @@ mdya vector use <model> [--yes]
 
 1. Rewrites `embedding.model` in `config.yml` to the new model.
 2. Drops the vector table inside the index.
-3. Walks every registered collection and re-embeds documents with the new model. This is the same walk as `update-all`, so `.gitignore` exclusions apply.
+3. Walks every registered collection and re-embeds documents with the new model (same walk as `update-all`, so `.gitignore` exclusions apply).
 
 The document index (the source text returned by `mdya get`) is model-independent and stays in place. Only the vector portion is recomputed.
 

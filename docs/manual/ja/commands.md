@@ -102,7 +102,7 @@ $ mdya collection list --format json
 
 ## `mdya update-all`
 
-登録済みの全コレクションを走査し、新規 / 変更された `.md` / `.markdown` / `.pdf` ファイルを取り込み、走査に現れなくなったファイル (削除・改名・`.gitignore` で新たに除外されたもの) の索引データを掃除します。
+登録済みの全コレクションを走査し、新規 / 変更された `.md` / `.markdown` / `.pdf` ファイルを取り込み、走査に現れなくなったファイル (削除されたもの、`.gitignore` で新たに除外されたもの) の索引データを掃除します。
 
 ```sh
 mdya update-all
