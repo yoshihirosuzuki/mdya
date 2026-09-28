@@ -79,7 +79,12 @@ The usual way to add a collection is `mdya collection add <path>`, in which case
 
 `mdya update-all` walks the directory and **does not follow symbolic links under the collection root**. When the root itself is a symbolic link (e.g. `~/notes -> ~/Dropbox/notes`), the root link is followed. If you want to index areas scattered across separate disks, register each one as its own collection.
 
-`mdya update-all` (and the re-embed walk in `mdya vector use`) also honors `.gitignore`. When the collection root is inside a git repository (a `.git` directory or file at the root or in a directory above it), files and directories excluded by `.gitignore` rules are not indexed, including rules from `.gitignore` files above the root. Only `.gitignore` files are consulted: `.git/info/exclude`, the global excludes file and `.ignore` files are not read, and hidden entries such as `.github/` are still walked unless a rule excludes them. To keep a git-ignored path in the index — say a private notes folder kept out of version control — move its rule from `.gitignore` to `.git/info/exclude`, which git reads and mdya does not. Registering the ignored directory as its own collection also works, but only when the rule names the directory itself (for example `notes/`): rules from parent directories are not applied to a collection root, yet they still apply to the files under it, so patterns such as `notes/*` or `*.pdf` keep excluding them.
+`mdya update-all` (and the re-embed walk in `mdya vector use`) honors `.gitignore`. When the collection root is inside a git repository (a `.git` directory or file at the root or above it), files and directories excluded by `.gitignore` are not indexed. `.gitignore` files above the root apply as well.
+
+- Only `.gitignore` files are read — not `.git/info/exclude`, the global excludes file, or `.ignore` files.
+- Hidden directories such as `.github/` are still walked unless a `.gitignore` rule excludes them.
+- To keep a file ignored by git but indexed by mdya, move its rule from `.gitignore` to `.git/info/exclude`: git reads that file too, mdya does not, so the path is indexed again.
+- Registering an excluded directory as its own collection only helps when the rule names the directory itself (`notes/`). Rules such as `notes/*` or `*.pdf` still apply to the files under the new root.
 
 ### embedding
 
