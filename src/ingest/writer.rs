@@ -539,7 +539,8 @@ async fn remove_orphans(
     summary: &mut UpdateSummary,
 ) -> Result<(), IngestError> {
     // Orphans = any `(collection, path)` indexed in chunks OR sources
-    // that no longer exists on disk. Union the two key sets so an
+    // that the walker no longer yields (deleted, renamed, or now
+    // excluded by `.gitignore`). Union the two key sets so an
     // interrupted previous run that left one table's row behind still
     // gets cleaned.
     let mut db_paths: BTreeSet<PathBuf> = db_index.keys().cloned().collect();

@@ -148,9 +148,14 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # features (getopts / html) are disabled — chunking only needs the parser,
 # not the CLI or HTML escaping. Pure Rust, no `*-sys` / no `cc-rs`.
 pulldown-cmark = { version = "0.13", default-features = false }
-# Recursive file walker for the ingest pipeline. Pure Rust
-# (`same-file` + `winapi-util` on Windows, both `#[link]`-based, no `*-sys`).
-walkdir = "2"
+# Recursive, `.gitignore`-aware file walker for the ingest pipeline (the
+# walker behind ripgrep). Replaces the direct `walkdir` dependency; walkdir
+# stays in the tree underneath `ignore`. Of its dependencies only `ignore`
+# itself and `globset` are new to the lockfile — walkdir, same-file,
+# crossbeam-deque, memchr, regex-automata, regex-syntax, aho-corasick,
+# bstr, log and (Windows only) winapi-util were already present. Pure
+# Rust, no `*-sys` / no `cc-rs`.
+ignore = "0.4"
 # Pure Rust PDF text extractor for `.pdf` ingest.
 # Internally pulls lopdf + adobe-cmap-parser + cff-parser + encoding_rs +
 # euclid + postscript + type1-encoding-parser + unicode-normalization + log

@@ -79,6 +79,8 @@ The usual way to add a collection is `mdya collection add <path>`, in which case
 
 `mdya update-all` walks the directory and **does not follow symbolic links under the collection root**. When the root itself is a symbolic link (e.g. `~/notes -> ~/Dropbox/notes`), the root link is followed. If you want to index areas scattered across separate disks, register each one as its own collection.
 
+When a collection root is inside a git repository, `mdya update-all` does not index files and directories that `.gitignore` excludes (rules in `.gitignore` files above the root apply too).
+
 ### embedding
 
 Specifies exactly one embedding model used by vector / hybrid search.

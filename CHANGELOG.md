@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `mdya update-all` (and the re-embed walk in `mdya vector use`) now honors `.gitignore`. When a collection root is inside a git repository, files and directories excluded by `.gitignore` — including rules in `.gitignore` files above the root — are no longer indexed; git worktrees, `node_modules/` and scratch directories kept under a repository root used to be indexed and appeared as duplicates in search results. Only `.gitignore` is read (not `.git/info/exclude`, the global excludes file or `.ignore`), and hidden directories are not excluded by name. Existing indexes adjust on the next `mdya update-all` or `mdya vector use`: entries for paths that are now ignored are dropped and counted under `removed`.
+- Replaced the direct `walkdir` dependency with the `ignore` crate (the library behind ripgrep); walkdir stays in the tree underneath it. `ignore` and `globset` are the only crates new to the dependency tree, both pure Rust with no `*-sys` bindings.
+
 ### Security
 
 - Bumped `serde_with` (and `serde_with_macros`) 3.20.0 → 3.22.0 in the lockfile, clearing GHSA-7gcf-g7xr-8hxj: serializing a `KeyValueMap` entry whose sequence or map was empty panicked. Upstream rates it moderate severity, a panic rather than memory unsafety. `serde_with` reaches mdya as a transitive dependency of `lance-namespace-reqwest-client` under `lancedb`; whether the affected paths are reachable here was not established. The lockfile moves to 3.22.0 rather than the 3.21.0 the advisory names because 3.21.0 fixed `KeyValueMap` alone, and 3.22.0 extends the same fix to `rust::sets_duplicate_value_is_error`, `rust::maps_duplicate_key_is_error`, `rust::sets_last_value_wins` and `rust::maps_first_key_wins`, which share the defect. The advisory was published through the GitHub Advisory Database and has no RustSec entry, so `cargo audit` did not flag it — the Dependabot alert was the only signal.
