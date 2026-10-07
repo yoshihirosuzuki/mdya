@@ -146,7 +146,10 @@ indicatif = "0.18"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # Markdown event-based parser for heading-aware chunking. Default
 # features (getopts / html) are disabled — chunking only needs the parser,
-# not the CLI or HTML escaping. Pure Rust, no `*-sys` / no `cc-rs`.
+# not the CLI or HTML escaping. Pure Rust, no `*-sys` / no `cc-rs`. The
+# chunker works around an offset-iterator panic in 0.13.4 (see
+# `offset_parser_would_panic` in src/chunking/markdown.rs); its tests fail
+# when an upgrade changes that behaviour.
 pulldown-cmark = { version = "0.13", default-features = false }
 # Recursive, `.gitignore`-aware file walker for the ingest pipeline (the
 # walker behind ripgrep). Replaces the direct `walkdir` dependency; walkdir

@@ -10,7 +10,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::TimestampMicrosecondType;
 use arrow_array::{
     Array, FixedSizeListArray, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
-    TimestampMicrosecondArray, UInt32Array,
+    TimestampMicrosecondArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::Schema;
 use chrono::{DateTime, Utc};
@@ -33,7 +33,7 @@ use crate::store::lance_lm::ensure_lindera_ipadic_config;
 use crate::store::metadata_check::{self, Outcome as MetadataOutcome};
 use crate::store::{
     CHUNKS_TABLE_NAME, COL_BODY, COL_CHUNK_SEQUENCE, COL_COLLECTION, COL_EMBEDDING, COL_PATH,
-    COL_SOURCE_HASH, SOURCES_TABLE_NAME,
+    COL_SOURCE_HASH, SOURCES_TABLE_NAME, chunks_schema_has_source_ranges,
 };
 
 /// The two LanceDB tables the ingest writer keeps in step: per-chunk
@@ -124,6 +124,7 @@ pub async fn update_all_collections(
         embedder.model_id(),
         declared_dim,
     )?;
+    ensure_source_range_columns(&tables.chunks, embedder.model_id()).await?;
     let mut summary = UpdateSummary::default();
     for (name, root) in collections {
         update_one_collection(
@@ -876,6 +877,18 @@ fn build_record_batch(
     let modified_at_col =
         TimestampMicrosecondArray::from(vec![micros; n]).with_timezone("UTC".to_string());
     let source_hash_col = StringArray::from(vec![source_hash; n]);
+    let source_start_col = UInt64Array::from(
+        chunks
+            .iter()
+            .map(|c| c.source_range.start as u64)
+            .collect::<Vec<_>>(),
+    );
+    let source_end_col = UInt64Array::from(
+        chunks
+            .iter()
+            .map(|c| c.source_range.end as u64)
+            .collect::<Vec<_>>(),
+    );
     let columns: Vec<Arc<dyn Array>> = vec![
         Arc::new(collection_col),
         Arc::new(path_col),
@@ -884,8 +897,23 @@ fn build_record_batch(
         Arc::new(embedding_col),
         Arc::new(modified_at_col),
         Arc::new(source_hash_col),
+        Arc::new(source_start_col),
+        Arc::new(source_end_col),
     ];
     Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+/// Refuse a `chunks` table built without the source-range columns. Runs
+/// before any file is touched: unchanged files are skipped, so ingesting into
+/// an old table would leave its rows without ranges indefinitely.
+async fn ensure_source_range_columns(chunks: &Table, model: &str) -> Result<(), IngestError> {
+    let schema = chunks.schema().await.map_err(IngestError::QueryChunks)?;
+    if chunks_schema_has_source_ranges(&schema) {
+        return Ok(());
+    }
+    Err(IngestError::IndexOutdated {
+        model: model.to_string(),
+    })
 }
 
 /// Lift `metadata_check::Outcome` to the matching `IngestError`. `Pass`

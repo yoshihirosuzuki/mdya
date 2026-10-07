@@ -8,7 +8,8 @@ mod schema;
 
 pub use schema::{
     CHUNKS_TABLE_NAME, COL_BODY, COL_CHUNK_SEQUENCE, COL_COLLECTION, COL_CONTENT, COL_EMBEDDING,
-    COL_PATH, COL_SOURCE_HASH, SOURCES_TABLE_NAME, chunks_schema, sources_schema,
+    COL_PATH, COL_SOURCE_END, COL_SOURCE_HASH, COL_SOURCE_START, SOURCES_TABLE_NAME, chunks_schema,
+    chunks_schema_has_source_ranges, sources_schema,
 };
 
 use anyhow::{Context, Result};

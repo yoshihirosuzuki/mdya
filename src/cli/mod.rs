@@ -102,23 +102,29 @@ pub enum Command {
     Vector(VectorCommand),
 
     /// Print a document's full original text (the faithful source) —
-    /// or one chunk's body with `--chunk <N>` — to stdout.
+    /// or the original text of one chunk (`--chunk <N>`) or a run of chunks
+    /// (`--chunk <N> --chunk-end <M>`) — to stdout.
     /// Reads from the DB, not the filesystem.
     Get {
         /// Collection name (must be declared in config.yml).
         collection: String,
         /// Document path, relative to the collection root.
         path: String,
-        /// 0-indexed `chunk_sequence` to print one chunk's
-        /// body instead of the full document. Pair with a `chunk_sequence`
+        /// 0-indexed `chunk_sequence` to print the original text of that
+        /// chunk instead of the full document. Pair with a `chunk_sequence`
         /// from `mdya search ... --chunks` to read the middle ground
         /// between a snippet and the whole file.
         #[arg(long = "chunk", value_name = "N")]
         chunk: Option<u32>,
-        /// Bypass the `get.cli_max_bytes` output-size cap and print the full
-        /// document regardless of size — for redirects / pipes where a large
-        /// output is intended. Has no effect with `--chunk` (chunk reads are
-        /// never size-checked).
+        /// Last `chunk_sequence` (inclusive) to print, reading chunks N
+        /// through M as one contiguous piece of the original text. Requires
+        /// `--chunk`; must be >= N. A value past the last chunk reads to the
+        /// end of the document.
+        #[arg(long = "chunk-end", value_name = "M", requires = "chunk")]
+        chunk_end: Option<u32>,
+        /// Bypass the `get.cli_max_bytes` output-size cap and print the output
+        /// (full document or chunks) regardless of size — for redirects /
+        /// pipes where a large output is intended.
         #[arg(short = 'f', long = "no-size-limit")]
         no_size_limit: bool,
     },
@@ -312,6 +318,7 @@ impl Cli {
                 collection,
                 path,
                 chunk,
+                chunk_end,
                 no_size_limit,
             } => {
                 get::run(
@@ -319,6 +326,7 @@ impl Cli {
                     &collection,
                     &path,
                     chunk,
+                    chunk_end,
                     no_size_limit,
                 )
                 .await?;

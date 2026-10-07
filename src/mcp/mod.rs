@@ -36,7 +36,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config;
 use crate::embedding::{EmbedError, Embedder, ModelCache, RURI_V3_30M_DIM, RuriV3_30m};
-use crate::get::{GetError, check_size_limit, configured_size_limit, get_chunk, get_document};
+use crate::get::{
+    ChunkSpan, GetError, check_size_limit, configured_size_limit, get_chunks, get_document,
+};
 use crate::introspect::{self, CollectionListReport};
 use crate::search::{SearchEngine, SearchError, SearchMode, SearchResponse};
 
@@ -61,11 +63,14 @@ optional `collections` filter (empty = all collections), and an optional `level`
 (`\"doc\"` default, or `\"chunk\"`). With `level: \"doc\"` each hit is one document \
 (one per `(collection, path)`) carrying the max chunk score and a `matched_chunks` \
 count; with `level: \"chunk\"` you get the raw chunk-level passages including \
-`chunk_sequence`. Use `get_document` with a hit's `collection` and `path` to fetch the \
-document's full original text, or add `chunk` (a `chunk_sequence` from a \
-`level: \"chunk\"` hit) to fetch one chunk's body — the middle ground between the \
-short snippet and the full document. Use `list_collections` to see the available collections \
-(name, path, description, document count).";
+`chunk_sequence`. Every hit carries `chunk_count`, the number of chunks in its document. \
+Use `get_document` with a hit's `collection` and `path` to fetch the document's full \
+original text, or add `chunk` (a `chunk_sequence` from a `level: \"chunk\"` hit) to fetch \
+the original text of that chunk — the middle ground between the short snippet and the full \
+document. Add `chunk_end` as well to fetch chunks `chunk` through `chunk_end` as one \
+contiguous piece, e.g. to read around a hit or to page through a document too large to \
+fetch whole; a `chunk_end` past the last chunk reads to the end. Use `list_collections` to \
+see the available collections (name, path, description, document count).";
 
 #[derive(Clone)]
 pub struct Server {
@@ -161,8 +166,10 @@ impl Server {
         description = "Fetch one Markdown document's full original text by its collection and \
                        path (e.g. from a search hit) — returns the faithful source, not a \
                        snippet. Pass `chunk` (a `chunk_sequence` from a `level: \"chunk\"` \
-                       search hit) to fetch just one chunk's body instead: the middle ground \
-                       between the snippet and the full document."
+                       search hit) to fetch just that chunk's original text instead: the \
+                       middle ground between the snippet and the full document. Add \
+                       `chunk_end` to fetch chunks `chunk` through `chunk_end` as one \
+                       contiguous piece; a `chunk_end` past the last chunk reads to the end."
     )]
     pub async fn get_document(
         &self,
@@ -172,12 +179,12 @@ impl Server {
             collection,
             path,
             chunk,
+            chunk_end,
         } = req;
-        let content = match chunk {
-            Some(seq) => get_chunk(&self.config_dir, &collection, &path, seq).await,
-            None => self.full_document_within_cap(&collection, &path).await,
-        }
-        .map_err(|e| Json(McpToolError::from(e)))?;
+        let content = self
+            .read_within_cap(&collection, &path, chunk, chunk_end)
+            .await
+            .map_err(|e| Json(McpToolError::from(e)))?;
         Ok(Json(GetDocumentResponse {
             collection,
             path,
@@ -185,21 +192,28 @@ impl Server {
         }))
     }
 
-    /// Fetch the faithful full document and enforce the MCP output cap
-    /// (`get.mcp_max_bytes`, `0` = disabled). The document is read in full
-    /// before the cap is applied: the cap bounds the *emitted* payload (the
-    /// client's context budget), not the read. Unlike the CLI there is no
-    /// per-call bypass: an LLM that always opted out would defeat the
-    /// context-budget protection this guard exists for. An over-cap document
-    /// surfaces as [`GetError::DocumentTooLarge`], which the tool's
-    /// [`McpToolError`] projection renders as `payload_too_large`.
-    async fn full_document_within_cap(
+    /// Fetch the full document or the requested chunks and enforce the MCP
+    /// output cap (`get.mcp_max_bytes`, `0` = disabled) on either. The content
+    /// is read in full before the cap is applied: the cap bounds the *emitted*
+    /// payload (the client's context budget), not the read. Unlike the CLI
+    /// there is no per-call bypass: an LLM that always opted out would defeat
+    /// the context-budget protection this guard exists for. Over-cap content
+    /// surfaces as [`GetError::ContentTooLarge`], which the tool's
+    /// [`McpToolError`] projection renders as `payload_too_large`; a client
+    /// can then read the document in smaller chunk ranges.
+    async fn read_within_cap(
         &self,
         collection: &str,
         path: &str,
+        chunk: Option<u32>,
+        chunk_end: Option<u32>,
     ) -> Result<String, GetError> {
+        let span = ChunkSpan::from_request(chunk, chunk_end)?;
         let cfg = config::load(&self.config_dir.join("config.yml"))?;
-        let content = get_document(&self.config_dir, collection, path).await?;
+        let content = match span {
+            Some(span) => get_chunks(&self.config_dir, collection, path, span).await?,
+            None => get_document(&self.config_dir, collection, path).await?,
+        };
         check_size_limit(&content, configured_size_limit(cfg.get.mcp_max_bytes))?;
         Ok(content)
     }

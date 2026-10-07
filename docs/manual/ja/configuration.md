@@ -142,7 +142,7 @@ mdya プロセス自身の使用メモリ (RSS) の上限を MB で指定しま�
 
 ### get
 
-`mdya get` と MCP `get_document` ツールが返す document 全文のサイズ上限です。単位は UTF-8 バイト数です。
+`mdya get` と MCP `get_document` ツールが返す内容 (document 全文、またはチャンクの範囲) のサイズ上限です。単位は UTF-8 バイト数です。
 
 ```yaml
 get:
@@ -152,10 +152,10 @@ get:
 
 #### cli_max_bytes
 
-`mdya get` がエラーで停止せずに出力する document 全文の最大サイズです。default は `1048576` (= 1 MiB)。`0` で無効化されます。
+`mdya get` がエラーで停止せずに出力する最大サイズです。全文取得にも `--chunk` / `--chunk-end` 指定にも効きます。default は `1048576` (= 1 MiB)。`0` で無効化されます。
 
-`mdya get` に `-f` / `--no-size-limit` を渡すと、その 1 回だけ上限を無視して出力します (大きな document を意図的にリダイレクト / パイプするときに便利)。上限が効くのは全文取得のみで、`mdya get --chunk <N>` は対象外です。
+`mdya get` に `-f` / `--no-size-limit` を渡すと、その 1 回だけ上限を無視して出力します (大きな出力を意図的にリダイレクト / パイプするときに便利)。
 
 #### mcp_max_bytes
 
-MCP `get_document` ツールが `payload_too_large` エラーを返さずに返す document 全文の最大サイズです。default は `1048576` (= 1 MiB)。`0` で無効化されます。MCP 側にはリクエスト単位の上書きはありません。CLI と同様に `chunk` 取得は対象外です。
+MCP `get_document` ツールが `payload_too_large` エラーを返さずに返す最大サイズです。全文取得にも `chunk` / `chunk_end` 指定にも効きます。default は `1048576` (= 1 MiB)。`0` で無効化されます。MCP 側にはリクエスト単位の上書きはありません。上限を超える文書も、多くの場合は `chunk` / `chunk_end` で上限に収まる範囲ずつ読めます。1 チャンクの範囲だけで上限を超える部分は読めません。

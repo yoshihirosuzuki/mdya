@@ -3,52 +3,17 @@
 //! PDFs have no Markdown-style heading structure, so we slide a constant-size
 //! window over the extracted plain text. Window and overlap are shared with
 //! [`super::WINDOW_CHARS`] / [`super::OVERLAP_CHARS`] so retrieval
-//! granularity is uniform across file formats. The placeholder rule from
-//! `markdown::placeholder_chunk` applies when extraction yields no text.
+//! granularity is uniform across file formats. The shared placeholder rule
+//! applies when extraction yields no text.
 
-use super::{Chunk, ChunkingError, OVERLAP_CHARS, WINDOW_CHARS};
+use super::{Chunk, ChunkingError, chunk_plain_text};
+#[cfg(test)]
+use super::{OVERLAP_CHARS, WINDOW_CHARS};
 
 /// Chunk PDF-extracted plain text. See module-level docs for the rules; the
 /// behaviour is fully covered by `#[cfg(test)]` cases below.
 pub fn chunk_pdf(text: &str) -> Result<Vec<Chunk>, ChunkingError> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Ok(vec![super::placeholder_chunk()]);
-    }
-    let mut chunks = Vec::new();
-    emit_with_overflow_split(&mut chunks, trimmed);
-    Ok(chunks)
-}
-
-/// Sliding-window emission identical in shape to the Markdown chunker's
-/// overflow path (`chunking::markdown::emit_with_overflow_split`). Walks
-/// `char_indices` once so very large bodies stay linear instead of degrading
-/// quadratically with repeated `skip(start).take(...)`.
-fn emit_with_overflow_split(out: &mut Vec<Chunk>, body: &str) {
-    let char_count = body.chars().count();
-    if char_count <= WINDOW_CHARS {
-        out.push(Chunk {
-            body: body.to_string(),
-        });
-        return;
-    }
-    let boundaries: Vec<usize> = body
-        .char_indices()
-        .map(|(i, _)| i)
-        .chain(std::iter::once(body.len()))
-        .collect();
-    let step = WINDOW_CHARS - OVERLAP_CHARS;
-    let mut start = 0;
-    while start < char_count {
-        let end = (start + WINDOW_CHARS).min(char_count);
-        out.push(Chunk {
-            body: body[boundaries[start]..boundaries[end]].to_string(),
-        });
-        if end == char_count {
-            break;
-        }
-        start += step;
-    }
+    Ok(chunk_plain_text(text))
 }
 
 #[cfg(test)]
@@ -88,6 +53,27 @@ mod tests {
             out[1].body.chars().count(),
             750 - (WINDOW_CHARS - OVERLAP_CHARS)
         );
+    }
+
+    #[test]
+    fn ranges_tile_the_untrimmed_text_and_contain_each_body() {
+        // Leading / trailing whitespace is trimmed from the bodies but still
+        // covered by the first / last range, and every overlapping
+        // sub-chunk's range contains its own body.
+        let text = format!("\n\n  {}  \n", "あ".repeat(1500));
+        let out = chunk_pdf(&text).expect("ok");
+        assert_eq!(out.len(), 3);
+        crate::chunking::test_support::assert_ranges_tile(&text, &out);
+        for chunk in &out {
+            assert!(text[chunk.source_range.clone()].contains(&chunk.body));
+        }
+        assert_eq!(out[1].source_range.start, 4 + 630 * "あ".len());
+    }
+
+    #[test]
+    fn whitespace_only_placeholder_covers_the_whole_text() {
+        let out = chunk_pdf("  \n ").expect("ok");
+        assert_eq!(out[0].source_range, 0..4);
     }
 
     #[test]

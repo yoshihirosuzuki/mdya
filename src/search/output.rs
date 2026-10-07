@@ -33,7 +33,7 @@ pub fn print_human<W: Write>(
     use_color: bool,
 ) -> io::Result<()> {
     for hit in &resp.hits {
-        write_hit_header(writer, hit.collection(), hit.path(), hit.score(), use_color)?;
+        write_hit_header(writer, hit, use_color)?;
         for line in hit.snippet().lines() {
             writeln!(writer, "  > {line}")?;
         }
@@ -49,20 +49,21 @@ pub fn print_human<W: Write>(
     Ok(())
 }
 
-fn write_hit_header<W: Write>(
-    writer: &mut W,
-    collection: &str,
-    path: &str,
-    score: f32,
-    use_color: bool,
-) -> io::Result<()> {
+/// Header line of one hit: `collection/path`, the score, and the document's
+/// chunk count (`chunks=N`) — the bound for `mdya get --chunk N --chunk-end M`.
+fn write_hit_header<W: Write>(writer: &mut W, hit: &SearchHit, use_color: bool) -> io::Result<()> {
+    let (collection, path, score) = (hit.collection(), hit.path(), hit.score());
+    let chunk_count = hit.chunk_count();
     if use_color {
         writeln!(
             writer,
-            "{ANSI_CYAN}{collection}/{path}{ANSI_RESET}  {ANSI_YELLOW}score={score:.3}{ANSI_RESET}"
+            "{ANSI_CYAN}{collection}/{path}{ANSI_RESET}  {ANSI_YELLOW}score={score:.3}{ANSI_RESET}  chunks={chunk_count}"
         )
     } else {
-        writeln!(writer, "{collection}/{path}  score={score:.3}")
+        writeln!(
+            writer,
+            "{collection}/{path}  score={score:.3}  chunks={chunk_count}"
+        )
     }
 }
 
@@ -112,6 +113,7 @@ pub fn print_md<W: Write>(writer: &mut W, resp: &SearchResponse) -> io::Result<(
         writeln!(writer)?;
         write_md_granularity_fields(writer, hit)?;
         writeln!(writer, "- score: {:.3}", hit.score())?;
+        writeln!(writer, "- chunk_count: {}", hit.chunk_count())?;
         writeln!(writer)?;
         for line in hit.snippet().lines() {
             writeln!(writer, "> {line}")?;
@@ -217,6 +219,11 @@ fn write_xml_hit<W: Write>(writer: &mut W, hit: &SearchHit) -> io::Result<()> {
             "      <matched_chunks>{matched_chunks}</matched_chunks>"
         )?;
     }
+    writeln!(
+        writer,
+        "      <chunk_count>{}</chunk_count>",
+        hit.chunk_count()
+    )?;
     writeln!(writer, "    </hit>")
 }
 
@@ -253,6 +260,7 @@ mod tests {
             score,
             snippet: snippet.to_string(),
             matched_chunks: matched,
+            chunk_count: 12,
         }
     }
 
@@ -269,6 +277,7 @@ mod tests {
             chunk_sequence,
             score,
             snippet: snippet.to_string(),
+            chunk_count: 12,
         }
     }
 
@@ -330,10 +339,10 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert_eq!(
             s,
-            "notes/foo.md  score=0.812\n  \
+            "notes/foo.md  score=0.812  chunks=12\n  \
              > matching text\n  \
              > second line\n---\n\
-             work/bar.md  score=0.751\n  \
+             work/bar.md  score=0.751  chunks=12\n  \
              > another snippet\n---\n\
              17 doc hits (showing 20 max)\n"
         );
@@ -342,19 +351,20 @@ mod tests {
     #[test]
     fn human_format_chunk_level_summary_uses_chunk_unit() {
         // Same hit layout as the doc test on purpose: only the summary
-        // word changes when `level` flips. If a future refactor leaks
-        // chunk-only fields (e.g. `chunk_sequence`) into the human
-        // header this assertion catches it because it pins the exact
-        // bytes the renderer emits.
+        // word changes when `level` flips. The header carries the fields
+        // both variants share (`chunks=N` included, the bound for
+        // `mdya get --chunk-end`); if a refactor leaks a chunk-only field
+        // (e.g. `chunk_sequence`) into it this assertion catches it because
+        // it pins the exact bytes the renderer emits.
         let mut buf = Vec::new();
         print_human(&mut buf, &chunk_response_with_two_hits(), false).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert_eq!(
             s,
-            "notes/foo.md  score=0.812\n  \
+            "notes/foo.md  score=0.812  chunks=12\n  \
              > matching text\n  \
              > second line\n---\n\
-             work/bar.md  score=0.751\n  \
+             work/bar.md  score=0.751  chunks=12\n  \
              > another snippet\n---\n\
              17 chunk hits (showing 20 max)\n"
         );
@@ -419,6 +429,7 @@ mod tests {
 
 - matched_chunks: 3
 - score: 0.812
+- chunk_count: 12
 
 > matching text
 > second line
@@ -427,6 +438,7 @@ mod tests {
 
 - matched_chunks: 1
 - score: 0.751
+- chunk_count: 12
 
 > another snippet
 "#;
@@ -448,6 +460,7 @@ mod tests {
 
 - chunk_sequence: 3
 - score: 0.812
+- chunk_count: 12
 
 > matching text
 > second line
@@ -456,6 +469,7 @@ mod tests {
 
 - chunk_sequence: 0
 - score: 0.751
+- chunk_count: 12
 
 > another snippet
 "#;
@@ -498,6 +512,7 @@ mod tests {
       <snippet>matching text
 second line</snippet>
       <matched_chunks>3</matched_chunks>
+      <chunk_count>12</chunk_count>
     </hit>
     <hit>
       <collection>work</collection>
@@ -505,6 +520,7 @@ second line</snippet>
       <score>0.751</score>
       <snippet>another snippet</snippet>
       <matched_chunks>1</matched_chunks>
+      <chunk_count>12</chunk_count>
     </hit>
   </hits>
 </response>
@@ -534,6 +550,7 @@ second line</snippet>
       <score>0.812</score>
       <snippet>matching text
 second line</snippet>
+      <chunk_count>12</chunk_count>
     </hit>
     <hit>
       <collection>work</collection>
@@ -541,6 +558,7 @@ second line</snippet>
       <chunk_sequence>0</chunk_sequence>
       <score>0.751</score>
       <snippet>another snippet</snippet>
+      <chunk_count>12</chunk_count>
     </hit>
   </hits>
 </response>
@@ -621,6 +639,7 @@ second line</snippet>
 
 - matched_chunks: 1
 - score: 0.500
+- chunk_count: 12
 
 "#;
         assert_eq!(s, expected);

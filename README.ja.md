@@ -86,11 +86,11 @@ mdya search hybrid "リリース手順"  # hybrid (RRF)
 検索結果は人間向けフォーマットで標準出力に出力されます。
 
 ```
-notes/release.md  score=0.812
+notes/release.md  score=0.812  chunks=4
   > リリース手順は以下の通り
   > 1. バージョン番号を更新する
 ---
-notes/checklist.md  score=0.751
+notes/checklist.md  score=0.751  chunks=1
   > 公開前チェックリスト
 ---
 2 doc hits (showing 20 max)

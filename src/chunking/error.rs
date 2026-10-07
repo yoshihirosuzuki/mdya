@@ -9,9 +9,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ChunkingError {
     /// Reserved for input shapes the chunker cannot currently handle. Today
-    /// there is no concrete trigger — pulldown-cmark accepts any UTF-8 input
-    /// — but keeping the variant lets callers `?`-propagate without churn
-    /// when stricter validation lands later (e.g. encoding sniffing).
+    /// there is no concrete trigger — Markdown that pulldown-cmark cannot
+    /// report offsets for falls back to plain-text chunking — but keeping
+    /// the variant lets callers `?`-propagate without churn when stricter
+    /// validation lands later (e.g. encoding sniffing).
     #[error("invalid markdown input: {reason}")]
     InvalidInput { reason: String },
 }

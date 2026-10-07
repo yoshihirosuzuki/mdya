@@ -142,7 +142,7 @@ If you hit the memory limit and the process exits with `137`, try lowering paral
 
 ### get
 
-Caps on the size of a full document returned by `mdya get` and the MCP `get_document` tool. Measured in UTF-8 bytes.
+Caps on the size of what `mdya get` and the MCP `get_document` tool return (a full document or a chunk range). Measured in UTF-8 bytes.
 
 ```yaml
 get:
@@ -152,10 +152,10 @@ get:
 
 #### cli_max_bytes
 
-The largest full document `mdya get` prints before it stops with an error. Default `1048576` (= 1 MiB). Set to `0` to disable.
+The largest output `mdya get` prints before it stops with an error, for full documents and `--chunk` / `--chunk-end` reads alike. Default `1048576` (= 1 MiB). Set to `0` to disable.
 
-Pass `-f` / `--no-size-limit` to `mdya get` to override the cap for a single run — useful when you are redirecting or piping a large document on purpose. The cap applies only to full-document reads; `mdya get --chunk <N>` is never size-checked.
+Pass `-f` / `--no-size-limit` to `mdya get` to override the cap for a single run — useful when you are redirecting or piping a large output on purpose.
 
 #### mcp_max_bytes
 
-The largest full document the MCP `get_document` tool returns before it responds with a `payload_too_large` error. Default `1048576` (= 1 MiB). Set to `0` to disable. There is no per-request override on the MCP side. As with the CLI, `chunk` reads are never size-checked.
+The largest response the MCP `get_document` tool returns before it responds with a `payload_too_large` error, for full documents and `chunk` / `chunk_end` reads alike. Default `1048576` (= 1 MiB). Set to `0` to disable. There is no per-request override on the MCP side. A document over the cap can usually be read in `chunk` / `chunk_end` ranges that fit under it, except where a single chunk's range alone exceeds the cap.

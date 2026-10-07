@@ -24,7 +24,7 @@ use crate::config;
 use crate::embedding::{EmbedError, Embedder, ModelCache, ModelCacheError, build_embedder};
 use crate::ingest::{IngestError, IngestProgress, UpdateSummary, update_all_collections};
 use crate::store::metadata_check::METADATA_KEY_EMBEDDING_MODEL;
-use crate::store::{self, CHUNKS_TABLE_NAME, chunks_schema};
+use crate::store::{self, CHUNKS_TABLE_NAME, chunks_schema, chunks_schema_has_source_ranges};
 
 use super::log_writer;
 use super::update_all::{IndicatifProgress, expand_collection_paths, resolve_embed_parallelism};
@@ -72,39 +72,51 @@ pub enum VectorUseError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UseAction {
     /// The config already declares `target` and the `chunks` index is already
-    /// built for it — nothing to do.
+    /// built for it with the current table layout — nothing to do.
     NoOp,
     /// The config already declares `target` but the index is not built for it
     /// (a hand-edited `config.yml` left the pin on the old model, so
-    /// `update-all` aborts on the mismatch). Rebuild the index for `target`.
+    /// `update-all` aborts on the mismatch), or the table was built by an older
+    /// mdya without chunk source ranges. Rebuild the index for `target`.
     Rebuild,
     /// The config declares a different model — switch to `target` and rebuild.
     Switch,
 }
 
 /// Decide the action from the config's current model, the requested `target`,
-/// and the model the `chunks` table is pinned to (`None` when no table/pin
-/// exists yet). Pure so the decision is exercised without touching the DB.
+/// and the state of the `chunks` table. Pure so the decision is exercised
+/// without touching the DB.
 ///
 /// The no-op is gated on the DB pin, not just the config string: when a user
 /// hand-edits `config.yml` to `target` the config matches but the index is
 /// still pinned to the old model, and `vector use <target>` must rebuild
 /// rather than report "nothing to do" and leave `update-all` stuck on the
-/// pin mismatch.
-fn decide_use_action(config_model: &str, target: &str, pinned: Option<&str>) -> UseAction {
+/// pin mismatch. Likewise an index pinned to `target` but lacking chunk source
+/// ranges is rebuilt: `update-all` refuses it and cannot repair it itself.
+fn decide_use_action(config_model: &str, target: &str, index: &IndexState) -> UseAction {
     if config_model != target {
         return UseAction::Switch;
     }
-    if pinned == Some(target) {
+    if index.pinned_model.as_deref() == Some(target) && index.has_source_ranges {
         UseAction::NoOp
     } else {
         UseAction::Rebuild
     }
 }
 
-/// Read the embedding-model pin from the `chunks` table's schema metadata, or
-/// `None` when the table (or the pin key) does not exist yet.
-async fn chunks_pinned_model(base: &Path) -> Result<Option<String>, VectorUseError> {
+/// What `vector use` needs to know about the `chunks` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct IndexState {
+    /// The embedding-model pin, `None` when the table (or the pin key) does
+    /// not exist yet.
+    pinned_model: Option<String>,
+    /// Whether the table has the chunk source-range columns. `false` when the
+    /// table does not exist.
+    has_source_ranges: bool,
+}
+
+/// Read the `chunks` table's embedding-model pin and layout.
+async fn chunks_index_state(base: &Path) -> Result<IndexState, VectorUseError> {
     let db = store::connect(base.join("index"))
         .await
         .map_err(VectorUseError::Store)?;
@@ -114,7 +126,7 @@ async fn chunks_pinned_model(base: &Path) -> Result<Option<String>, VectorUseErr
         .await
         .map_err(VectorUseError::Lance)?;
     if !names.iter().any(|n| n == CHUNKS_TABLE_NAME) {
-        return Ok(None);
+        return Ok(IndexState::default());
     }
     let table = db
         .open_table(CHUNKS_TABLE_NAME)
@@ -122,7 +134,10 @@ async fn chunks_pinned_model(base: &Path) -> Result<Option<String>, VectorUseErr
         .await
         .map_err(VectorUseError::Lance)?;
     let schema = table.schema().await.map_err(VectorUseError::Lance)?;
-    Ok(schema.metadata().get(METADATA_KEY_EMBEDDING_MODEL).cloned())
+    Ok(IndexState {
+        pinned_model: schema.metadata().get(METADATA_KEY_EMBEDDING_MODEL).cloned(),
+        has_source_ranges: chunks_schema_has_source_ranges(&schema),
+    })
 }
 
 /// `mdya vector use <model>` entry point. Called from `cli::Cli::run`.
@@ -140,8 +155,8 @@ pub(crate) async fn run(
 ) -> Result<(), VectorUseError> {
     let base = config::resolve_config_dir(config_dir_flag)?;
     let cfg = config::load(&base.join("config.yml"))?;
-    let pinned = chunks_pinned_model(&base).await?;
-    let action = decide_use_action(&cfg.embedding.model, model, pinned.as_deref());
+    let index = chunks_index_state(&base).await?;
+    let action = decide_use_action(&cfg.embedding.model, model, &index);
     if action == UseAction::NoOp {
         eprintln!("Already using '{model}' and the index is built for it; nothing to do.");
         return Ok(());
@@ -377,18 +392,29 @@ mod tests {
         );
     }
 
+    fn index(pinned: Option<&str>, has_source_ranges: bool) -> IndexState {
+        IndexState {
+            pinned_model: pinned.map(str::to_string),
+            has_source_ranges,
+        }
+    }
+
     #[test]
     fn decide_use_action_switches_when_config_model_differs() {
         // A different target is always a switch, regardless of the DB pin.
         assert_eq!(
-            decide_use_action("cl-nagoya/ruri-v3-30m", "ollama:nomic-embed-text", None),
+            decide_use_action(
+                "cl-nagoya/ruri-v3-30m",
+                "ollama:nomic-embed-text",
+                &index(None, false)
+            ),
             UseAction::Switch
         );
         assert_eq!(
             decide_use_action(
                 "cl-nagoya/ruri-v3-30m",
                 "ollama:nomic-embed-text",
-                Some("cl-nagoya/ruri-v3-30m")
+                &index(Some("cl-nagoya/ruri-v3-30m"), true)
             ),
             UseAction::Switch
         );
@@ -396,15 +422,15 @@ mod tests {
         // model is still a switch (the config is the source of truth being
         // changed); the matching pin does not turn it into a no-op.
         assert_eq!(
-            decide_use_action("old-model", "new-model", Some("new-model")),
+            decide_use_action("old-model", "new-model", &index(Some("new-model"), true)),
             UseAction::Switch
         );
     }
 
     #[test]
-    fn decide_use_action_is_noop_only_when_config_and_pin_both_match() {
+    fn decide_use_action_is_noop_only_when_config_pin_and_layout_all_match() {
         assert_eq!(
-            decide_use_action("ruri", "ruri", Some("ruri")),
+            decide_use_action("ruri", "ruri", &index(Some("ruri"), true)),
             UseAction::NoOp
         );
     }
@@ -414,9 +440,22 @@ mod tests {
         // Hand-edited config: declares the target, but the index is still
         // pinned to the old model (or absent) — rebuild instead of no-op.
         assert_eq!(
-            decide_use_action("ruri", "ruri", Some("old-model")),
+            decide_use_action("ruri", "ruri", &index(Some("old-model"), true)),
             UseAction::Rebuild
         );
-        assert_eq!(decide_use_action("ruri", "ruri", None), UseAction::Rebuild);
+        assert_eq!(
+            decide_use_action("ruri", "ruri", &index(None, false)),
+            UseAction::Rebuild
+        );
+    }
+
+    #[test]
+    fn decide_use_action_rebuilds_an_index_without_source_ranges_for_the_same_model() {
+        // An index built by an older mdya: pin and config agree, but the
+        // table lacks chunk source ranges, which `update-all` cannot add.
+        assert_eq!(
+            decide_use_action("ruri", "ruri", &index(Some("ruri"), false)),
+            UseAction::Rebuild
+        );
     }
 }

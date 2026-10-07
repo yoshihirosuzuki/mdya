@@ -71,12 +71,18 @@ impl SearchLevel {
 /// (`Chunk`) is returned only when the caller opts in via the CLI
 /// `--chunks` flag or the MCP `level: "chunk"` parameter.
 ///
-/// The two variants share `collection` / `path` / `score` / `snippet`
-/// and differ only in the third "granularity-specific" field:
+/// The two variants share `collection` / `path` / `score` / `snippet` /
+/// `chunk_count` and differ only in the "granularity-specific" field:
 /// `matched_chunks` (Doc) carries the breadth signal — how many of the
 /// document's chunks contributed to the hit — while `chunk_sequence`
 /// (Chunk) carries the 0-indexed chunk number so callers can locate the
 /// passage.
+///
+/// `chunk_count` is the total number of chunks in the hit's document, so a
+/// caller can read around a hit or page through the document with
+/// `get_document` / `mdya get --chunk N --chunk-end M` without a separate
+/// lookup. It sits last in both variants so the field-presence
+/// discrimination below is untouched.
 ///
 /// `#[serde(untagged)]` means the wire JSON has no discriminator field:
 /// consumers tell variants apart by the presence of `matched_chunks` vs
@@ -94,6 +100,7 @@ pub enum SearchHit {
         score: f32,
         snippet: String,
         matched_chunks: u32,
+        chunk_count: u32,
     },
     Chunk {
         collection: String,
@@ -101,6 +108,7 @@ pub enum SearchHit {
         chunk_sequence: u32,
         score: f32,
         snippet: String,
+        chunk_count: u32,
     },
 }
 
@@ -135,6 +143,15 @@ impl SearchHit {
     pub fn snippet(&self) -> &str {
         match self {
             SearchHit::Doc { snippet, .. } | SearchHit::Chunk { snippet, .. } => snippet,
+        }
+    }
+
+    /// Number of chunks in the hit's document, shared by both variants.
+    pub fn chunk_count(&self) -> u32 {
+        match self {
+            SearchHit::Doc { chunk_count, .. } | SearchHit::Chunk { chunk_count, .. } => {
+                *chunk_count
+            }
         }
     }
 }
@@ -233,6 +250,7 @@ mod tests {
             score: 0.812,
             snippet: "release checklist...".to_string(),
             matched_chunks: 3,
+            chunk_count: 9,
         };
         let s = serde_json::to_string(&hit).unwrap();
         // The wire form must NOT contain `chunk_sequence` for Doc hits;
@@ -252,6 +270,7 @@ mod tests {
             chunk_sequence: 4,
             score: 0.65,
             snippet: "...".to_string(),
+            chunk_count: 9,
         };
         let s = serde_json::to_string(&hit).unwrap();
         // Mirror of the Doc test: `matched_chunks` must be absent for
@@ -270,6 +289,7 @@ mod tests {
             score: 0.5,
             snippet: "doc snippet".to_string(),
             matched_chunks: 2,
+            chunk_count: 9,
         };
         assert_eq!(doc.collection(), "notes");
         assert_eq!(doc.path(), "a.md");
@@ -282,10 +302,38 @@ mod tests {
             chunk_sequence: 7,
             score: 0.9,
             snippet: "chunk snippet".to_string(),
+            chunk_count: 9,
         };
         assert_eq!(chunk.collection(), "work");
         assert_eq!(chunk.path(), "b.md");
         assert_eq!(chunk.score(), 0.9);
         assert_eq!(chunk.snippet(), "chunk snippet");
+    }
+
+    #[test]
+    fn both_hit_variants_serialise_chunk_count_as_the_last_field() {
+        let doc = SearchHit::Doc {
+            collection: "notes".to_string(),
+            path: "a.md".to_string(),
+            score: 0.5,
+            snippet: "s".to_string(),
+            matched_chunks: 2,
+            chunk_count: 12,
+        };
+        let chunk = SearchHit::Chunk {
+            collection: "notes".to_string(),
+            path: "a.md".to_string(),
+            chunk_sequence: 3,
+            score: 0.5,
+            snippet: "s".to_string(),
+            chunk_count: 12,
+        };
+        for hit in [doc, chunk] {
+            let s = serde_json::to_string(&hit).unwrap();
+            assert!(s.ends_with(",\"chunk_count\":12}"), "got {s}");
+            assert_eq!(hit.chunk_count(), 12);
+            let back: SearchHit = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, hit);
+        }
     }
 }

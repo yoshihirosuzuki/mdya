@@ -10,7 +10,7 @@
 //! builtin.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use arrow_array::cast::AsArray;
@@ -22,7 +22,7 @@ use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::vector::DIST_COL;
 use lancedb::DistanceType;
 use lancedb::Table;
-use lancedb::expr::{col, lit};
+use lancedb::expr::{DfExpr, col, lit};
 use lancedb::query::{ExecutableQuery, QueryBase, Select, VectorQuery};
 use tracing::{debug, info};
 
@@ -47,7 +47,10 @@ const DOC_LEVEL_OVERFETCH_K: usize = 10;
 use crate::config;
 use crate::embedding::Embedder;
 use crate::store::metadata_check::{self, Outcome as MetadataOutcome};
-use crate::store::{CHUNKS_TABLE_NAME, COL_BODY, COL_CHUNK_SEQUENCE, COL_COLLECTION, COL_PATH};
+use crate::store::{
+    CHUNKS_TABLE_NAME, COL_BODY, COL_CHUNK_SEQUENCE, COL_COLLECTION, COL_PATH,
+    chunks_schema_has_source_ranges,
+};
 
 use super::error::SearchError;
 use super::request::SearchRequest;
@@ -59,6 +62,12 @@ pub struct SearchEngine {
     /// Names declared in `config.yml::collections`. Used to reject
     /// `-c <typo>` early instead of silently returning zero hits.
     known_collections: Vec<String>,
+    /// `Some(declared model)` when the `chunks` table lacks source ranges
+    /// (built by an older mdya). Recorded at `open` rather than failing
+    /// there, so the MCP server — which opens the engine at startup — still
+    /// serves full-document reads; every search returns
+    /// [`SearchError::IndexOutdated`] instead.
+    outdated_for_model: Option<String>,
 }
 
 impl SearchEngine {
@@ -71,6 +80,9 @@ impl SearchEngine {
     /// still inspect what is in the DB. The check runs once per
     /// `SearchEngine` instance; schema metadata is immutable within
     /// a dataset version.
+    ///
+    /// A table without chunk source ranges is not refused here; see
+    /// `outdated_for_model`.
     pub async fn open(
         config_dir: &Path,
         declared_embedding_model: &str,
@@ -86,9 +98,13 @@ impl SearchEngine {
             declared_embedding_model,
             declared_vector_dim,
         )?;
+        let schema = table.schema().await.map_err(SearchError::Query)?;
+        let outdated_for_model = (!chunks_schema_has_source_ranges(&schema))
+            .then(|| declared_embedding_model.to_string());
         Ok(Self {
             table,
             known_collections,
+            outdated_for_model,
         })
     }
 
@@ -126,7 +142,7 @@ impl SearchEngine {
             .await
             .map_err(SearchError::Query)?;
         let chunks = batches_to_chunks(&batches, &req.query, ScoreSource::CosineDistance);
-        Ok(finalize_response(req, SearchMode::Vector, chunks))
+        self.respond(req, SearchMode::Vector, chunks).await
     }
 
     fn build_vector_query(
@@ -192,7 +208,7 @@ impl SearchEngine {
             .await
             .map_err(SearchError::Query)?;
         let chunks = batches_to_chunks(&batches, &req.query, ScoreSource::RelevanceScore);
-        Ok(finalize_response(req, SearchMode::Hybrid, chunks))
+        self.respond(req, SearchMode::Hybrid, chunks).await
     }
 
     fn build_hybrid_query(
@@ -253,7 +269,7 @@ impl SearchEngine {
             .await
             .map_err(SearchError::Query)?;
         let chunks = batches_to_chunks(&batches, &req.query, ScoreSource::FtsScore);
-        Ok(finalize_response(req, SearchMode::Fts, chunks))
+        self.respond(req, SearchMode::Fts, chunks).await
     }
 
     /// Public re-exposure of [`Self::validate`] so callers can reject a
@@ -276,7 +292,53 @@ impl SearchEngine {
                 return Err(SearchError::UnknownCollection { name: name.clone() });
             }
         }
+        if let Some(model) = &self.outdated_for_model {
+            return Err(SearchError::IndexOutdated {
+                model: model.clone(),
+            });
+        }
         Ok(())
+    }
+
+    /// Rank the chunk hits, attach each hit's document chunk count, and
+    /// build the response.
+    async fn respond(
+        &self,
+        req: &SearchRequest,
+        mode: SearchMode,
+        chunks: Vec<ChunkHit>,
+    ) -> Result<SearchResponse, SearchError> {
+        let ranked = RankedHits::rank(req, chunks);
+        let counts = self.chunk_counts(&ranked.documents()).await?;
+        Ok(finalize_response(req, mode, ranked, &counts))
+    }
+
+    /// Count the chunks of `documents` in one query (projecting only
+    /// `collection` / `path`) rather than one round-trip per hit. A plain
+    /// query has no implicit row limit, so every chunk row is counted.
+    async fn chunk_counts(
+        &self,
+        documents: &BTreeSet<DocumentKey>,
+    ) -> Result<ChunkCounts, SearchError> {
+        let Some(filter) = documents_filter(documents) else {
+            return Ok(ChunkCounts::default());
+        };
+        let stream = self
+            .table
+            .query()
+            .only_if_expr(filter)
+            .select(Select::Columns(vec![
+                COL_COLLECTION.to_string(),
+                COL_PATH.to_string(),
+            ]))
+            .execute()
+            .await
+            .map_err(SearchError::Query)?;
+        let batches = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(SearchError::Query)?;
+        Ok(ChunkCounts::from_batches(&batches))
     }
 
     fn build_fts_query(&self, req: &SearchRequest) -> lancedb::query::Query {
@@ -383,13 +445,14 @@ struct ChunkHit {
 }
 
 impl ChunkHit {
-    fn into_search_hit(self) -> SearchHit {
+    fn into_search_hit(self, chunk_count: u32) -> SearchHit {
         SearchHit::Chunk {
             collection: self.collection,
             path: self.path,
             chunk_sequence: self.chunk_sequence,
             score: self.score,
             snippet: self.snippet,
+            chunk_count,
         }
     }
 }
@@ -407,13 +470,14 @@ struct DocHit {
 }
 
 impl DocHit {
-    fn into_search_hit(self) -> SearchHit {
+    fn into_search_hit(self, chunk_count: u32) -> SearchHit {
         SearchHit::Doc {
             collection: self.collection,
             path: self.path,
             score: self.score,
             snippet: self.snippet,
             matched_chunks: self.matched_chunks,
+            chunk_count,
         }
     }
 }
@@ -430,38 +494,150 @@ fn query_chunk_limit(req: &SearchRequest) -> usize {
     }
 }
 
-/// Wrap a `Vec<ChunkHit>` into a `SearchResponse` honouring
-/// `req.level`: doc-level folds + truncates + emits `SearchHit::Doc`,
-/// chunk-level just sorts + emits `SearchHit::Chunk`. `total` reflects
-/// the unit returned (doc-count or chunk-count).
+/// `(collection, path)` of one document.
+type DocumentKey = (String, String);
+
+/// Hits of one granularity, ranked and truncated to `limit`, before the
+/// documents' chunk counts are attached.
+enum RankedHits {
+    Docs(Vec<DocHit>),
+    Chunks(Vec<ChunkHit>),
+}
+
+impl RankedHits {
+    /// Rank `chunks` honouring `req.level`: doc-level folds + sorts +
+    /// truncates, chunk-level sorts + truncates.
+    fn rank(req: &SearchRequest, chunks: Vec<ChunkHit>) -> Self {
+        match req.level {
+            SearchLevel::Doc => {
+                let mut docs = dedup_chunks_to_docs(chunks);
+                sort_doc_hits_stable(&mut docs);
+                docs.truncate(req.limit as usize);
+                Self::Docs(docs)
+            }
+            SearchLevel::Chunk => {
+                let mut chunks = chunks;
+                sort_chunk_hits_stable(&mut chunks);
+                // Symmetric with the doc-level branch above: LanceDB's
+                // `.limit()` is contractually a top-N cap today, but
+                // truncating here protects the wire `limit` invariant if
+                // that ever loosens (and the cost is a no-op when LanceDB
+                // already returned `<= req.limit` rows).
+                chunks.truncate(req.limit as usize);
+                Self::Chunks(chunks)
+            }
+        }
+    }
+
+    /// The distinct documents the hits belong to.
+    fn documents(&self) -> BTreeSet<DocumentKey> {
+        match self {
+            Self::Docs(docs) => docs
+                .iter()
+                .map(|d| (d.collection.clone(), d.path.clone()))
+                .collect(),
+            Self::Chunks(chunks) => chunks
+                .iter()
+                .map(|c| (c.collection.clone(), c.path.clone()))
+                .collect(),
+        }
+    }
+
+    fn into_search_hits(self, counts: &ChunkCounts) -> Vec<SearchHit> {
+        match self {
+            Self::Docs(docs) => docs
+                .into_iter()
+                .map(|d| {
+                    let n = counts.of(&d.collection, &d.path);
+                    d.into_search_hit(n)
+                })
+                .collect(),
+            Self::Chunks(chunks) => chunks
+                .into_iter()
+                .map(|c| {
+                    let n = counts.of(&c.collection, &c.path);
+                    c.into_search_hit(n)
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Number of chunks per document.
+#[derive(Debug, Default)]
+struct ChunkCounts(HashMap<DocumentKey, u32>);
+
+impl ChunkCounts {
+    /// Count the rows of `batches` (each a `collection` / `path` projection)
+    /// per document.
+    fn from_batches(batches: &[RecordBatch]) -> Self {
+        let mut counts: HashMap<DocumentKey, u32> = HashMap::new();
+        for batch in batches {
+            let (Some(collections), Some(paths)) = (
+                batch.column_by_name(COL_COLLECTION),
+                batch.column_by_name(COL_PATH),
+            ) else {
+                continue;
+            };
+            let collections: &StringArray = collections.as_string();
+            let paths: &StringArray = paths.as_string();
+            for row in 0..batch.num_rows() {
+                if !collections.is_valid(row) || !paths.is_valid(row) {
+                    continue;
+                }
+                let key = (
+                    collections.value(row).to_string(),
+                    paths.value(row).to_string(),
+                );
+                *counts.entry(key).or_default() += 1;
+            }
+        }
+        Self(counts)
+    }
+
+    /// The document's chunk count. A document whose rows vanished between
+    /// the search and the count (a concurrent `update-all` removing it)
+    /// reports 0.
+    fn of(&self, collection: &str, path: &str) -> u32 {
+        self.0
+            .get(&(collection.to_string(), path.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// Typed filter matching every chunk of `documents`: per collection,
+/// `collection = c AND path IN (...)`, ORed together. `None` for no
+/// documents.
+fn documents_filter(documents: &BTreeSet<DocumentKey>) -> Option<DfExpr> {
+    let mut by_collection: BTreeMap<&str, Vec<DfExpr>> = BTreeMap::new();
+    for (collection, path) in documents {
+        by_collection
+            .entry(collection.as_str())
+            .or_default()
+            .push(lit(path.as_str()));
+    }
+    by_collection
+        .into_iter()
+        .map(|(collection, paths)| {
+            col(COL_COLLECTION)
+                .eq(lit(collection))
+                .and(col(COL_PATH).in_list(paths, false))
+        })
+        .reduce(DfExpr::or)
+}
+
+/// Wrap ranked hits into a `SearchResponse`, attaching each hit's document
+/// chunk count. `total` reflects the unit returned (doc-count or
+/// chunk-count).
 fn finalize_response(
     req: &SearchRequest,
     mode: SearchMode,
-    chunks: Vec<ChunkHit>,
+    ranked: RankedHits,
+    counts: &ChunkCounts,
 ) -> SearchResponse {
-    let (hits, total) = match req.level {
-        SearchLevel::Doc => {
-            let mut docs = dedup_chunks_to_docs(chunks);
-            sort_doc_hits_stable(&mut docs);
-            docs.truncate(req.limit as usize);
-            let total = docs.len() as u32;
-            let hits: Vec<SearchHit> = docs.into_iter().map(DocHit::into_search_hit).collect();
-            (hits, total)
-        }
-        SearchLevel::Chunk => {
-            let mut chunks = chunks;
-            sort_chunk_hits_stable(&mut chunks);
-            // Symmetric with the doc-level branch above: LanceDB's
-            // `.limit()` is contractually a top-N cap today, but
-            // truncating here protects the wire `limit` invariant if
-            // that ever loosens (and the cost is a no-op when LanceDB
-            // already returned `<= req.limit` rows).
-            chunks.truncate(req.limit as usize);
-            let total = chunks.len() as u32;
-            let hits: Vec<SearchHit> = chunks.into_iter().map(ChunkHit::into_search_hit).collect();
-            (hits, total)
-        }
-    };
+    let hits = ranked.into_search_hits(counts);
+    let total = hits.len() as u32;
     info!(
         target: "mdya::search",
         mode = mode.as_str(),
@@ -904,5 +1080,36 @@ mod tests {
             level: SearchLevel::Chunk,
         };
         assert_eq!(query_chunk_limit(&req), 20);
+    }
+
+    #[test]
+    fn documents_filter_is_none_without_documents() {
+        assert!(documents_filter(&BTreeSet::new()).is_none());
+    }
+
+    #[test]
+    fn chunk_counts_count_rows_per_document() {
+        use std::sync::Arc;
+
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(COL_COLLECTION, DataType::Utf8, false),
+            Field::new(COL_PATH, DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["notes", "notes", "notes", "work"])),
+                Arc::new(StringArray::from(vec!["a.md", "a.md", "b.md", "a.md"])),
+            ],
+        )
+        .unwrap();
+        let counts = ChunkCounts::from_batches(&[batch]);
+        assert_eq!(counts.of("notes", "a.md"), 2);
+        assert_eq!(counts.of("notes", "b.md"), 1);
+        assert_eq!(counts.of("work", "a.md"), 1);
+        // A document absent from the batches (removed meanwhile) reports 0.
+        assert_eq!(counts.of("work", "gone.md"), 0);
     }
 }

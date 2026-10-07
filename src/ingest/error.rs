@@ -138,6 +138,17 @@ pub enum IngestError {
     )]
     SchemaMetadataMissing { absent_keys: Vec<&'static str> },
 
+    /// The `chunks` table was built by an older mdya and lacks the
+    /// source-range columns. `update-all` skips unchanged files, so it would
+    /// never fill them in; ingest is refused and the user is pointed at the
+    /// rebuild, which keeps the `sources` table. `model` is the declared
+    /// embedding model, so the suggested command rebuilds for it.
+    #[error(
+        "index is outdated: it was built by an older mdya and lacks chunk source \
+         ranges. Rebuild it with `mdya vector use {model}`."
+    )]
+    IndexOutdated { model: String },
+
     /// A path supplied to the ingest writer contained traversal components
     /// (`..`, an absolute root, or a Windows prefix) and was therefore
     /// refused before any filesystem operation. File-level: caught by the

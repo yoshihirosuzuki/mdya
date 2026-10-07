@@ -7,10 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Chunk range reads: `mdya get --chunk <N> --chunk-end <M>` and the MCP `get_document` `chunk_end` parameter return chunks `N` through `M` (inclusive) as one contiguous piece of the original text, so a caller can read around a search hit in one call, or page through a document too large to fetch whole in pieces that fit the size cap. An end past the last chunk reads to the end of the document; `--chunk-end` without `--chunk`, or an end smaller than the start, is an error (MCP code `invalid_chunk_range`).
+- Every search hit, at doc and chunk level, now carries `chunk_count`, the number of chunks in its document — in the JSON / XML / Markdown output (`chunk_count`), the human output (`chunks=N`), and the MCP `search` result.
+- MCP error code `index_outdated`, returned by `search` and by `get_document` with `chunk` when the index needs rebuilding (see below).
+
 ### Changed
 
+- **Breaking:** `mdya get --chunk <N>` and the MCP `get_document` `chunk` parameter now return the part of the original document the chunk covers — heading markers, link targets, HTML and all — instead of the chunk's plain-text body. Chunk ranges cover the document without gaps, so a read of chunks `0` through the last returns the whole document.
+- **Breaking:** existing indexes must be rebuilt. The index now records where each chunk sits in its document, which an index built by an earlier version lacks; `mdya update-all`, `mdya search`, `mdya get --chunk` and the MCP `search` / chunk reads stop with an error naming the command to run, `mdya vector use <current model>`. `mdya vector use` now rebuilds such an index even when the model is unchanged. If `mdya mcp` is running, restart it after the rebuild. Full-document reads keep working on an old index.
+- The `get.cli_max_bytes` / `get.mcp_max_bytes` caps now apply to chunk reads too, since a chunk range can span a whole document. `-f` / `--no-size-limit` bypasses the CLI cap as before.
+- **Breaking (library):** `mdya::get::GetError::DocumentTooLarge` is renamed `ContentTooLarge`; `mdya::chunking::Chunk` gains `source_range`; both `mdya::search::SearchHit` variants gain `chunk_count`; `mdya::mcp::GetDocumentRequest` gains `chunk_end`; `GetError`, `mdya::search::SearchError`, `mdya::ingest::IngestError` and `mdya::mcp::McpErrorCode` gain variants.
 - `mdya update-all` (and the re-embed walk in `mdya vector use`) now honors `.gitignore`. When a collection root is inside a git repository, files and directories excluded by `.gitignore` — including rules in `.gitignore` files above the root — are no longer indexed; git worktrees, `node_modules/` and scratch directories kept under a repository root used to be indexed and appeared as duplicates in search results. Only `.gitignore` is read (not `.git/info/exclude`, the global excludes file or `.ignore`), and hidden directories are not excluded by name. Existing indexes adjust on the next `mdya update-all` or `mdya vector use`: entries for paths that are now ignored are dropped and counted under `removed`.
 - Replaced the direct `walkdir` dependency with the `ignore` crate (the library behind ripgrep); walkdir stays in the tree underneath it. `ignore` and `globset` are the only crates new to the dependency tree, both pure Rust with no `*-sys` bindings.
+
+### Removed
+
+- **Breaking (library):** `mdya::get::get_chunk`, replaced by `mdya::get::get_chunks`, which takes a `ChunkSpan`.
+
+### Fixed
+
+- Items of a list written without blank lines between them were joined into one run of text in the indexed chunk (`- alpha` / `- beta` became `alphabeta`), and so were nested list items and list items inside block quotes. Every block boundary now separates the text, whatever the Markdown layout. This takes effect when the index is rebuilt.
+- Some Markdown documents were indexed only up to a certain list item, and the rest of the document was silently left out of search. Such documents are rare: for example, one with a list item holding only a link reference definition (`- [a]: https://example.com`), directly followed by a whitespace-only line indented at least four columns past the item's text (six or more spaces under a top-level `- ` item). They are now indexed in full, chunked as plain text (Markdown syntax and any YAML front matter included in the indexed text) instead of by headings. This takes effect when the index is rebuilt.
 
 ### Security
 

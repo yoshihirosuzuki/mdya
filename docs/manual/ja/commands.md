@@ -167,11 +167,11 @@ mdya search hybrid <query> [-c <NAMES>...] [-n <N>] [--chunks] [--format <FORMAT
 #### `--format human` (default)
 
 ```
-notes/release.md  score=0.812
+notes/release.md  score=0.812  chunks=4
   > リリース手順は以下の通り
   > 1. バージョン番号を更新する
 ---
-notes/checklist.md  score=0.751
+notes/checklist.md  score=0.751  chunks=1
   > 公開前チェックリスト
 ---
 2 doc hits (showing 20 max)
@@ -201,13 +201,15 @@ mdya search fts "release" --format json | jq '.hits[].path'
       "path": "release.md",
       "score": 0.812,
       "snippet": "...",
-      "matched_chunks": 3
+      "matched_chunks": 3,
+      "chunk_count": 4
     }
   ]
 }
 ```
 
 - `level` は hit 粒度です。default の `doc` では文書単位の集約 hit を返し、 hit の `matched_chunks` に文書内で hit したチャンク数が入ります。 `--chunks` を渡すと `level: "chunk"` になり、 hit はチャンク単位で `chunk_sequence` (0-indexed のチャンク番号) を含みます。
+- `chunk_count` は hit した文書のチャンク総数です。どちらの粒度の hit にも入ります。`mdya get --chunk <N> --chunk-end <M>` で周辺や続きを読むときの上限の目安になります。
 - `total` は `hits` 配列の件数 (= `limit` で切り詰めた後) と一致し、`level: "doc"` のときは文書数、`level: "chunk"` のときはチャンク数を表します。
 - ヒットは `score` の降順に並びます。
 - スクリプト用途では必ず終了コードを確認してください。`json` フォーマットでエラーが起きると stdout は空になります (`{"hits":[]}` ではない) ので、stdout の有無だけで成否を判定するとミスリードします。
@@ -231,7 +233,7 @@ Markdown に整形した人間 / agent 向けビューです。複数行 snippet
 文書の原文を stdout に出力します。検索ヒットから元の文書を取り出すときに使います。
 
 ```sh
-mdya get <collection> <path> [--chunk <N>] [-f]
+mdya get <collection> <path> [--chunk <N> [--chunk-end <M>]] [-f]
 ```
 
 | 引数 | 役割 |
@@ -241,18 +243,25 @@ mdya get <collection> <path> [--chunk <N>] [-f]
 
 | オプション | 役割 |
 |---|---|
-| `--chunk <N>` | document 全文ではなくチャンク `N` (0-indexed) の本文だけを出力する。サイズ check は行わない |
+| `--chunk <N>` | document 全文ではなく、チャンク `N` (0-indexed) にあたる部分の原文だけを出力する |
+| `--chunk-end <M>` | `--chunk <N>` と組み合わせ、チャンク `N` から `M` まで (`M` を含む) を 1 続きの原文として出力する。`M` は `N` 以上。最後のチャンクを超える `M` は文書の末尾までとして扱う |
 | `-f`, `--no-size-limit` | `get.cli_max_bytes` の上限を無視してサイズに関わらず出力する |
 
 例:
 
 ```sh
 mdya get notes release.md
+mdya get notes release.md --chunk 3                 # hit したチャンクだけ
+mdya get notes release.md --chunk 2 --chunk-end 4   # その前後も含めて
 ```
 
 ファイルシステムではなく索引内に保存された原文を返します。`mdya update-all` を実行していない / 取り込まれていない文書は取得できません。
 
-`mdya get` は document が `get.cli_max_bytes` (default 1 MiB、[`configuration.md` の `cli_max_bytes`](configuration.md#cli_max_bytes) 参照) を超えると既定でエラー停止し、巨大なファイルをうっかり取得して端末を埋め尽くすのを防ぎます。意図的に大きな document をリダイレクト / パイプするときは `-f` / `--no-size-limit` を渡すとそのまま出力できます。
+`--chunk` で返るのは、そのチャンクにあたる部分の原文です。見出し記号・リンク先・HTML などの書式も元のまま含まれます。チャンクの範囲は文書を隙間なく区切っています。`--chunk 0 --chunk-end <最後>` は文書全体を返し、1 回の範囲指定の中では隣り合うチャンクの間に重複は出ません。ただし、1 つの長いブロック (長い段落・コードブロック、または PDF) を切ったチャンクは前後と少し重なります。別々に取得した結果の境目がそうしたブロックの途中に来ると、つないだときに継ぎ目で少し重複します (1 チャンクずつでも範囲指定でも同じです)。`N` が最後のチャンクを超えるとエラーになります。チャンクの総数は検索結果の `chunk_count` で分かります。
+
+`mdya get` は出力が `get.cli_max_bytes` (default 1 MiB、[`configuration.md` の `cli_max_bytes`](configuration.md#cli_max_bytes) 参照) を超えると既定でエラー停止し、巨大なファイルをうっかり取得して端末を埋め尽くすのを防ぎます。全文取得でも `--chunk` 指定でも同じです。意図的に大きな出力をリダイレクト / パイプするときは `-f` / `--no-size-limit` を渡すとそのまま出力できます。
+
+索引が古い形式のまま (チャンクの範囲を記録する前の mdya で作ったもの) だと、`--chunk` 指定はエラーになり、作り直しのコマンドを案内します。全文取得はそのまま使えます。作り直しは [`mdya vector use`](#索引の形式が古い場合) で行います。
 
 ---
 
@@ -334,6 +343,26 @@ Switched embedding model to 'ollama:nomic-embed-text'. Re-embedded 312 document(
 ```
 
 `failed > 0` の場合は終了コード `1` を返します。残りは `mdya update-all` の通常実行で再開できます。
+
+### 索引の形式が古い場合
+
+チャンクの範囲を記録する前の mdya で作った索引は、`mdya update-all` / `mdya search` / `mdya get --chunk` がエラーで停止し、次のコマンドを案内します。
+
+```sh
+mdya vector use <現在のモデル>
+```
+
+モデルを変えずに、索引のベクトルテーブルを作り直して全文書を再取り込みします。`config.yml` のモデル指定は変わりません。切り替えのときと同じく確認プロンプトが出ます。表示は次のようになります。
+
+```
+This will rebuild the index for 'cl-nagoya/ruri-v3-30m' (dim 256).
+The chunks index will be DROPPED and 3 collection(s) re-embedded from scratch.
+Proceed? [y/N]:
+```
+
+完了すると `Rebuilt the index for 'cl-nagoya/ruri-v3-30m'. Re-embedded 312 document(s) (removed: 0, failed: 0).` と表示します。モデルも索引も現在の形式のまま一致しているときは、何もせずに終わります。
+
+`mdya mcp` を起動したまま作り直した場合は、作り直した後に `mdya mcp` を再起動してください。起動中のサーバは、起動時に読んだ索引の形式を使い続けます。
 
 ### Ollama を使う場合
 

@@ -43,6 +43,14 @@ pub const COL_EMBEDDING: &str = "embedding";
 pub const COL_SOURCE_HASH: &str = "source_hash";
 /// Faithful original document text, only in the `sources` table.
 pub const COL_CONTENT: &str = "content";
+/// Byte offset in the matching `sources.content` where a chunk's range
+/// starts. With [`COL_SOURCE_END`] it lets `mdya get --chunk` / MCP
+/// `get_document` return the original text a chunk covers. The ranges of
+/// one document's chunks tile `content` (see `chunking::Chunk::source_range`).
+pub const COL_SOURCE_START: &str = "source_start";
+/// Byte offset in the matching `sources.content` where a chunk's range ends
+/// (exclusive).
+pub const COL_SOURCE_END: &str = "source_end";
 
 /// Build the Arrow schema for the `chunks` table. `vector_dim` is the
 /// `FixedSizeList<Float32, N>` width and must match the embedder's
@@ -61,7 +69,7 @@ pub fn chunks_schema(vector_dim: i32, embedding_model: &str) -> Schema {
         embedding_model.to_string(),
     );
     metadata.insert(METADATA_KEY_VECTOR_DIM.to_string(), vector_dim.to_string());
-    // 7 columns total; heading text is folded into `body`.
+    // 9 columns total; heading text is folded into `body`.
     Schema::new(vec![
         Field::new("collection", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, false),
@@ -90,8 +98,21 @@ pub fn chunks_schema(vector_dim: i32, embedding_model: &str) -> Schema {
             false,
         ),
         Field::new("source_hash", DataType::Utf8, false),
+        Field::new(COL_SOURCE_START, DataType::UInt64, false),
+        Field::new(COL_SOURCE_END, DataType::UInt64, false),
     ])
     .with_metadata(metadata)
+}
+
+/// Whether a `chunks` table schema has the source-range columns. A table
+/// built by an older mdya lacks them: its chunks cannot be read back as
+/// original text, and since `update-all` skips unchanged files it would
+/// never fill them in. Callers that need the ranges refuse such an index
+/// and point at `mdya vector use`, which recreates the table.
+pub fn chunks_schema_has_source_ranges(schema: &Schema) -> bool {
+    [COL_SOURCE_START, COL_SOURCE_END]
+        .iter()
+        .all(|name| schema.field_with_name(name).is_ok())
 }
 
 /// Build the Arrow schema for the `sources` table. One row per
@@ -126,6 +147,30 @@ mod tests {
             embedding.is_nullable(),
             "embedding must be nullable so placeholder chunks can store null"
         );
+    }
+
+    #[test]
+    fn chunks_schema_carries_non_null_source_range_columns() {
+        let schema = chunks_schema(256, "cl-nagoya/ruri-v3-30m");
+        for name in [COL_SOURCE_START, COL_SOURCE_END] {
+            let f = schema.field_with_name(name).expect("field exists");
+            assert_eq!(f.data_type(), &DataType::UInt64, "{name} is UInt64");
+            assert!(!f.is_nullable(), "{name} is non-null");
+        }
+        assert!(chunks_schema_has_source_ranges(&schema));
+    }
+
+    #[test]
+    fn schema_without_source_range_columns_is_reported_outdated() {
+        let current = chunks_schema(256, "cl-nagoya/ruri-v3-30m");
+        let fields: Vec<_> = current
+            .fields()
+            .iter()
+            .filter(|f| f.name() != COL_SOURCE_START && f.name() != COL_SOURCE_END)
+            .cloned()
+            .collect();
+        let old = Schema::new(fields);
+        assert!(!chunks_schema_has_source_ranges(&old));
     }
 
     #[test]

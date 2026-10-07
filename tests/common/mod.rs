@@ -29,7 +29,7 @@ use anyhow::Result;
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
 use arrow_array::{
     Array, FixedSizeListArray, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
-    TimestampMicrosecondArray, UInt32Array,
+    TimestampMicrosecondArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::Utc;
@@ -126,7 +126,7 @@ pub async fn tamper_schema_metadata(
     // value — keep the structural dim at 256 so the synthetic rows
     // below match the production schema and the test's `MockEmbedder`
     // can still emit 256-wide query vectors.
-    let schema = chunks_schema_with_explicit_metadata(256, metadata);
+    let schema = chunks_schema_with_explicit_metadata(256, metadata, true);
     db.create_empty_table("chunks", Arc::new(schema))
         .execute()
         .await?;
@@ -174,7 +174,7 @@ fn synthetic_chunks_batch(schema: Arc<Schema>, n: usize, dim: usize) -> RecordBa
     let micros = Utc::now().timestamp_micros();
     let modified_at = TimestampMicrosecondArray::from(vec![micros; n]).with_timezone("UTC");
     let source_hash = StringArray::from(vec!["0".repeat(64); n]);
-    let columns: Vec<Arc<dyn Array>> = vec![
+    let mut columns: Vec<Arc<dyn Array>> = vec![
         Arc::new(collection),
         Arc::new(path),
         Arc::new(chunk_sequence),
@@ -183,6 +183,12 @@ fn synthetic_chunks_batch(schema: Arc<Schema>, n: usize, dim: usize) -> RecordBa
         Arc::new(modified_at),
         Arc::new(source_hash),
     ];
+    // The pre-range layout (see `downgrade_chunks_table_to_pre_range_layout`)
+    // has no range columns; only append them when the table carries them.
+    if schema.field_with_name("source_start").is_ok() {
+        columns.push(Arc::new(UInt64Array::from(vec![0_u64; n])));
+        columns.push(Arc::new(UInt64Array::from(vec![0_u64; n])));
+    }
     RecordBatch::try_new(schema, columns).expect("schema matches synthetic columns")
 }
 
@@ -208,8 +214,9 @@ fn synthetic_embedding_array(n: usize, dim: usize) -> FixedSizeListArray {
 fn chunks_schema_with_explicit_metadata(
     vector_dim: i32,
     metadata: HashMap<String, String>,
+    with_source_ranges: bool,
 ) -> Schema {
-    Schema::new(vec![
+    let mut fields = vec![
         Field::new("collection", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, false),
         Field::new("chunk_sequence", DataType::UInt32, false),
@@ -228,6 +235,34 @@ fn chunks_schema_with_explicit_metadata(
             false,
         ),
         Field::new("source_hash", DataType::Utf8, false),
-    ])
-    .with_metadata(metadata)
+    ];
+    if with_source_ranges {
+        fields.push(Field::new("source_start", DataType::UInt64, false));
+        fields.push(Field::new("source_end", DataType::UInt64, false));
+    }
+    Schema::new(fields).with_metadata(metadata)
+}
+
+/// Drop and recreate the `chunks` table in the layout an older mdya built:
+/// correct metadata pins for the default model, but no chunk source-range
+/// columns. One synthetic row is added so search has something to match.
+/// The `sources` table is left as is, so full-document reads still work.
+pub async fn downgrade_chunks_table_to_pre_range_layout(base: &Path) -> Result<()> {
+    let index_dir = base.join("index");
+    let db = lancedb::connect(index_dir.to_str().expect("UTF-8 path"))
+        .execute()
+        .await?;
+    db.drop_table("chunks", &[]).await?;
+    let metadata = HashMap::from([
+        (
+            "embedding_model".to_string(),
+            "cl-nagoya/ruri-v3-30m".to_string(),
+        ),
+        ("vector_dim".to_string(), "256".to_string()),
+    ]);
+    let schema = chunks_schema_with_explicit_metadata(256, metadata, false);
+    db.create_empty_table("chunks", Arc::new(schema))
+        .execute()
+        .await?;
+    add_synthetic_chunks_row(base).await
 }

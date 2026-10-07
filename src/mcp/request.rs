@@ -51,22 +51,29 @@ fn default_k() -> u32 {
 }
 
 /// Input for the `get_document` tool: the composite key that
-/// identifies one document, optionally narrowed to a single chunk.
-/// Mirrors the `mdya get <collection> <path> [--chunk <N>]` CLI
-/// surface — omitting `chunk` returns the faithful full document from
-/// `sources`; supplying `chunk` returns that chunk's `body` from
-/// `chunks`, the locator coming from a search hit's `chunk_sequence`.
+/// identifies one document, optionally narrowed to a run of chunks.
+/// Mirrors the `mdya get <collection> <path> [--chunk <N> [--chunk-end <M>]]`
+/// CLI surface — omitting `chunk` returns the faithful full document;
+/// supplying `chunk` returns the original text that chunk (through
+/// `chunk_end`, when given) covers, the locator coming from a search hit's
+/// `chunk_sequence`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetDocumentRequest {
     /// Collection name (must be declared in config.yml).
     pub collection: String,
     /// Document path, relative to the collection root.
     pub path: String,
-    /// 0-indexed `chunk_sequence` to fetch a single chunk's body
-    /// instead of the full document. Omit for the faithful full
+    /// 0-indexed `chunk_sequence` to fetch the original text of that
+    /// chunk instead of the full document. Omit for the faithful full
     /// document.
     #[serde(default)]
     pub chunk: Option<u32>,
+    /// Last `chunk_sequence` (inclusive) to fetch together with `chunk`,
+    /// returned as one contiguous piece of the original text. Requires
+    /// `chunk` and must be >= it; a value past the document's last chunk
+    /// reads to the end of the document. Omit to fetch only `chunk`.
+    #[serde(default)]
+    pub chunk_end: Option<u32>,
 }
 
 impl SearchRequest {
