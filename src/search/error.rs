@@ -64,4 +64,16 @@ pub enum SearchError {
          `mdya init`, and re-run `mdya update-all` to rebuild."
     )]
     SchemaMetadataMissing { absent_keys: Vec<&'static str> },
+
+    /// The `chunks` table was built by an older mdya and lacks chunk source
+    /// ranges. Search refuses it so hits never point at chunks that cannot
+    /// be read back; `model` is the declared embedding model, so the
+    /// suggested command rebuilds for it. Recorded at `SearchEngine::open`
+    /// and returned per query, so a long-lived MCP server still starts and
+    /// serves full-document reads.
+    #[error(
+        "index is outdated: it was built by an older mdya and lacks chunk source \
+         ranges. Rebuild it with `mdya vector use {model}`."
+    )]
+    IndexOutdated { model: String },
 }

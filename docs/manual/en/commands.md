@@ -167,11 +167,11 @@ Do not compare scores across modes directly.
 #### `--format human` (default)
 
 ```
-notes/release.md  score=0.812
+notes/release.md  score=0.812  chunks=4
   > The release procedure is as follows
   > 1. Update the version number
 ---
-notes/checklist.md  score=0.751
+notes/checklist.md  score=0.751  chunks=1
   > Pre-release checklist
 ---
 2 doc hits (showing 20 max)
@@ -201,13 +201,15 @@ Envelope structure:
       "path": "release.md",
       "score": 0.812,
       "snippet": "...",
-      "matched_chunks": 3
+      "matched_chunks": 3,
+      "chunk_count": 4
     }
   ]
 }
 ```
 
 - `level` is the hit granularity. At the default `doc`, hits are aggregated per document and each hit's `matched_chunks` counts how many chunks within the document matched. Passing `--chunks` sets `level: "chunk"` and each hit carries `chunk_sequence` (the 0-indexed chunk number).
+- `chunk_count` is the total number of chunks in the hit's document, present on hits of either granularity. It bounds `mdya get --chunk <N> --chunk-end <M>` when you read around a hit or onward through the document.
 - `total` matches the length of `hits` (after `limit` truncation). With `level: "doc"` it counts documents; with `level: "chunk"` it counts chunks.
 - Hits are ordered by `score`, descending.
 - Scripts must check the exit code. When a `json`-formatted search fails, stdout is empty (not `{"hits":[]}`), so judging success by stdout presence alone is misleading.
@@ -231,7 +233,7 @@ When a search fails under a non-`human` format, stdout is empty and the error is
 Prints the original text of a document to stdout. Useful when you want to retrieve the source document for a search hit.
 
 ```sh
-mdya get <collection> <path> [--chunk <N>] [-f]
+mdya get <collection> <path> [--chunk <N> [--chunk-end <M>]] [-f]
 ```
 
 | Argument | Purpose |
@@ -241,18 +243,25 @@ mdya get <collection> <path> [--chunk <N>] [-f]
 
 | Option | Purpose |
 |---|---|
-| `--chunk <N>` | Print only chunk `N` (0-indexed) of the document instead of the full text. Never size-checked |
-| `-f`, `--no-size-limit` | Print the document regardless of size, bypassing the `get.cli_max_bytes` cap |
+| `--chunk <N>` | Print only the original text of chunk `N` (0-indexed) instead of the full document |
+| `--chunk-end <M>` | With `--chunk <N>`, print chunks `N` through `M` (inclusive) as one contiguous piece of the original text. `M` must be `>= N`; an `M` past the last chunk reads to the end of the document |
+| `-f`, `--no-size-limit` | Print the output regardless of size, bypassing the `get.cli_max_bytes` cap |
 
-Example:
+Examples:
 
 ```sh
 mdya get notes release.md
+mdya get notes release.md --chunk 3                 # just the chunk that matched
+mdya get notes release.md --chunk 2 --chunk-end 4   # with its neighbours
 ```
 
 It returns the text stored in the index, not the live filesystem contents. Documents not yet ingested (e.g. `mdya update-all` has not been run) cannot be retrieved.
 
-By default `mdya get` stops with an error when a document exceeds `get.cli_max_bytes` (1 MiB by default; see [`cli_max_bytes` in configuration.md](configuration.md#cli_max_bytes)), so an accidental fetch of a very large file does not flood your terminal. Pass `-f` / `--no-size-limit` to print it anyway — useful when you redirect or pipe a large document on purpose.
+`--chunk` returns the part of the original text the chunk covers, formatting included: heading markers, link targets, HTML, and so on. Chunk ranges cover the document without gaps: `--chunk 0 --chunk-end <last>` returns the whole document, and within one range read no text repeats between adjacent chunks. Chunks cut from one long block (a long paragraph or code block, or a PDF) overlap their neighbours slightly, though: when separate reads meet inside such a block, joining them repeats a little text at the seam, whether they are single chunks or ranges. An `N` past the last chunk is an error. A search hit's `chunk_count` tells you how many chunks the document has.
+
+By default `mdya get` stops with an error when its output exceeds `get.cli_max_bytes` (1 MiB by default; see [`cli_max_bytes` in configuration.md](configuration.md#cli_max_bytes)), so an accidental fetch of a very large file does not flood your terminal. This applies to full documents and `--chunk` reads alike. Pass `-f` / `--no-size-limit` to print it anyway — useful when you redirect or pipe a large output on purpose.
+
+On an index built by an older mdya (before chunk ranges were recorded), `--chunk` stops with an error that names the command to rebuild the index; full-document reads keep working. Rebuild with [`mdya vector use`](#when-the-index-format-is-outdated).
 
 ---
 
@@ -334,6 +343,26 @@ Switched embedding model to 'ollama:nomic-embed-text'. Re-embedded 312 document(
 ```
 
 When `failed > 0`, the command exits with `1`. The rest can be resumed by re-running `mdya update-all` normally.
+
+### When the index format is outdated
+
+On an index built by an older mdya (before chunk ranges were recorded), `mdya update-all`, `mdya search`, and `mdya get --chunk` stop with an error that suggests:
+
+```sh
+mdya vector use <current model>
+```
+
+This keeps the model, recreates the index's vector table, and re-ingests every document; the model in `config.yml` stays as it is. It asks for confirmation just like a model switch, worded as:
+
+```
+This will rebuild the index for 'cl-nagoya/ruri-v3-30m' (dim 256).
+The chunks index will be DROPPED and 3 collection(s) re-embedded from scratch.
+Proceed? [y/N]:
+```
+
+When it finishes it prints `Rebuilt the index for 'cl-nagoya/ruri-v3-30m'. Re-embedded 312 document(s) (removed: 0, failed: 0).` When the model and the index format are both current, it does nothing.
+
+If `mdya mcp` is running, restart it after the rebuild: a running server keeps the index format it read at startup.
 
 ### Using Ollama
 

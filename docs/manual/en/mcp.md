@@ -73,13 +73,14 @@ The output matches the CLI's `--format json` envelope.
       "path": "release.md",
       "score": 0.812,
       "snippet": "...",
-      "matched_chunks": 3
+      "matched_chunks": 3,
+      "chunk_count": 4
     }
   ]
 }
 ```
 
-At `level: "doc"` (default), hits are aggregated per document and each hit's `matched_chunks` counts how many chunks within the document matched. Passing `level: "chunk"` returns hits at chunk granularity, and each hit carries `chunk_sequence` (the 0-indexed chunk number).
+At `level: "doc"` (default), hits are aggregated per document and each hit's `matched_chunks` counts how many chunks within the document matched. Passing `level: "chunk"` returns hits at chunk granularity, and each hit carries `chunk_sequence` (the 0-indexed chunk number). At either granularity, each hit's `chunk_count` is the total number of chunks in its document.
 
 The numeric range of `score` differs per mode (see [the three modes in commands.md](commands.md#the-three-modes)).
 
@@ -110,9 +111,12 @@ Output:
 
 - `collection` (required) — collection name (must be declared in `config.yml`).
 - `path` (required) — document path relative to the collection root.
-- `chunk` (optional) — a 0-indexed `chunk_sequence`. When given, only that single chunk's body is returned instead of the full document; omit it for the faithful full document.
+- `chunk` (optional) — a 0-indexed `chunk_sequence`. When given, the original text that chunk covers is returned instead of the full document; omit it for the faithful full document.
+- `chunk_end` (optional) — with `chunk`, return chunks `chunk` through `chunk_end` (inclusive) as one contiguous piece of the original text. Must be `>= chunk`; a value past the last chunk reads to the end of the document.
 
-You can pass the `collection` and `path` from a search hit directly to retrieve its source text, or pass a hit's `chunk_sequence` as `chunk` to fetch just that chunk.
+You can pass the `collection` and `path` from a search hit directly to retrieve its source text, or pass a hit's `chunk_sequence` as `chunk` to fetch just that chunk. To read its neighbours too, pass a `chunk` below the hit's number and a `chunk_end` above it. A chunk's original text keeps its formatting: heading markers, link targets, HTML, and so on. Chunk ranges cover the document without gaps, so within one range read no text repeats between adjacent chunks. Chunks cut from one long block (a long paragraph or code block, or a PDF) overlap their neighbours slightly, though: when separate reads meet inside such a block, joining them repeats a little text at the seam.
+
+A document whose full text exceeds `get.mcp_max_bytes` can usually still be read piece by piece with `chunk` / `chunk_end` ranges that fit under the cap. A part where a single chunk's range alone exceeds the cap — large content with no body text, such as a huge HTML block — cannot be read this way. A search hit's `chunk_count` tells you how many chunks the document has.
 
 ### Index introspection tool
 
@@ -140,7 +144,9 @@ When a tool call fails, a structured error is returned.
 | `invalid_limit` | `k` is `0` |
 | `unknown_collection` | An unknown collection name was given |
 | `not_found` | `get_document` found no matching document, or the requested `chunk` is out of range |
-| `payload_too_large` | A full `get_document` response exceeded `get.mcp_max_bytes`. `details` carries `size_bytes` / `limit_bytes`; fetch a single `chunk` to narrow it |
+| `invalid_chunk_range` | `get_document` got `chunk_end` without `chunk`, or a `chunk_end` smaller than `chunk` |
+| `payload_too_large` | A `get_document` response (full document or `chunk` / `chunk_end` range) exceeded `get.mcp_max_bytes`. `details` carries `size_bytes` / `limit_bytes`; narrow the `chunk` / `chunk_end` range to fit |
+| `index_outdated` | The index was built by an older mdya, before chunk ranges were recorded. Returned by `search` and by `get_document` with `chunk`. Rebuild it with `mdya vector use <model>`, using the model in `details.embedding_model`. Full-document `get_document` keeps working. Restart the MCP server after the rebuild |
 | `schema_metadata_missing` | The index is uninitialized or corrupted |
 | `internal` | I/O, embedding, configuration-load, or other failure |
 

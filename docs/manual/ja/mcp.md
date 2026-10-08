@@ -73,13 +73,14 @@ mdya MCP サーバは次のツールを提供します。
       "path": "release.md",
       "score": 0.812,
       "snippet": "...",
-      "matched_chunks": 3
+      "matched_chunks": 3,
+      "chunk_count": 4
     }
   ]
 }
 ```
 
-`level: "doc"` (default) では文書単位の集約 hit が返り、 hit の `matched_chunks` に文書内で hit したチャンク数が入ります。 入力で `level: "chunk"` を渡すとチャンク単位の hit が返り、 hit に `chunk_sequence` (0-indexed のチャンク番号) が入ります。
+`level: "doc"` (default) では文書単位の集約 hit が返り、 hit の `matched_chunks` に文書内で hit したチャンク数が入ります。 入力で `level: "chunk"` を渡すとチャンク単位の hit が返り、 hit に `chunk_sequence` (0-indexed のチャンク番号) が入ります。 どちらの粒度でも、 hit の `chunk_count` にその文書のチャンク総数が入ります。
 
 スコアの数値域は mode ごとに異なります ([commands.md の 3 モードの違い](commands.md#3-モードの違い) を参照)。
 
@@ -110,9 +111,12 @@ mdya MCP サーバは次のツールを提供します。
 
 - `collection` (必須) — コレクション名 (`config.yml` で宣言済みのもの)。
 - `path` (必須) — コレクションルートからの相対パス。
-- `chunk` (任意) — 0-indexed の `chunk_sequence`。指定すると document 全文ではなくそのチャンク 1 つの本文だけを返します。省略時は忠実な全文を返します。
+- `chunk` (任意) — 0-indexed の `chunk_sequence`。指定すると document 全文ではなく、そのチャンクにあたる部分の原文を返します。省略時は忠実な全文を返します。
+- `chunk_end` (任意) — `chunk` と組み合わせ、チャンク `chunk` から `chunk_end` まで (`chunk_end` を含む) を 1 続きの原文として返します。`chunk` 以上の値を指定します。最後のチャンクを超える値は文書の末尾までとして扱います。
 
-検索ヒットの `collection` と `path` をそのまま渡せば原文が取れます。hit の `chunk_sequence` を `chunk` に渡せばそのチャンクだけを取得できます。
+検索ヒットの `collection` と `path` をそのまま渡せば原文が取れます。hit の `chunk_sequence` を `chunk` に渡せばそのチャンクだけを取得できます。前後も含めて読むときは、`chunk` に hit より小さい番号、`chunk_end` に大きい番号を渡します。チャンクにあたる部分の原文には、見出し記号・リンク先・HTML などの書式も元のまま含まれます。チャンクの範囲は文書を隙間なく区切っているので、1 回の範囲指定の中では隣り合うチャンクの間に重複は出ません。ただし、1 つの長いブロック (長い段落・コードブロック、または PDF) を切ったチャンクは前後と少し重なるので、別々に取得した結果の境目がそうしたブロックの途中に来ると、つないだときに継ぎ目で少し重複します。
+
+全文が `get.mcp_max_bytes` を超える文書も、多くの場合は `chunk` / `chunk_end` で上限に収まる範囲ずつ読み進められます。本文に文字を持たない大きな内容 (巨大な HTML ブロックなど) を含み、1 チャンクの範囲だけで上限を超える部分は読めません。チャンクの総数は検索 hit の `chunk_count` で分かります。
 
 ### 索引情報ツール
 
@@ -140,7 +144,9 @@ mdya MCP サーバは次のツールを提供します。
 | `invalid_limit` | `k` が `0` |
 | `unknown_collection` | 未知のコレクション名を指定 |
 | `not_found` | `get_document` で該当文書が無い、または指定した `chunk` が範囲外 |
-| `payload_too_large` | `get_document` の全文応答が `get.mcp_max_bytes` を超過。`details` に `size_bytes` / `limit_bytes` が入る。単一 `chunk` 取得で絞り込める |
+| `invalid_chunk_range` | `get_document` で `chunk` なしに `chunk_end` を指定した、または `chunk_end` が `chunk` より小さい |
+| `payload_too_large` | `get_document` の応答 (全文、または `chunk` / `chunk_end` の範囲) が `get.mcp_max_bytes` を超過。`details` に `size_bytes` / `limit_bytes` が入る。`chunk` / `chunk_end` の範囲を狭めて絞り込める |
+| `index_outdated` | 索引がチャンクの範囲を記録する前の mdya で作られている。`search` と、`chunk` を指定した `get_document` で返る。`details.embedding_model` のモデル名で `mdya vector use <model>` を実行すると作り直せる。全文の `get_document` はそのまま使える。作り直した後は MCP サーバを再起動する |
 | `schema_metadata_missing` | 索引が未初期化 / 壊れている |
 | `internal` | I/O / 埋め込み / 設定読み込み等の障害 |
 

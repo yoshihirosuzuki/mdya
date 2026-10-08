@@ -369,6 +369,7 @@ async fn get_document_echoes_locator_and_returns_faithful_content() -> Result<()
                 collection: "notes".to_string(),
                 path: "release.md".to_string(),
                 chunk: None,
+                chunk_end: None,
             }))
             .await,
     );
@@ -391,6 +392,7 @@ async fn get_document_missing_path_maps_to_not_found_error() -> Result<()> {
             collection: "notes".to_string(),
             path: "ghost.md".to_string(),
             chunk: None,
+            chunk_end: None,
         }))
         .await
         .err()
@@ -410,7 +412,7 @@ async fn get_document_missing_path_maps_to_not_found_error() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_document_with_chunk_returns_a_chunk_body_for_a_valid_sequence() -> Result<()> {
+async fn get_document_with_chunk_returns_the_original_text_for_a_valid_sequence() -> Result<()> {
     let _env_lock = LANCE_ENV_LOCK.lock().await;
     let tmp = TempDir::new()?;
     let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
@@ -422,19 +424,17 @@ async fn get_document_with_chunk_returns_a_chunk_body_for_a_valid_sequence() -> 
                 collection: "notes".to_string(),
                 path: "release.md".to_string(),
                 chunk: Some(0),
+                chunk_end: None,
             }))
             .await,
     );
 
     assert_eq!(resp.collection, "notes");
     assert_eq!(resp.path, "release.md");
-    // chunk body is lossy vs the raw source; a substring is the read-path
-    // assertion. The MCP envelope still echoes the locator unchanged.
-    assert!(
-        resp.content.contains("release checklist"),
-        "chunk body should carry the section text: {:?}",
-        resp.content
-    );
+    // The document's only chunk covers all of it, heading markup included:
+    // the original text, not the plain-text body. The MCP envelope still
+    // echoes the locator unchanged.
+    assert_eq!(resp.content, "# Release\n\nrelease checklist.\n");
     Ok(())
 }
 
@@ -450,6 +450,7 @@ async fn get_document_with_out_of_range_chunk_carries_chunk_sequence_in_details(
             collection: "notes".to_string(),
             path: "release.md".to_string(),
             chunk: Some(9999),
+            chunk_end: None,
         }))
         .await
         .err()
@@ -512,6 +513,7 @@ async fn get_document_over_mcp_cap_is_payload_too_large_with_byte_details() -> R
             collection: "notes".to_string(),
             path: "big.md".to_string(),
             chunk: None,
+            chunk_end: None,
         }))
         .await
         .err()
@@ -528,28 +530,198 @@ async fn get_document_over_mcp_cap_is_payload_too_large_with_byte_details() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_document_chunk_path_ignores_the_mcp_cap() -> Result<()> {
+async fn get_document_chunk_path_is_capped_like_the_full_document() -> Result<()> {
     let _env_lock = LANCE_ENV_LOCK.lock().await;
     let tmp = TempDir::new()?;
     let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
-    // Cap of 1 byte: the full-document path would fail, but a `chunk` read
-    // must still succeed — chunk bodies are out of the guard's scope.
+    // Cap of 1 byte: a chunk range can span a whole document, so a `chunk`
+    // read is capped too.
     let (server, _big) = seeded_server_with_mcp_cap(&tmp, 1).await?;
 
-    let resp = tool_ok(
-        server
-            .get_document(Parameters(GetDocumentRequest {
-                collection: "notes".to_string(),
-                path: "big.md".to_string(),
-                chunk: Some(0),
-            }))
-            .await,
+    let err = server
+        .get_document(Parameters(GetDocumentRequest {
+            collection: "notes".to_string(),
+            path: "big.md".to_string(),
+            chunk: Some(0),
+            chunk_end: None,
+        }))
+        .await
+        .err()
+        .expect("over-cap chunk read rejected")
+        .0;
+    assert_eq!(err.code, McpErrorCode::PayloadTooLarge);
+    Ok(())
+}
+
+/// A document of `n` short sections — one chunk each.
+fn sectioned_document(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("## Section {i}\n\nbody of section {i}.\n\n"))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_cap_document_can_be_paged_through_with_chunk_ranges() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
+    let (base, coll_dir) = fresh_corpus(&tmp).await?;
+    let cfg_path = base.join("config.yml");
+    let mut cfg = mdya::config::load(&cfg_path)?;
+    cfg.get.mcp_max_bytes = 200;
+    save(&cfg_path, &cfg)?;
+    let doc = sectioned_document(12);
+    assert!(doc.len() > 200, "fixture must exceed the cap");
+    write_md(&coll_dir, "long.md", &doc);
+    ingest(&base, &coll_dir).await?;
+    let engine = SearchEngine::open(&base, DEFAULT_MODEL_ID, DEFAULT_VECTOR_DIM_I32).await?;
+    let server = Server::with_seeded_embedder(
+        &base,
+        Path::new(":seeded-embedder-no-cache-needed:"),
+        Arc::new(engine),
+        Arc::new(MockEmbedder),
     );
-    assert!(
-        resp.content.contains("lorem ipsum dolor"),
-        "chunk body returned despite a 1-byte cap: {:?}",
-        resp.content
+    let read = |chunk: Option<u32>, chunk_end: Option<u32>| {
+        server.get_document(Parameters(GetDocumentRequest {
+            collection: "notes".to_string(),
+            path: "long.md".to_string(),
+            chunk,
+            chunk_end,
+        }))
+    };
+
+    let whole = read(None, None).await.err().expect("over cap").0;
+    assert_eq!(whole.code, McpErrorCode::PayloadTooLarge);
+
+    // Pages of four chunks fit the cap; the last page's end runs past the
+    // last chunk and is clamped. Together they are the document.
+    let mut rebuilt = String::new();
+    for (first, last) in [(0, 3), (4, 7), (8, 99)] {
+        rebuilt.push_str(&tool_ok(read(Some(first), Some(last)).await).content);
+    }
+    assert_eq!(rebuilt, doc);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_document_rejects_invalid_chunk_ranges() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
+    let server = seeded_server(&tmp).await?;
+    let read = |chunk: Option<u32>, chunk_end: Option<u32>| {
+        server.get_document(Parameters(GetDocumentRequest {
+            collection: "notes".to_string(),
+            path: "release.md".to_string(),
+            chunk,
+            chunk_end,
+        }))
+    };
+
+    let end_only = read(None, Some(1))
+        .await
+        .err()
+        .expect("end without start")
+        .0;
+    assert_eq!(end_only.code, McpErrorCode::InvalidChunkRange);
+
+    let reversed = read(Some(2), Some(1))
+        .await
+        .err()
+        .expect("end before start")
+        .0;
+    assert_eq!(reversed.code, McpErrorCode::InvalidChunkRange);
+    assert_eq!(
+        reversed.details,
+        Some(serde_json::json!({ "chunk": 2, "chunk_end": 1 }))
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_hits_carry_their_document_chunk_count() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
+    let (base, coll_dir) = fresh_corpus(&tmp).await?;
+    write_md(&coll_dir, "long.md", &sectioned_document(12));
+    write_md(&coll_dir, "short.md", "# Short\n\nbody of a short note.\n");
+    ingest(&base, &coll_dir).await?;
+    let engine = SearchEngine::open(&base, DEFAULT_MODEL_ID, DEFAULT_VECTOR_DIM_I32).await?;
+    let server = Server::with_seeded_embedder(
+        &base,
+        Path::new(":seeded-embedder-no-cache-needed:"),
+        Arc::new(engine),
+        Arc::new(MockEmbedder),
+    );
+
+    for mode in ["fts", "vector", "hybrid"] {
+        for level in ["doc", "chunk"] {
+            let request: SearchRequest = serde_json::from_value(serde_json::json!({
+                "query": "body",
+                "k": 50,
+                "mode": mode,
+                "level": level,
+            }))?;
+            let resp = tool_ok(server.search(Parameters(request)).await);
+            assert!(!resp.hits.is_empty(), "{mode}/{level}: expected hits");
+            for hit in &resp.hits {
+                let expected = if hit.path() == "long.md" { 12 } else { 1 };
+                assert_eq!(hit.chunk_count(), expected, "{mode}/{level}: {hit:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outdated_index_is_reported_on_search_and_chunk_reads_only() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let _guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(tmp.path()));
+    let (base, coll_dir) = fresh_corpus(&tmp).await?;
+    let original = "# Release\n\nrelease checklist.\n";
+    write_md(&coll_dir, "release.md", original);
+    ingest(&base, &coll_dir).await?;
+    common::downgrade_chunks_table_to_pre_range_layout(&base).await?;
+    // The server still starts on an outdated index.
+    let engine = SearchEngine::open(&base, DEFAULT_MODEL_ID, DEFAULT_VECTOR_DIM_I32).await?;
+    let server = Server::with_seeded_embedder(
+        &base,
+        Path::new(":seeded-embedder-no-cache-needed:"),
+        Arc::new(engine),
+        Arc::new(MockEmbedder),
+    );
+
+    for mode in ["fts", "vector", "hybrid"] {
+        let err = server
+            .search(Parameters(req("release", 5, vec![], mode)))
+            .await
+            .err()
+            .expect("search on an outdated index")
+            .0;
+        assert_eq!(err.code, McpErrorCode::IndexOutdated, "{mode}");
+        assert_eq!(
+            err.details,
+            Some(serde_json::json!({ "embedding_model": DEFAULT_MODEL_ID }))
+        );
+    }
+
+    let read = |chunk: Option<u32>| {
+        server.get_document(Parameters(GetDocumentRequest {
+            collection: "notes".to_string(),
+            path: "release.md".to_string(),
+            chunk,
+            chunk_end: None,
+        }))
+    };
+    let err = read(Some(0))
+        .await
+        .err()
+        .expect("chunk read on an outdated index")
+        .0;
+    assert_eq!(err.code, McpErrorCode::IndexOutdated);
+    assert_eq!(tool_ok(read(None).await).content, original);
     Ok(())
 }
 
@@ -567,6 +739,7 @@ async fn get_document_with_mcp_cap_zero_returns_the_full_document() -> Result<()
                 collection: "notes".to_string(),
                 path: "big.md".to_string(),
                 chunk: None,
+                chunk_end: None,
             }))
             .await,
     );

@@ -192,23 +192,24 @@ fn default_embed_parallelism() -> usize {
 
 /// Output-size guard for the document-read paths. Kept separate from
 /// [`RuntimeConfig`] (process-safety knobs) because this bounds what a
-/// full-document read *emits*, not what the ingest pipeline consumes. The
+/// read *emits*, not what the ingest pipeline consumes. The
 /// CLI and MCP caps are independent fields because their failure modes
 /// differ: the CLI cap is overridable per call with `--no-size-limit` (a
 /// terminal redirect / pipe is a legitimate large-output use), while the
 /// MCP cap has no bypass (an LLM that always opted out would hollow out the
-/// context-budget protection). Both apply only to the full-document path;
-/// chunk reads are never size-checked.
+/// context-budget protection). Both apply to full-document and chunk reads:
+/// a chunk range can span a whole document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GetConfig {
-    /// Max UTF-8 bytes `mdya get` emits for a full document before it errors.
-    /// `0` disables the cap. `-f` / `--no-size-limit` bypasses it per call.
+    /// Max UTF-8 bytes `mdya get` emits (full document or chunk range) before
+    /// it errors. `0` disables the cap. `-f` / `--no-size-limit` bypasses it
+    /// per call.
     #[serde(default = "default_get_max_bytes")]
     pub cli_max_bytes: u64,
 
-    /// Max UTF-8 bytes MCP `get_document` returns for a full document before
-    /// a `payload_too_large` error. `0` disables the cap; there is no MCP
-    /// bypass parameter.
+    /// Max UTF-8 bytes MCP `get_document` returns (full document or chunk
+    /// range) before a `payload_too_large` error. `0` disables the cap; there
+    /// is no MCP bypass parameter.
     #[serde(default = "default_get_max_bytes")]
     pub mcp_max_bytes: u64,
 }

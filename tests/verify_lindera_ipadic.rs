@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
 use arrow_array::{
     FixedSizeListArray, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
-    TimestampMicrosecondArray, UInt32Array,
+    TimestampMicrosecondArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::Schema;
 use futures::TryStreamExt;
@@ -111,6 +111,8 @@ fn build_row_batch(seed: u64, body: &str) -> RecordBatch {
             Arc::new(embedding),
             Arc::new(modified_at),
             Arc::new(source_hash),
+            Arc::new(UInt64Array::from(vec![0_u64])),
+            Arc::new(UInt64Array::from(vec![0_u64])),
         ],
     )
     .unwrap_or_else(|e| panic!("RecordBatch::try_new failed (schema / columns mismatch?): {e}"))

@@ -35,11 +35,20 @@ pub enum McpErrorCode {
     InvalidLimit,
     UnknownCollection,
     NotFound,
-    /// A full `get_document` response exceeded `get.mcp_max_bytes`. The
-    /// client cannot retry around it (there is no MCP bypass), but it can
-    /// read `details.size_bytes` / `details.limit_bytes` to decide whether
-    /// to narrow the request (e.g. fetch a single `chunk` instead).
+    /// A `get_document` response (full document or chunk range) exceeded
+    /// `get.mcp_max_bytes`. The client cannot retry around it (there is no
+    /// MCP bypass), but it can read `details.size_bytes` /
+    /// `details.limit_bytes` to decide how to narrow the request (e.g. fetch
+    /// a shorter `chunk` .. `chunk_end` range).
     PayloadTooLarge,
+    /// `get_document` got a `chunk_end` without `chunk`, or a `chunk_end`
+    /// smaller than `chunk`. Fixable by changing the request.
+    InvalidChunkRange,
+    /// The index was built by an older mdya and lacks chunk source ranges,
+    /// so `search` and chunk reads are refused until it is rebuilt with
+    /// `mdya vector use <model>` (named in `details.embedding_model`).
+    /// Full-document `get_document` keeps working.
+    IndexOutdated,
     SchemaMetadataMissing,
     Internal,
 }
@@ -70,6 +79,10 @@ impl From<SearchError> for McpToolError {
             SearchError::SchemaMetadataMissing { absent_keys } => (
                 McpErrorCode::SchemaMetadataMissing,
                 Some(json!({ "absent_keys": absent_keys })),
+            ),
+            SearchError::IndexOutdated { model } => (
+                McpErrorCode::IndexOutdated,
+                Some(json!({ "embedding_model": model })),
             ),
             SearchError::LancedbPathNotUtf8 { .. }
             | SearchError::LancedbConnect { .. }
@@ -110,12 +123,21 @@ impl From<GetError> for McpToolError {
                     "chunk_sequence": chunk_sequence,
                 })),
             ),
-            GetError::DocumentTooLarge {
+            GetError::ContentTooLarge {
                 size_bytes,
                 limit_bytes,
             } => (
                 McpErrorCode::PayloadTooLarge,
                 Some(json!({ "size_bytes": size_bytes, "limit_bytes": limit_bytes })),
+            ),
+            GetError::ChunkEndWithoutChunk => (McpErrorCode::InvalidChunkRange, None),
+            GetError::ChunkEndBeforeChunk { chunk, chunk_end } => (
+                McpErrorCode::InvalidChunkRange,
+                Some(json!({ "chunk": chunk, "chunk_end": chunk_end })),
+            ),
+            GetError::IndexOutdated { model } => (
+                McpErrorCode::IndexOutdated,
+                Some(json!({ "embedding_model": model })),
             ),
             GetError::Config(_)
             | GetError::LancedbPathNotUtf8 { .. }
@@ -123,7 +145,8 @@ impl From<GetError> for McpToolError {
             | GetError::OpenSourcesTable(_)
             | GetError::QuerySources(_)
             | GetError::OpenChunksTable(_)
-            | GetError::QueryChunks(_) => (McpErrorCode::Internal, None),
+            | GetError::QueryChunks(_)
+            | GetError::IndexOutOfSync { .. } => (McpErrorCode::Internal, None),
         };
         Self {
             code,
@@ -239,7 +262,7 @@ mod tests {
 
     #[test]
     fn get_document_too_large_maps_to_payload_too_large_with_byte_details() {
-        let err = McpToolError::from(GetError::DocumentTooLarge {
+        let err = McpToolError::from(GetError::ContentTooLarge {
             size_bytes: 2_621_440,
             limit_bytes: 1_048_576,
         });
@@ -289,5 +312,62 @@ mod tests {
         });
         assert_eq!(err.code, McpErrorCode::Internal);
         assert!(err.details.is_none());
+    }
+
+    #[test]
+    fn chunk_end_before_chunk_maps_to_invalid_chunk_range_with_both_bounds() {
+        let err = McpToolError::from(GetError::ChunkEndBeforeChunk {
+            chunk: 5,
+            chunk_end: 2,
+        });
+        assert_eq!(err.code, McpErrorCode::InvalidChunkRange);
+        assert_eq!(err.details, Some(json!({ "chunk": 5, "chunk_end": 2 })));
+    }
+
+    #[test]
+    fn chunk_end_without_chunk_maps_to_invalid_chunk_range() {
+        let err = McpToolError::from(GetError::ChunkEndWithoutChunk);
+        assert_eq!(err.code, McpErrorCode::InvalidChunkRange);
+        assert!(err.details.is_none());
+    }
+
+    #[test]
+    fn outdated_index_maps_to_index_outdated_from_get_and_search() {
+        let model = "cl-nagoya/ruri-v3-30m".to_string();
+        let from_get = McpToolError::from(GetError::IndexOutdated {
+            model: model.clone(),
+        });
+        let from_search = McpToolError::from(SearchError::IndexOutdated {
+            model: model.clone(),
+        });
+        for err in [from_get, from_search] {
+            assert_eq!(err.code, McpErrorCode::IndexOutdated);
+            assert_eq!(err.details, Some(json!({ "embedding_model": model })));
+            assert!(
+                err.message
+                    .contains("mdya vector use cl-nagoya/ruri-v3-30m")
+            );
+        }
+    }
+
+    #[test]
+    fn new_codes_serialise_as_snake_case_tokens() {
+        assert_eq!(
+            serde_json::to_value(McpErrorCode::InvalidChunkRange).unwrap(),
+            json!("invalid_chunk_range")
+        );
+        assert_eq!(
+            serde_json::to_value(McpErrorCode::IndexOutdated).unwrap(),
+            json!("index_outdated")
+        );
+    }
+
+    #[test]
+    fn out_of_sync_index_maps_to_internal() {
+        let err = McpToolError::from(GetError::IndexOutOfSync {
+            collection: "notes".to_string(),
+            path: "a.md".to_string(),
+        });
+        assert_eq!(err.code, McpErrorCode::Internal);
     }
 }

@@ -86,11 +86,11 @@ mdya search hybrid "release plan"  # hybrid (RRF)
 Search results are printed to stdout in a human-readable format.
 
 ```
-notes/release.md  score=0.812
+notes/release.md  score=0.812  chunks=4
   > The release procedure is as follows
   > 1. Update the version number
 ---
-notes/checklist.md  score=0.751
+notes/checklist.md  score=0.751  chunks=1
   > Pre-release checklist
 ---
 2 doc hits (showing 20 max)
