@@ -11,7 +11,8 @@
 //! becomes painful, point `--config-dir` at a stable path manually.
 //!
 //! The smoke covers: `init` → `collection add` → write 1 markdown file
-//! → `update-all` → assert exit 0 and the documented stdout summary.
+//! → `update-all` → assert exit 0, the status line printed on a
+//! non-terminal stderr, and the documented stderr summary.
 
 use std::fs;
 
@@ -57,6 +58,10 @@ fn update_all_indexes_one_markdown_file_end_to_end() {
         .arg("update-all")
         .assert()
         .success()
+        // `assert_cmd` captures stderr through a pipe, so progress comes
+        // as status lines instead of bars; the first one names the
+        // collection.
+        .stderr(predicate::str::contains("Indexing 'notes': 0/1 files"))
         // The completion summary is a status notice on stderr; stdout
         // stays empty for `update-all` (it has no piped artifact).
         .stderr(predicate::str::contains("Indexed 1 documents"))

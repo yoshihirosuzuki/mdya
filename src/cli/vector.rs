@@ -26,8 +26,7 @@ use crate::ingest::{IngestError, IngestProgress, UpdateSummary, update_all_colle
 use crate::store::metadata_check::METADATA_KEY_EMBEDDING_MODEL;
 use crate::store::{self, CHUNKS_TABLE_NAME, chunks_schema, chunks_schema_has_source_ranges};
 
-use super::log_writer;
-use super::update_all::{IndicatifProgress, expand_collection_paths, resolve_embed_parallelism};
+use super::update_all::{expand_collection_paths, ingest_progress, resolve_embed_parallelism};
 
 #[derive(Debug, Error)]
 pub enum VectorUseError {
@@ -179,9 +178,7 @@ pub(crate) async fn run(
     // notice, so it goes to stderr alongside the no-op / abort notices
     // above (stdout stays empty), mirroring `mdya update-all`.
     let parallelism = resolve_embed_parallelism(&cfg.runtime);
-    let indicatif = IndicatifProgress::with_parallelism(parallelism);
-    let progress_guard = log_writer::register(indicatif.multiprogress());
-    let progress: Arc<dyn IngestProgress> = Arc::new(indicatif);
+    let (progress, progress_guard) = ingest_progress(parallelism);
     let summary = switch_model(&base, cfg, embedder, progress, parallelism).await?;
     drop(progress_guard);
     eprintln!("{}", format_switch_summary(action, model, &summary));

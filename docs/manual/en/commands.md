@@ -112,7 +112,8 @@ mdya update-all
 - Symbolic links under a collection root are not followed (see [`collections` in configuration.md](configuration.md#collections)).
 - Paths excluded by `.gitignore` are not indexed when the collection root is inside a git repository (see [`collections` in configuration.md](configuration.md#collections)).
 - Parallelism is controlled by `runtime.embed_parallelism`.
-- Progress is shown as a progress bar on stderr, and a one-line summary is written to stdout at the end.
+- Progress is shown on stderr, in a form that depends on whether a progress bar can be shown there (see [Progress display](#progress-display)).
+- At the end, a one-line summary is written to stderr. Nothing is written to stdout.
 
 ```
 Indexed 43 documents (new: 5, updated: 3, skipped: 34, removed: 0, failed: 1).
@@ -127,6 +128,18 @@ What each counter means:
 - `failed` — files that failed to ingest
 
 When `failed > 0`, the command exits with `1` (the summary is still printed).
+
+### Progress display
+
+When a progress bar can be shown on stderr, it is shown along with one line per file in progress. Once a file's chunks are being embedded, its line shows the chunks done and the total after the file name. After every file is processed, `Updating search indexes` is shown while the search indexes are updated.
+
+When a progress bar cannot be shown, the state at that moment is printed as one line when indexing starts and then every 10 seconds. That is the case when stderr is not a terminal (redirected to a file, piped, a CI log, and so on), and when the `TERM` environment variable is `dumb` (or, outside Windows, unset).
+
+```
+Indexing 'notes': 12/340 files; in progress: docs/big.pdf (320/12000 chunks), memo.md
+```
+
+The file counts are for the collection being processed and start from 0 for each collection. `in progress:` lists the files being processed, with the chunk progress of each file whose chunks are being embedded. While the search indexes are updated after every file is processed, the status line reads `Updating search indexes`.
 
 ---
 
@@ -319,7 +332,7 @@ mdya vector use <model> [--yes]
 
 1. Rewrites `embedding.model` in `config.yml` to the new model.
 2. Drops the vector table inside the index.
-3. Walks every registered collection and re-embeds documents with the new model (same walk as `update-all`, so `.gitignore` exclusions apply).
+3. Walks every registered collection and re-embeds documents with the new model (same walk as `update-all`, so `.gitignore` exclusions apply). Progress is shown the same way as for `update-all` (see [Progress display](#progress-display)).
 
 The document index (the source text returned by `mdya get`) is model-independent and stays in place. Only the vector portion is recomputed.
 
@@ -337,6 +350,8 @@ Proceed? [y/N]:
 For scripts and other non-interactive stdin contexts, pass `--yes`. Running without `--yes` on a non-interactive stdin is rejected for safety.
 
 ### Completion summary
+
+At the end, a line like the following is written to stderr. Nothing is written to stdout.
 
 ```
 Switched embedding model to 'ollama:nomic-embed-text'. Re-embedded 312 document(s) (removed: 0, failed: 0).

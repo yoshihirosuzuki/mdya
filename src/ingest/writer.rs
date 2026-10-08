@@ -55,13 +55,13 @@ use super::orphan::compute_orphans;
 use super::progress::{FileOutcome, IngestProgress};
 use super::walker::collect_ingestable_files;
 
-/// Max chunks passed to `Embedder::embed_passages` in one call (grill
-/// Q6). Worst-case activation ≈ 1.5 GB which fits well inside the
+/// Max chunks passed to `Embedder::embed_passages` in one call.
+/// Worst-case activation ≈ 1.5 GB which fits well inside the
 /// 8192 MB default `runtime.memory_limit_mb`.
 ///
-/// `pub(crate)` keeps this an implementation detail — the snapshot
-/// pinned "embed batch size の config 化 — 内部 const のまま" and
-/// nothing outside the crate has reason to read it.
+/// `pub(crate)` keeps this an implementation detail — the batch size
+/// is deliberately not a setting, and nothing outside the crate has
+/// reason to read it.
 pub(crate) const EMBED_BATCH_SIZE: usize = 32;
 
 /// Counters returned by `update_all_collections`. `new + updated +
@@ -138,6 +138,7 @@ pub async fn update_all_collections(
         )
         .await?;
     }
+    progress.start_index_maintenance();
     maintain_indices(&tables.chunks).await?;
     progress.finish();
     Ok(summary)
@@ -287,7 +288,7 @@ async fn update_one_collection(
     // a re-ingest instead of being silently skipped.
     let source_hashes = load_existing_source_hashes(&tables.sources, name).await?;
     remove_orphans(tables, name, &fs_paths, &db_index, &source_hashes, summary).await?;
-    progress.set_total_files(fs_paths_vec.len());
+    progress.start_collection(name, fs_paths_vec.len());
     // `runtime.embed_parallelism` lets users bound candle's forward peak,
     // which saturates memory in practice. `parallelism == 0` keeps the
     // sequential path as a disable sentinel.
@@ -356,6 +357,7 @@ async fn run_files_sequentially(
             source_hashes.get(rel_path).map(String::as_str),
             tables,
             Arc::clone(embedder),
+            progress,
         )
         .await
         .unwrap_or_else(|e| {
@@ -421,6 +423,7 @@ async fn run_files_in_parallel(
                 source_hash.as_deref(),
                 &tables,
                 embedder,
+                &progress,
             )
             .await
             .unwrap_or_else(|e| {
@@ -572,6 +575,7 @@ async fn remove_orphans(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_file(
     collection: &str,
     root: &Path,
@@ -580,6 +584,7 @@ async fn process_file(
     sources_hash: Option<&str>,
     tables: &Tables,
     embedder: Arc<dyn Embedder>,
+    progress: &Arc<dyn IngestProgress>,
 ) -> Result<FileOutcome, IngestError> {
     // The walker (`collect_ingestable_files`) only emits paths that
     // `FileFormat::from_path` recognises, so this `expect` is unreachable
@@ -651,6 +656,7 @@ async fn process_file(
                 &source_hash,
                 &tables.chunks,
                 embedder,
+                progress,
             )
             .await?;
             Ok(FileOutcome::Updated)
@@ -665,6 +671,7 @@ async fn process_file(
                 &source_hash,
                 &tables.chunks,
                 embedder,
+                progress,
             )
             .await?;
             Ok(FileOutcome::New)
@@ -765,6 +772,7 @@ async fn chunk_embed_and_upsert(
     source_hash: &str,
     table: &Table,
     embedder: Arc<dyn Embedder>,
+    progress: &Arc<dyn IngestProgress>,
 ) -> Result<(), IngestError> {
     let chunks = format.chunk(content)?;
     debug_assert!(
@@ -778,16 +786,22 @@ async fn chunk_embed_and_upsert(
         sql_escape(collection),
         sql_escape(&path_str),
     );
+    let total = chunks.len();
+    progress.chunks_embedded(rel_path, 0, total);
     // Offload the candle forward pass to tokio's blocking worker pool
     // so the async runtime threads stay free for `Table::add` / other
-    // files' I/O. `embedder` (Arc) and `chunks` (Vec clone) move into
-    // the closure; the original `chunks` is reused below for
-    // `build_record_batch`.
+    // files' I/O. `embedder` / `progress` (Arcs), `chunks` (Vec clone)
+    // and the path move into the closure; the original `chunks` is
+    // reused below for `build_record_batch`.
     let vectors = {
         let embedder_for_embed = Arc::clone(&embedder);
         let chunks_for_embed = chunks.clone();
+        let progress = Arc::clone(progress);
+        let path = rel_path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            embed_chunks_in_batches(&*embedder_for_embed, &chunks_for_embed)
+            embed_chunks_in_batches(&*embedder_for_embed, &chunks_for_embed, |done| {
+                progress.chunks_embedded(&path, done, total);
+            })
         })
         .await
         .map_err(IngestError::EmbedJoin)??
@@ -826,11 +840,16 @@ async fn chunk_embed_and_upsert(
     Ok(())
 }
 
+/// Embed `chunks` `EMBED_BATCH_SIZE` at a time, calling `on_batch` with
+/// the number of chunks done after each batch. The count includes the
+/// placeholder, so it always ends at `chunks.len()`.
 fn embed_chunks_in_batches(
     embedder: &dyn Embedder,
     chunks: &[Chunk],
+    mut on_batch: impl FnMut(usize),
 ) -> Result<Vec<Vec<f32>>, IngestError> {
     let mut all = Vec::with_capacity(chunks.len());
+    let mut done = 0;
     for batch in chunks.chunks(EMBED_BATCH_SIZE) {
         // Skip placeholder chunks (empty body) — they get a null
         // embedding, not an embedded empty string, so they stay out of
@@ -840,11 +859,11 @@ fn embed_chunks_in_batches(
             .filter(|c| !c.body.is_empty())
             .map(|c| c.body.as_str())
             .collect();
-        if texts.is_empty() {
-            continue;
+        if !texts.is_empty() {
+            all.extend(embedder.embed_passages(&texts)?);
         }
-        let vectors = embedder.embed_passages(&texts)?;
-        all.extend(vectors);
+        done += batch.len();
+        on_batch(done);
     }
     Ok(all)
 }
@@ -1193,6 +1212,58 @@ mod tests {
         let p = Path::new("/etc/shadow");
         let err = ensure_under_root(p).unwrap_err();
         assert!(matches!(err, IngestError::PathTraversal { .. }));
+    }
+
+    /// Embeds every passage as a one-dimensional zero vector.
+    struct ZeroEmbedder;
+
+    impl Embedder for ZeroEmbedder {
+        fn model_id(&self) -> &str {
+            "zero"
+        }
+        fn dim(&self) -> usize {
+            1
+        }
+        fn embed_queries(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+            Ok(vec![vec![0.0]; texts.len()])
+        }
+        fn embed_passages(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+            Ok(vec![vec![0.0]; texts.len()])
+        }
+    }
+
+    fn chunk_with_body(body: &str) -> Chunk {
+        Chunk {
+            body: body.to_string(),
+            source_range: 0..0,
+        }
+    }
+
+    #[test]
+    fn embed_chunks_in_batches_reports_the_chunks_done_after_each_batch() {
+        let total = 2 * EMBED_BATCH_SIZE + 6;
+        let chunks: Vec<Chunk> = (0..total).map(|_| chunk_with_body("text")).collect();
+        let mut reported = Vec::new();
+        let vectors =
+            embed_chunks_in_batches(&ZeroEmbedder, &chunks, |done| reported.push(done)).unwrap();
+        assert_eq!(reported, [EMBED_BATCH_SIZE, 2 * EMBED_BATCH_SIZE, total]);
+        assert_eq!(vectors.len(), total);
+    }
+
+    #[test]
+    fn embed_chunks_in_batches_counts_a_batch_that_holds_only_the_placeholder() {
+        let chunks = [chunk_with_body("")];
+        let mut reported = Vec::new();
+        let vectors =
+            embed_chunks_in_batches(&ZeroEmbedder, &chunks, |done| reported.push(done)).unwrap();
+        assert_eq!(reported, [1]);
+        assert!(vectors.is_empty(), "the placeholder is not embedded");
     }
 
     #[test]
