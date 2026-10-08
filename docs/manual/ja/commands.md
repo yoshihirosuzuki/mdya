@@ -112,7 +112,8 @@ mdya update-all
 - コレクションルート配下のシンボリックリンクは辿りません ([configuration.md の `collections`](configuration.md#collections) 参照)。
 - コレクションルートが git リポジトリ内にある場合、`.gitignore` で除外されるパスは索引化しません ([configuration.md の `collections`](configuration.md#collections) 参照)。
 - 並列度は `runtime.embed_parallelism` で調整します。
-- 進捗は stderr にプログレスバーで表示され、最後に stdout へサマリ 1 行を出します。
+- 進捗は stderr に表示します。表示のしかたは、stderr にプログレスバーを表示できるかどうかで変わります ([進捗の表示](#進捗の表示) 参照)。
+- 終わると stderr にサマリを 1 行出します。stdout には何も出しません。
 
 ```
 Indexed 43 documents (new: 5, updated: 3, skipped: 34, removed: 0, failed: 1).
@@ -127,6 +128,18 @@ Indexed 43 documents (new: 5, updated: 3, skipped: 34, removed: 0, failed: 1).
 - `failed` — 取り込みに失敗したファイル数
 
 `failed > 0` の場合は終了コード `1` を返します (サマリは表示されます)。
+
+### 進捗の表示
+
+stderr にプログレスバーを表示できるときは、プログレスバーと、処理中のファイルを 1 つずつ 1 行で表示します。埋め込み計算に入ったファイルは、ファイル名の後に「済んだチャンク数/総数」を表示します。全ファイルを処理した後、検索用の索引を更新している間は `Updating search indexes` と表示します。
+
+プログレスバーを表示できないときは、取り込みを始めたときと、その後 10 秒ごとに、その時点の状態を 1 行で出します。表示できないのは、stderr が端末でないとき (ファイルへのリダイレクト、パイプ、CI のログなど) と、環境変数 `TERM` が `dumb` のとき (Windows 以外では未設定のときも) です。
+
+```
+Indexing 'notes': 12/340 files; in progress: docs/big.pdf (320/12000 chunks), memo.md
+```
+
+ファイル数は処理中のコレクションのもので、コレクションごとに 0 から数えます。`in progress:` の後には処理中のファイルを並べ、埋め込み計算に入ったファイルにはチャンクの進みを添えます。全ファイルを処理した後、検索用の索引を更新している間は、状態の行が `Updating search indexes` になります。
 
 ---
 
@@ -319,7 +332,7 @@ mdya vector use <model> [--yes]
 
 1. `config.yml` の `embedding.model` を新しいモデルに書き換え
 2. 索引内のベクトルテーブルを削除
-3. 登録済みコレクションを全部スキャンし、新しいモデルで再度埋め込み計算 (`update-all` と同じ走査なので、`.gitignore` の除外が効きます)
+3. 登録済みコレクションを全部スキャンし、新しいモデルで再度埋め込み計算 (`update-all` と同じ走査なので、`.gitignore` の除外が効きます)。進捗は `update-all` と同じように表示します ([進捗の表示](#進捗の表示) 参照)
 
 文書本文の索引 (`mdya get` で取れる原文) はモデル非依存なので残ります。再計算が走るのはベクトル部分だけです。
 
@@ -337,6 +350,8 @@ Proceed? [y/N]:
 スクリプトなど非対話 stdin で実行する場合は `--yes` を付けてください。`--yes` なしの非対話実行は安全のため拒否します。
 
 ### 完了サマリ
+
+終わると stderr に次のような 1 行を出します。stdout には何も出しません。
 
 ```
 Switched embedding model to 'ollama:nomic-embed-text'. Re-embedded 312 document(s) (removed: 0, failed: 0).

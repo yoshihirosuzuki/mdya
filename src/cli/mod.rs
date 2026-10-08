@@ -6,6 +6,7 @@ mod collection;
 mod dim;
 mod get;
 mod init;
+mod line_progress;
 mod log_writer;
 mod search;
 mod status;

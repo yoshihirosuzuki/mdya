@@ -19,7 +19,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use arrow_array::cast::AsArray;
@@ -30,7 +30,9 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use tempfile::TempDir;
 
 use mdya::embedding::{EmbedError, Embedder};
-use mdya::ingest::{IngestError, NullProgress, update_all_collections};
+use mdya::ingest::{
+    FileOutcome, IngestError, IngestProgress, NullProgress, update_all_collections,
+};
 use mdya::store::lance_lm::lance_models_dir;
 use mdya::store::{CHUNKS_TABLE_NAME, SOURCES_TABLE_NAME, chunks_schema, sources_schema};
 
@@ -643,5 +645,110 @@ async fn shrinking_a_file_removes_stale_chunks_via_merge_insert() -> Result<()> 
         1,
         "shrinking to 1 section must leave exactly 1 row (stale higher-sequence rows must be deleted)"
     );
+    Ok(())
+}
+
+/// Records every progress call as one string, in call order.
+#[derive(Default)]
+struct RecordingProgress(Mutex<Vec<String>>);
+
+impl RecordingProgress {
+    fn record(&self, call: String) {
+        self.0.lock().expect("calls mutex poisoned").push(call);
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.0.lock().expect("calls mutex poisoned").clone()
+    }
+}
+
+impl IngestProgress for RecordingProgress {
+    fn start_collection(&self, name: &str, total_files: usize) {
+        self.record(format!("collection {name} {total_files}"));
+    }
+    fn start_file(&self, path: &Path) {
+        self.record(format!("start {}", path.display()));
+    }
+    fn chunks_embedded(&self, path: &Path, done: usize, total: usize) {
+        self.record(format!("chunks {} {done}/{total}", path.display()));
+    }
+    fn finish_file(&self, path: &Path, outcome: FileOutcome) {
+        self.record(format!("finish {} {outcome:?}", path.display()));
+    }
+    fn start_index_maintenance(&self) {
+        self.record("index".to_string());
+    }
+    fn finish(&self) {
+        self.record("finish".to_string());
+    }
+}
+
+/// The run reports each collection with its file count, each file's
+/// chunks as they are embedded — from 0 up to the total, batch by batch,
+/// and for an empty file its one placeholder chunk — then the index
+/// update and the end.
+#[tokio::test]
+async fn ingest_reports_progress_per_collection_file_and_embedding_batch() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let big_dir = tmp.path().join("big");
+    let empty_dir = tmp.path().join("empty");
+    let sections: String = (0..40)
+        .map(|i| format!("# Section {i}\n\nBody of section {i}.\n\n"))
+        .collect();
+    write_md(&big_dir, "big.md", &sections);
+    write_md(&empty_dir, "empty.md", "");
+    let mut collections = collections_with("a", big_dir);
+    collections.insert("b".to_string(), empty_dir);
+    let progress = Arc::new(RecordingProgress::default());
+
+    update_all_collections(
+        &collections,
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::clone(&progress) as Arc<dyn IngestProgress>,
+        0,
+    )
+    .await?;
+
+    let total = count_chunks(&base, Some("path = 'big.md'")).await?;
+    assert_eq!(total, 40, "one chunk per section");
+    let calls = progress.calls();
+    let big_done: Vec<usize> = calls
+        .iter()
+        .filter_map(|call| call.strip_prefix("chunks big.md "))
+        .map(|report| {
+            let (done, reported_total) = report.split_once('/').expect("done/total");
+            assert_eq!(reported_total, total.to_string());
+            done.parse().expect("done is a number")
+        })
+        .collect();
+    assert!(
+        big_done.len() >= 3 && big_done.first() == Some(&0) && big_done.last() == Some(&total),
+        "expected 0, one report per batch, ending at {total}: {big_done:?}"
+    );
+    assert!(big_done.windows(2).all(|w| w[0] < w[1]), "{big_done:?}");
+    let mut expected = vec!["collection a 1".to_string(), "start big.md".to_string()];
+    expected.extend(
+        big_done
+            .iter()
+            .map(|done| format!("chunks big.md {done}/{total}")),
+    );
+    expected.extend(
+        [
+            "finish big.md New",
+            "collection b 1",
+            "start empty.md",
+            "chunks empty.md 0/1",
+            "chunks empty.md 1/1",
+            "finish empty.md New",
+            "index",
+            "finish",
+        ]
+        .map(String::from),
+    );
+    assert_eq!(calls, expected);
     Ok(())
 }

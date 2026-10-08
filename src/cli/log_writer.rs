@@ -1,12 +1,14 @@
 //! A stderr writer for `tracing` that yields to an active progress bar.
 //!
 //! `mdya update-all` / `mdya vector use` render an `indicatif`
-//! `MultiProgress` on stderr. `indicatif` only keeps its bars intact for
-//! writes routed through the same `MultiProgress`; a raw `tracing` line
-//! emitted mid-redraw corrupts them. While such a bar is live, the
-//! command registers it here and the fmt layer's writer suspends it
-//! around each event, so diagnostics print cleanly above the bar. With
-//! no bar registered (every other command) writes go straight to stderr.
+//! `MultiProgress` on stderr when it can be drawn there. `indicatif` only
+//! keeps its bars intact for writes routed through the same
+//! `MultiProgress`; a raw `tracing` line emitted mid-redraw corrupts them.
+//! While such a bar is live, the command registers it here and the fmt
+//! layer's writer suspends it around each event, so diagnostics print
+//! cleanly above the bar. With no bar registered (every other command,
+//! and an ingest run printing status lines instead) writes go straight
+//! to stderr.
 
 use std::io::{self, Write};
 use std::sync::{Mutex, OnceLock};

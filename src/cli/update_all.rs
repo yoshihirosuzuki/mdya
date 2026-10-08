@@ -1,19 +1,20 @@
 //! `mdya update-all` subcommand.
 //!
 //! Wires the config layer, the embedder, the ingest backend, and the
-//! `indicatif`-based progress UI together. Backend logic lives in
-//! `crate::ingest`; this module is the CLI-side coordinator + UI.
+//! progress UI together. Backend logic lives in `crate::ingest`; this
+//! module is the CLI-side coordinator + UI.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use thiserror::Error;
 use tracing::warn;
 
-use super::log_writer;
+use super::line_progress::{INDEX_MAINTENANCE_MESSAGE, LineProgress};
+use super::log_writer::{self, ProgressGuard};
 use crate::config;
 use crate::embedding::{EmbedError, Embedder, ModelCache, ModelCacheError, build_embedder};
 use crate::ingest::{
@@ -32,11 +33,7 @@ pub async fn run(
     let parallelism = resolve_embed_parallelism(&cfg.runtime);
     let embedder: Arc<dyn Embedder> =
         build_embedder(&cfg.embedding.model, &cfg.embedding.ollama.endpoint, &cache).await?;
-    let indicatif = IndicatifProgress::with_parallelism(parallelism);
-    // Suspend the bars around tracing output for the duration of the run
-    // so file-level `warn!`s print above the bar instead of corrupting it.
-    let progress_guard = log_writer::register(indicatif.multiprogress());
-    let progress: Arc<dyn IngestProgress> = Arc::new(indicatif);
+    let (progress, progress_guard) = ingest_progress(parallelism);
     let summary =
         update_all_collections(&collections, &base, embedder, progress, parallelism).await?;
     drop(progress_guard);
@@ -47,6 +44,25 @@ pub async fn run(
         return Err(UpdateAllError::FilesFailed(summary.failed));
     }
     Ok(())
+}
+
+/// The progress display for an ingest run: bars where `indicatif` can
+/// draw them on stderr, status lines otherwise. Shared with `cli::vector`.
+/// Hold the guard until the run ends: while bars are drawn it suspends
+/// them around each log line, so file-level `warn!`s print above the bars
+/// instead of corrupting them.
+pub(crate) fn ingest_progress(
+    parallelism: usize,
+) -> (Arc<dyn IngestProgress>, Option<ProgressGuard>) {
+    // Ask `indicatif` itself rather than `is_terminal`: it also hides the
+    // bars on a terminal whose `TERM` is `dumb` (or, outside Windows,
+    // unset).
+    if ProgressDrawTarget::stderr().is_hidden() {
+        return (Arc::new(LineProgress::stderr()), None);
+    }
+    let bars = IndicatifProgress::with_parallelism(parallelism);
+    let guard = log_writer::register(bars.multiprogress());
+    (Arc::new(bars), Some(guard))
 }
 
 /// Resolve the effective `embed_parallelism` for an ingest run,
@@ -103,7 +119,9 @@ fn format_summary(s: &UpdateSummary) -> String {
 /// via [`log_writer::register`] so the tracing fmt layer suspends the
 /// bars around each event — diagnostics print above the bar instead of
 /// corrupting it. `indicatif` hides the bars entirely on a non-TTY
-/// stderr (e.g. CI / piped output).
+/// stderr (e.g. CI / piped output) and when `TERM` is `dumb` (or,
+/// outside Windows, unset); [`ingest_progress`] uses `LineProgress`
+/// there instead.
 pub struct IndicatifProgress {
     /// File-completion counter; `inc(1)` per `finish_file` call.
     bar: ProgressBar,
@@ -172,8 +190,11 @@ impl Default for IndicatifProgress {
 }
 
 impl IngestProgress for IndicatifProgress {
-    fn set_total_files(&self, total: usize) {
-        self.bar.set_length(total as u64);
+    fn start_collection(&self, _name: &str, total_files: usize) {
+        // `reset` puts the position back to 0 (and restarts the ETA), so
+        // each collection counts its own files against its own total.
+        self.bar.reset();
+        self.bar.set_length(total_files as u64);
     }
 
     fn start_file(&self, path: &Path) {
@@ -202,6 +223,19 @@ impl IngestProgress for IndicatifProgress {
         self.spinners[idx].set_message(path.display().to_string());
     }
 
+    fn chunks_embedded(&self, path: &Path, done: usize, total: usize) {
+        // Same lock-order discipline as `start_file`: release slots
+        // before touching indicatif's internal Mutex. A path with no
+        // slot was already reported by `start_file`.
+        let idx = {
+            let slots = self.slots.lock().expect("slots mutex poisoned");
+            slots.iter().position(|s| s.as_deref() == Some(path))
+        };
+        if let Some(idx) = idx {
+            self.spinners[idx].set_message(format!("{} {done}/{total}", path.display()));
+        }
+    }
+
     fn finish_file(&self, path: &Path, _outcome: FileOutcome) {
         // Same lock-order discipline as `start_file`: release slots
         // before touching indicatif's internal Mutex.
@@ -226,6 +260,11 @@ impl IngestProgress for IndicatifProgress {
         // Tick unconditionally so the total count stays accurate even
         // when the slot was missing (pool overflow path or caller bug).
         self.bar.inc(1);
+    }
+
+    fn start_index_maintenance(&self) {
+        // Every file is done by now, so every spinner is free.
+        self.spinners[0].set_message(INDEX_MAINTENANCE_MESSAGE);
     }
 
     fn finish(&self) {
@@ -298,14 +337,14 @@ mod tests {
         // `IndicatifProgress::new` must not panic — the templates are
         // hard-coded so any future typo trips this immediately.
         let p = IndicatifProgress::new();
-        p.set_total_files(0);
+        p.start_collection("notes", 0);
         p.finish();
     }
 
     #[test]
     fn indicatif_progress_writes_path_into_spinner_message() {
         let p = IndicatifProgress::new();
-        p.set_total_files(1);
+        p.start_collection("notes", 1);
         p.start_file(Path::new("notes/foo.md"));
         // Single-spinner mode collapses to `spinners[0]`.
         assert!(p.spinners[0].message().contains("foo.md"));
@@ -369,9 +408,42 @@ mod tests {
         // `finish_file` called without a paired `start_file` must still
         // tick the bar so the completion count stays accurate.
         let p = IndicatifProgress::with_parallelism(1);
-        p.set_total_files(1);
+        p.start_collection("notes", 1);
         p.finish_file(Path::new("ghost.md"), FileOutcome::Failed);
         assert_eq!(p.bar.position(), 1, "bar must tick even on no-match");
+        p.finish();
+    }
+
+    #[test]
+    fn indicatif_progress_restarts_the_file_count_for_each_collection() {
+        let p = IndicatifProgress::new();
+        p.start_collection("first", 2);
+        for path in ["a.md", "b.md"] {
+            p.start_file(Path::new(path));
+            p.finish_file(Path::new(path), FileOutcome::New);
+        }
+        p.start_collection("second", 3);
+        assert_eq!(p.bar.position(), 0);
+        assert_eq!(p.bar.length(), Some(3));
+        p.finish();
+    }
+
+    #[test]
+    fn indicatif_progress_shows_the_chunks_embedded_after_the_path() {
+        let p = IndicatifProgress::with_parallelism(2);
+        p.start_file(Path::new("a.md"));
+        p.start_file(Path::new("big.md"));
+        p.chunks_embedded(Path::new("big.md"), 32, 70);
+        assert_eq!(p.spinners[0].message(), "a.md");
+        assert_eq!(p.spinners[1].message(), "big.md 32/70");
+        p.finish();
+    }
+
+    #[test]
+    fn indicatif_progress_says_when_the_search_indexes_are_updated() {
+        let p = IndicatifProgress::new();
+        p.start_index_maintenance();
+        assert_eq!(p.spinners[0].message(), INDEX_MAINTENANCE_MESSAGE);
         p.finish();
     }
 
