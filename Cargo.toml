@@ -146,11 +146,18 @@ indicatif = "0.18"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # Markdown event-based parser for heading-aware chunking. Default
 # features (getopts / html) are disabled — chunking only needs the parser,
-# not the CLI or HTML escaping. Pure Rust, no `*-sys` / no `cc-rs`. The
-# chunker works around an offset-iterator panic in 0.13.4 (see
-# `offset_parser_would_panic` in src/chunking/markdown.rs); its tests fail
-# when an upgrade changes that behaviour.
-pulldown-cmark = { version = "0.13", default-features = false }
+# not the CLI or HTML escaping. Pure Rust, no `*-sys` / no `cc-rs`.
+# Pinned exactly: the chunker works around an offset-iterator panic in
+# 0.13.4 (https://github.com/pulldown-cmark/pulldown-cmark/issues/1129) by
+# detecting the affected documents up front (`offset_parser_would_panic` in
+# src/chunking/markdown.rs), and the detection relies on how 0.13.4 behaves
+# at the panic site. Its tests fail when an upgrade changes that behaviour,
+# but they only cover builds that use Cargo.lock; the pin keeps a
+# `cargo install mdya` without `--locked` on the version they cover. Run
+# those tests before bumping. A release that no longer panics on their
+# trigger inputs makes them fail by design; then drop the detection and the
+# pin together.
+pulldown-cmark = { version = "=0.13.4", default-features = false }
 # Recursive, `.gitignore`-aware file walker for the ingest pipeline (the
 # walker behind ripgrep). Replaces the direct `walkdir` dependency; walkdir
 # stays in the tree underneath `ignore`. Of its dependencies only `ignore`
