@@ -25,11 +25,22 @@ keywords = ["markdown", "search", "retrieval", "mcp", "local-first"]
 categories = ["command-line-utilities", "text-processing"]
 # Keep the published crate to what a `cargo install mdya` consumer needs.
 # Integration tests (and their fixtures), CI workflows, and repo/dev tooling
-# are not used when building from the crates.io tarball.
+# are not used when building from the crates.io tarball. The archives in
+# `tests/fixtures/archives` stay in, without the script that makes them:
+# the unit tests in `src/ingest/archive/tests.rs` read them, so `cargo test`
+# on the tarball passes. Anything else added under `tests/` is packaged
+# unless it is listed below. That includes an integration test split into
+# `tests/<name>/main.rs`, which fails to build from the tarball if it uses
+# `tests/common`. Check with `cargo package --list`.
 exclude = [
     "/.github",
     "/.cargo",
-    "/tests",
+    "/tests/*.rs",
+    "/tests/common",
+    "/tests/fixtures/pdfs",
+    "/tests/fixtures/tiny_bert",
+    "/tests/fixtures/tiny_modernbert",
+    "/tests/fixtures/archives/generate.py",
     "/dist-workspace.toml",
     "/justfile",
     "/rustfmt.toml",
@@ -52,7 +63,7 @@ clap = { version = "4", features = ["derive", "env"] }
 arrow-array = "58"
 arrow-schema = "58"
 futures = "0.3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "process", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "process", "net", "signal", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 serde = { version = "1", features = ["derive"] }
@@ -166,6 +177,17 @@ pulldown-cmark = { version = "=0.13.4", default-features = false }
 # bstr, log and (Windows only) winapi-util were already present. Pure
 # Rust, no `*-sys` / no `cc-rs`.
 ignore = "0.4"
+# Archive collections: read `.md` / `.markdown` / `.pdf` documents straight
+# out of a `.zip` / `.tar` / `.tar.gz` / `.tgz` registered as a collection.
+# Both crates were already in the lockfile (tar under lindera-ipadic's build
+# script through lindera-dictionary's `build_rs` feature, flate2 under
+# several crates), so no package is added; tar and filetime join the runtime
+# tree. mdya walks tar and zip archives itself: tar only lends its header
+# type, and flate2 decompresses `.tar.gz` and deflated zip entries (its
+# miniz_oxide backend). tar drops its default `xattr` feature, since nothing
+# is extracted to disk. Pure Rust, no `*-sys` / no `cc-rs`.
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
 # Pure Rust PDF text extractor for `.pdf` ingest.
 # Internally pulls lopdf + adobe-cmap-parser + cff-parser + encoding_rs +
 # euclid + postscript + type1-encoding-parser + unicode-normalization + log
@@ -217,6 +239,10 @@ futures = "0.3"
 arrow-array = "58"
 arrow-schema = "58"
 lance-index = "=10.0.0"
+# Builds zip archives in the archive collection tests. Already in the
+# lockfile under candle-core, which requires `^8.6`, so 9.x would add a
+# second copy.
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 
 [profile.release]
 lto = "thin"

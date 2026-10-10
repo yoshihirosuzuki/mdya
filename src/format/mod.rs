@@ -30,7 +30,14 @@ impl FileFormat {
     /// case-insensitive to handle `.MD` / `.PDF` on case-preserving file
     /// systems.
     pub fn from_path(path: &Path) -> Option<Self> {
-        let ext = path.extension()?.to_str()?;
+        Self::from_extension(path.extension()?.to_str()?)
+    }
+
+    /// The format an extension (without the leading dot) belongs to, matched
+    /// case-insensitively. Split out of [`Self::from_path`] for callers that
+    /// hold a name they cannot yet treat as a path, such as an archive entry
+    /// name that has not been decoded.
+    pub fn from_extension(ext: &str) -> Option<Self> {
         if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") {
             return Some(Self::Markdown);
         }

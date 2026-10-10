@@ -64,8 +64,11 @@ pub enum InvalidPathKind {
     #[error("does not exist")]
     NotFound,
 
-    #[error("is not a directory")]
-    NotDirectory,
+    #[error("is neither a directory nor a .zip / .tar / .tar.gz / .tgz archive")]
+    NotDirectoryOrArchive,
+
+    #[error("is an archive, which has no default collection name (use --name to set one)")]
+    ArchiveNeedsName,
 
     #[error("has no usable basename (use --name to set the collection name explicitly)")]
     NoBasename,

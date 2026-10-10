@@ -334,6 +334,36 @@ async fn deleting_a_file_triggers_orphan_cleanup_on_next_ingest() -> Result<()> 
     Ok(())
 }
 
+/// A file whose path holds a control character is not indexed and counts as
+/// failed. Windows does not allow such file names, so this runs elsewhere.
+#[cfg(unix)]
+#[tokio::test]
+async fn files_whose_paths_hold_control_characters_count_as_failed() -> Result<()> {
+    let _env_lock = LANCE_ENV_LOCK.lock().await;
+    let tmp = TempDir::new()?;
+    let base = fresh_config_dir(&tmp).await?;
+    let _lance_home_guard = ScopedLanceLanguageModelHome::set(&lance_models_dir(&base));
+    let coll_dir = tmp.path().join("notes");
+    std::fs::create_dir(&coll_dir)?;
+    write_md(&coll_dir, "a.md", "# A\n\nA body.\n");
+    write_md(&coll_dir, "b\x1b[31m.md", "# B\n\nB body.\n");
+    write_md(&coll_dir, "sub\n/c.md", "# C\n\nC body.\n");
+
+    let summary = update_all_collections(
+        &collections_with("notes", coll_dir.clone()),
+        &base,
+        Arc::new(MockEmbedder::pinned()),
+        Arc::new(NullProgress),
+        0,
+    )
+    .await?;
+
+    assert_eq!(summary.new, 1);
+    assert_eq!(summary.failed, 2);
+    assert_eq!(distinct_paths(&base).await?, vec!["a.md".to_string()]);
+    Ok(())
+}
+
 #[tokio::test]
 async fn schema_metadata_mismatch_returns_error_before_any_write() -> Result<()> {
     // The chunks table's Arrow `Schema::metadata` pins

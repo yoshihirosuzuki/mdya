@@ -35,7 +35,7 @@ pub fn print_human<W: Write>(
     for hit in &resp.hits {
         write_hit_header(writer, hit, use_color)?;
         for line in hit.snippet().lines() {
-            writeln!(writer, "  > {line}")?;
+            writeln!(writer, "  > {}", shown_snippet_line(line))?;
         }
         writeln!(writer, "---")?;
     }
@@ -116,7 +116,7 @@ pub fn print_md<W: Write>(writer: &mut W, resp: &SearchResponse) -> io::Result<(
         writeln!(writer, "- chunk_count: {}", hit.chunk_count())?;
         writeln!(writer)?;
         for line in hit.snippet().lines() {
-            writeln!(writer, "> {line}")?;
+            writeln!(writer, "> {}", shown_snippet_line(line))?;
         }
     }
     Ok(())
@@ -136,16 +136,17 @@ fn write_md_granularity_fields<W: Write>(writer: &mut W, hit: &SearchHit) -> io:
     }
 }
 
-/// Render the response as XML, a lossless 1:1 mirror of the JSON
-/// envelope: every JSON key becomes a child
-/// element (no attributes), so text content only ever needs the three
-/// element-content entities (`&` / `<` / `>`) — `"` / `'` matter only
-/// inside attribute values, which this layout never produces. `score` is
-/// the raw `f32` (machine-faithful, like JSON), not the human-rounded
-/// form. Each `<hit>` carries the granularity-specific element
+/// Render the response as XML, a 1:1 mirror of the JSON envelope: every
+/// JSON key becomes a child element (no attributes), so text content only
+/// ever needs the three element-content entities (`&` / `<` / `>`) — `"` /
+/// `'` matter only inside attribute values, which this layout never
+/// produces. The mirror is lossless except for the characters XML 1.0
+/// cannot carry, which `xml_escape` replaces with U+FFFD. `score` is the
+/// raw `f32` (machine-faithful, like JSON), not the human-rounded form.
+/// Each `<hit>` carries the granularity-specific element
 /// (`<chunk_sequence>` for `SearchHit::Chunk`, `<matched_chunks>` for
-/// `SearchHit::Doc`) in the same position the JSON has the field, so
-/// the two encodings stay byte-aligned modulo the XML markup overhead.
+/// `SearchHit::Doc`) in the same position the JSON has the field, so the
+/// two encodings stay byte-aligned modulo the XML markup overhead.
 pub fn print_xml<W: Write>(writer: &mut W, resp: &SearchResponse) -> io::Result<()> {
     writeln!(writer, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
     writeln!(writer, "<response>")?;
@@ -237,15 +238,59 @@ fn format_collections(collections: &[String]) -> String {
     collections.join(", ")
 }
 
-/// Escape the three XML entities that are mandatory in element content.
-/// `&` MUST be replaced first, otherwise the `&` introduced by `<` → `&lt;`
-/// would itself be re-escaped into `&amp;lt;`. Shared with `introspect::output`
-/// so the `--format xml` escaping has a single tested implementation.
+/// Escape the three XML entities that are mandatory in element content, and
+/// replace each character XML 1.0 cannot carry, not even as a character
+/// reference, with U+FFFD: the control characters below U+0020 other than
+/// tab, newline and carriage return, and U+FFFE / U+FFFF (the spec's `Char`
+/// production). A document can hold such characters, and one left in would
+/// make the whole output malformed. A carriage return is written as `&#xD;`,
+/// since a parser turns a literal one into a newline before parsing.
+/// Working one character at a time, the `&` of `&lt;` is never escaped
+/// again. Shared with `introspect::output` so the `--format xml` escaping
+/// has a single tested implementation.
 pub(crate) fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\r' => escaped.push_str("&#xD;"),
+            c if is_xml_char(c) => escaped.push(c),
+            _ => escaped.push(char::REPLACEMENT_CHARACTER),
+        }
+    }
+    escaped
+}
+
+/// Whether XML 1.0's `Char` production admits `c`. A Rust `char` is never
+/// a surrogate, so the gap at U+D800–U+DFFF needs no arm of its own.
+fn is_xml_char(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n'
+            | '\r'
+            | '\u{20}'..='\u{D7FF}'
+            | '\u{E000}'..='\u{FFFD}'
+            | '\u{10000}'..='\u{10FFFF}'
+    )
+}
+
+/// One snippet line as the human and Markdown formats print it, with each
+/// control character other than tab written as its Rust escape (`\u{1b}`),
+/// so a document cannot move the cursor or recolor the terminal it is
+/// printed to. The machine formats keep the text as it is, XML replacing
+/// only what it cannot carry.
+fn shown_snippet_line(line: &str) -> String {
+    let mut shown = String::with_capacity(line.len());
+    for c in line.chars() {
+        if c.is_control() && c != '\t' {
+            shown.extend(c.escape_default());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
 }
 
 #[cfg(test)]
@@ -586,12 +631,36 @@ second line</snippet>
     #[test]
     fn xml_escape_replaces_the_three_element_content_entities() {
         assert_eq!(xml_escape("a & b < c > d"), "a &amp; b &lt; c &gt; d");
-        // `&` is escaped first, so the `&` inside `&lt;` is not double-escaped.
+        // The `&` of the `&lt;` written for `<` is not escaped again.
         assert_eq!(xml_escape("<tag>"), "&lt;tag&gt;");
-        // Order proof: a literal `&lt;` must become `&amp;lt;`. If `<` were
-        // replaced before `&`, the `&` from the first pass would be re-escaped
-        // and this would wrongly stay `&lt;`.
+        // An entity already in the text is text: its `&` is escaped.
         assert_eq!(xml_escape("a&lt;b"), "a&amp;lt;b");
+    }
+
+    #[test]
+    fn xml_escape_replaces_characters_xml_cannot_carry() {
+        assert_eq!(
+            xml_escape("a\0b\x0cc\x1b[31md\u{fffe}e\u{ffff}"),
+            "a\u{fffd}b\u{fffd}c\u{fffd}[31md\u{fffd}e\u{fffd}"
+        );
+        // Tab and newline are allowed, and so are DEL and the C1 controls,
+        // however unwelcome on a terminal.
+        let allowed = "\t\n\x7f\u{85}\u{9b} あ \u{d7ff}\u{e000}\u{fffd}\u{10000}\u{10ffff}";
+        assert_eq!(xml_escape(allowed), allowed);
+        // A literal carriage return would reach a parser as a newline.
+        assert_eq!(xml_escape("a\r\nb\rc"), "a&#xD;\nb&#xD;c");
+    }
+
+    #[test]
+    fn human_and_md_formats_escape_control_characters_in_snippets_but_keep_tabs() {
+        let resp = single_doc_hit_response("a\x1b[31mb\tc\u{9b}d\x07", 0.5);
+        for s in [
+            render_to_string(|w| print_human(w, &resp, false)),
+            render_to_string(|w| print_md(w, &resp)),
+        ] {
+            assert!(s.contains("a\\u{1b}[31mb\tc\\u{9b}d\\u{7}\n"), "{s}");
+            assert!(!s.contains(['\x1b', '\u{9b}', '\x07']), "{s}");
+        }
     }
 
     #[test]

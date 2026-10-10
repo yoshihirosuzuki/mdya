@@ -26,6 +26,8 @@ What it can do:
 
 `.pdf` files go through the same ingest path as `.md`. They are converted to plain text at ingest time and then chunked and embedded with the same pipeline as Markdown.
 
+A `.zip` / `.tar` / `.tar.gz` / `.tgz` archive can be registered as a collection too. The documents inside it are read without extracting it (see [Registering an archive](docs/manual/en/commands.md#registering-an-archive)).
+
 ## Supported platforms
 
 - macOS (arm64 / x86_64)

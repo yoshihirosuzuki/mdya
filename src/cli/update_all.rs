@@ -40,6 +40,18 @@ pub async fn run(
     // The completion summary is a status notice, not piped data, so it
     // goes to stderr (stdout stays empty for this command).
     eprintln!("{}", format_summary(&summary));
+    summary_result(&summary)
+}
+
+/// What a finished run of `mdya update-all` returns: an error naming the archive
+/// collections that could not be read, else one counting the failed files,
+/// else success. Either error makes `main` exit with 1.
+fn summary_result(summary: &UpdateSummary) -> Result<(), UpdateAllError> {
+    if !summary.unreadable_collections.is_empty() {
+        return Err(UpdateAllError::CollectionsUnreadable(
+            summary.unreadable_collections.join(", "),
+        ));
+    }
     if summary.failed > 0 {
         return Err(UpdateAllError::FilesFailed(summary.failed));
     }
@@ -297,6 +309,15 @@ pub enum UpdateAllError {
     /// path / reason for each failure.
     #[error("{0} file(s) failed during ingest — check warnings above for details")]
     FilesFailed(u64),
+
+    /// At least one archive collection could not be read (missing,
+    /// unreadable, or corrupt part-way). Its documents were left in the
+    /// index as they were; the `warn!` lines above name the archive and
+    /// the reason. Takes precedence over `FilesFailed` for the exit message.
+    #[error(
+        "archive collection(s) could not be read and were left as they were in the index: {0} — check warnings above for details"
+    )]
+    CollectionsUnreadable(String),
 }
 
 #[cfg(test)]
@@ -310,6 +331,7 @@ mod tests {
             skipped,
             removed,
             failed,
+            unreadable_collections: Vec::new(),
         }
     }
 
@@ -462,5 +484,25 @@ mod tests {
         );
         drop(slots);
         p.finish();
+    }
+
+    #[test]
+    fn summary_result_reports_unreadable_collections_before_failed_files() {
+        let mut summary = UpdateSummary {
+            failed: 2,
+            unreadable_collections: vec!["a".to_string(), "b".to_string()],
+            ..UpdateSummary::default()
+        };
+        assert!(matches!(
+            summary_result(&summary),
+            Err(UpdateAllError::CollectionsUnreadable(names)) if names == "a, b"
+        ));
+        summary.unreadable_collections.clear();
+        assert!(matches!(
+            summary_result(&summary),
+            Err(UpdateAllError::FilesFailed(2))
+        ));
+        summary.failed = 0;
+        assert!(summary_result(&summary).is_ok());
     }
 }

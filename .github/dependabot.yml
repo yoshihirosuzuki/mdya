@@ -36,6 +36,12 @@ updates:
       # own. Lift this once lancedb upgrades its arrow and bump arrow by hand.
       - dependency-name: "arrow-*"
         update-types: ["version-update:semver-major"]
+      # zip (a dev-dependency) is held on the major version candle-core
+      # requires (currently 8): a zip major bump would add a second zip to
+      # the tree. Lift this once candle-core moves to a newer zip and bump zip
+      # by hand.
+      - dependency-name: "zip"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /

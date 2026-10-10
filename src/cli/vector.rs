@@ -64,6 +64,15 @@ pub enum VectorUseError {
     /// Mirrors `UpdateAllError::FilesFailed` so `main` propagates exit 1.
     #[error("{0} file(s) failed during re-embed — check warnings above for details")]
     FilesFailed(u64),
+
+    /// At least one archive collection could not be read during the
+    /// re-embed. The switch recreated the `chunks` table, so its documents
+    /// have no chunks (their `sources` rows remain) until `mdya update-all`
+    /// reads the archive again. Takes precedence over `FilesFailed`.
+    #[error(
+        "archive collection(s) could not be read and were not re-embedded: {0} — run `mdya update-all` once the archive can be read; check warnings above for details"
+    )]
+    CollectionsUnreadable(String),
 }
 
 /// What `mdya vector use <target>` should do, given how the config and the
@@ -182,6 +191,18 @@ pub(crate) async fn run(
     let summary = switch_model(&base, cfg, embedder, progress, parallelism).await?;
     drop(progress_guard);
     eprintln!("{}", format_switch_summary(action, model, &summary));
+    summary_result(&summary)
+}
+
+/// What a finished run of `mdya vector use` returns: an error naming the archive
+/// collections that could not be read, else one counting the failed files,
+/// else success. Either error makes `main` exit with 1.
+fn summary_result(summary: &UpdateSummary) -> Result<(), VectorUseError> {
+    if !summary.unreadable_collections.is_empty() {
+        return Err(VectorUseError::CollectionsUnreadable(
+            summary.unreadable_collections.join(", "),
+        ));
+    }
     if summary.failed > 0 {
         return Err(VectorUseError::FilesFailed(summary.failed));
     }
@@ -363,6 +384,7 @@ mod tests {
             skipped: 0,
             removed: 2,
             failed: 1,
+            unreadable_collections: Vec::new(),
         };
         let out = format_switch_summary(UseAction::Switch, "ollama:nomic-embed-text", &s);
         // total = new + updated + skipped + failed = 8; removed is reported
@@ -381,6 +403,7 @@ mod tests {
             skipped: 0,
             removed: 0,
             failed: 0,
+            unreadable_collections: Vec::new(),
         };
         let out = format_switch_summary(UseAction::Rebuild, "cl-nagoya/ruri-v3-30m", &s);
         assert_eq!(
@@ -454,5 +477,25 @@ mod tests {
             decide_use_action("ruri", "ruri", &index(Some("ruri"), false)),
             UseAction::Rebuild
         );
+    }
+
+    #[test]
+    fn summary_result_reports_unreadable_collections_before_failed_files() {
+        let mut summary = UpdateSummary {
+            failed: 2,
+            unreadable_collections: vec!["a".to_string(), "b".to_string()],
+            ..UpdateSummary::default()
+        };
+        assert!(matches!(
+            summary_result(&summary),
+            Err(VectorUseError::CollectionsUnreadable(names)) if names == "a, b"
+        ));
+        summary.unreadable_collections.clear();
+        assert!(matches!(
+            summary_result(&summary),
+            Err(VectorUseError::FilesFailed(2))
+        ));
+        summary.failed = 0;
+        assert!(summary_result(&summary).is_ok());
     }
 }

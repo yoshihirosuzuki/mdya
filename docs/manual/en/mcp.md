@@ -110,7 +110,7 @@ Output:
 ```
 
 - `collection` (required) — collection name (must be declared in `config.yml`).
-- `path` (required) — document path relative to the collection root.
+- `path` (required) — document path relative to the collection root (for an archive collection, the path inside the archive).
 - `chunk` (optional) — a 0-indexed `chunk_sequence`. When given, the original text that chunk covers is returned instead of the full document; omit it for the faithful full document.
 - `chunk_end` (optional) — with `chunk`, return chunks `chunk` through `chunk_end` (inclusive) as one contiguous piece of the original text. Must be `>= chunk`; a value past the last chunk reads to the end of the document.
 

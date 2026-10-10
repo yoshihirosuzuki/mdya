@@ -166,12 +166,15 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum CollectionCommand {
-    /// Add a directory as a collection.
+    /// Add a directory, or a .zip / .tar / .tar.gz / .tgz archive, as a
+    /// collection.
     Add {
-        /// Path to the collection root. Tilde (`~/...`) is expanded.
+        /// Path to the collection root: a directory or an archive. Tilde
+        /// (`~/...`) is expanded.
         path: PathBuf,
 
-        /// Override the collection name. Default: basename of `<path>`.
+        /// Collection name. Default for a directory: basename of `<path>`.
+        /// Required for an archive.
         #[arg(long)]
         name: Option<String>,
 
@@ -220,8 +223,8 @@ pub enum VectorCommand {
 /// Output format for search results, selected via
 /// `--format <human|json|md|xml>`. `human` / `md` are
 /// human-facing and round `score` to 3 decimals; `json` / `xml` are
-/// machine-faithful (raw `f32` score), and `xml` is a lossless 1:1 mirror
-/// of the JSON envelope.
+/// machine-faithful (raw `f32` score), and `xml` is a 1:1 mirror of the
+/// JSON envelope, lossless but for the characters XML 1.0 cannot carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
     Human,
