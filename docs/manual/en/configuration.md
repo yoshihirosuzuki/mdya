@@ -60,7 +60,7 @@ There are four sections.
 
 ### collections
 
-The list of directories registered as search targets.
+The list of directories and archives registered as search targets.
 
 ```yaml
 collections:
@@ -72,14 +72,14 @@ collections:
 ```
 
 - The key (`notes` / `work`) is the collection name. Use it in filters like `mdya search ... -c notes`.
-- `path` (required) is the directory to index. `~/...` is expanded.
+- `path` (required) is the directory or archive (`.zip` / `.tar` / `.tar.gz` / `.tgz`) to index. `~/...` is expanded. For how an archive is read, see [Registering an archive in `commands.md`](commands.md#registering-an-archive).
 - `description` (optional) is a human-readable description. Shown by `mdya collection list`.
 
-The usual way to add a collection is `mdya collection add <path>`, in which case the key is set to the basename of `<path>` (overridable with `--name`).
+The usual way to add a collection is `mdya collection add <path>`. For a directory, the key is set to the basename of `<path>` (overridable with `--name`); for an archive, set the key with `--name`.
 
 `mdya update-all` walks the directory and **does not follow symbolic links under the collection root**. When the root itself is a symbolic link (e.g. `~/notes -> ~/Dropbox/notes`), the root link is followed. If you want to index areas scattered across separate disks, register each one as its own collection.
 
-When a collection root is inside a git repository, `mdya update-all` does not index files and directories that `.gitignore` excludes (rules in `.gitignore` files above the root apply too).
+When a collection root is inside a git repository, `mdya update-all` does not index files and directories that `.gitignore` excludes (rules in `.gitignore` files above the root apply too). No `.gitignore` applies to an archive, whether inside it or around it.
 
 ### embedding
 
@@ -137,6 +137,8 @@ Higher parallelism is faster but proportionally increases memory usage. Worst ca
 - Parallelism `8` × 1.5 GB ≈ 12 GB (may exceed the 8 GB default limit)
 - Parallelism `4` × 1.5 GB ≈ 6 GB
 - `0` (sequential) ≈ 1.5 GB
+
+For an archive collection, up to two documents read ahead (each up to 256 MiB once decompressed) are held on top of the in-flight files, so add up to 512 MiB. An archive with a very large number of documents also needs memory for their names.
 
 If you hit the memory limit and the process exits with `137`, try lowering parallelism first.
 

@@ -9,11 +9,16 @@
 //! The flow is staged into small leaf modules:
 //!
 //! - [`walker`] — list `.md` / `.markdown` files under a collection root
+//! - [`archive`] — list and read the documents of an archive collection
+//! - [`document_path`] — rules every document path follows, and how a
+//!   rejected name is shown
 //! - [`incremental`] — decide skip / touch-mtime / reingest per file
 //! - [`orphan`] — DB-minus-FS set difference for stale chunks
 //! - [`writer`] — orchestration: chunk + embed + LanceDB upsert
 //! - [`progress`] — UI hook trait (interactive CLI plugs in `indicatif`)
 
+pub(crate) mod archive;
+mod document_path;
 pub(crate) mod error;
 mod incremental;
 mod orphan;

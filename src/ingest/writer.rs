@@ -49,6 +49,12 @@ struct Tables {
     sources: Table,
 }
 
+use super::archive::{
+    self, ArchiveDocument, ArchiveKind, ArchiveListing, ArchiveStamp, DocumentReadError,
+};
+use super::document_path::{
+    RejectedDocument, escape_control_characters, reject_control_characters,
+};
 use super::error::IngestError;
 use super::incremental::{Action, DbRow};
 use super::orphan::compute_orphans;
@@ -65,16 +71,24 @@ use super::walker::collect_ingestable_files;
 pub(crate) const EMBED_BATCH_SIZE: usize = 32;
 
 /// Counters returned by `update_all_collections`. `new + updated +
-/// skipped` covers every file the walker visited; `removed` counts
-/// orphan deletes; `failed` counts per-file errors (file-level
-/// failures do not abort the whole run).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// skipped + failed` covers every document the walker or an archive
+/// listing yielded; `removed` counts orphan deletes; `failed` counts
+/// per-document errors (document-level failures do not abort the whole
+/// run).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct UpdateSummary {
     pub new: u64,
     pub updated: u64,
     pub skipped: u64,
     pub removed: u64,
     pub failed: u64,
+    /// Archive collections whose archive could not be read this run
+    /// (missing, unreadable, or corrupt part-way). This run neither
+    /// updates nor removes their documents, and they are not counted in
+    /// the fields above. (A caller that emptied the `chunks` table first,
+    /// as `mdya vector use` does, leaves them without chunks until a later
+    /// run reads the archive.)
+    pub unreadable_collections: Vec<String>,
 }
 
 /// Public entry point used by the `mdya update-all` CLI subcommand and
@@ -127,16 +141,35 @@ pub async fn update_all_collections(
     ensure_source_range_columns(&tables.chunks, embedder.model_id()).await?;
     let mut summary = UpdateSummary::default();
     for (name, root) in collections {
-        update_one_collection(
-            name,
-            root,
-            &tables,
-            Arc::clone(&embedder),
-            Arc::clone(&progress),
-            &mut summary,
-            parallelism,
-        )
-        .await?;
+        let embedder = Arc::clone(&embedder);
+        let progress = Arc::clone(&progress);
+        match archive_kind_of(root) {
+            Some(kind) => {
+                update_archive_collection(
+                    name,
+                    root,
+                    kind,
+                    &tables,
+                    embedder,
+                    progress,
+                    &mut summary,
+                    parallelism,
+                )
+                .await?;
+            }
+            None => {
+                update_one_collection(
+                    name,
+                    root,
+                    &tables,
+                    embedder,
+                    progress,
+                    &mut summary,
+                    parallelism,
+                )
+                .await?;
+            }
+        }
     }
     progress.start_index_maintenance();
     maintain_indices(&tables.chunks).await?;
@@ -280,7 +313,8 @@ async fn update_one_collection(
     parallelism: usize,
 ) -> Result<(), IngestError> {
     info!(collection = %name, root = %root.display(), "ingest start");
-    let fs_paths_vec = collect_ingestable_files(root);
+    let (fs_paths_vec, rejected) = reject_control_characters(collect_ingestable_files(root));
+    record_rejected(name, &rejected, summary);
     let fs_paths: BTreeSet<PathBuf> = fs_paths_vec.iter().cloned().collect();
     let db_index = load_existing_rows(&tables.chunks, name).await?;
     // `sources.source_hash` per path: the comparator the skip gate checks
@@ -325,6 +359,266 @@ async fn update_one_collection(
     Ok(())
 }
 
+/// Log and count as failed the documents left out because of their names.
+/// Leaving their paths out of the collection's path set also drops any
+/// index entry they had, as for a file that is gone.
+fn record_rejected(collection: &str, rejected: &[RejectedDocument], summary: &mut UpdateSummary) {
+    for document in rejected {
+        warn!(
+            collection = %collection,
+            name = %document.name,
+            reason = %document.problem,
+            "ingest file-level failure (continuing)",
+        );
+        summary.failed += 1;
+    }
+}
+
+/// The archive format of a collection root, or `None` to walk it as a
+/// directory. A directory is always a directory, even when named
+/// `notes.zip`; anything else that is not an archive by extension keeps
+/// the directory behaviour too, including a root that no longer exists.
+fn archive_kind_of(root: &Path) -> Option<ArchiveKind> {
+    if root.is_dir() {
+        return None;
+    }
+    ArchiveKind::from_path(root)
+}
+
+/// Process one archive collection: list the archive, drop the documents it
+/// no longer holds, skip the unchanged ones without reading them, and read
+/// the rest in one more pass.
+///
+/// An archive that cannot be listed is recorded in
+/// `summary.unreadable_collections` and its index left as it was, since
+/// treating it as empty — as a missing directory is — would delete every
+/// document a truncated download or a moved file happened to hide.
+#[allow(clippy::too_many_arguments)]
+async fn update_archive_collection(
+    name: &str,
+    archive_path: &Path,
+    kind: ArchiveKind,
+    tables: &Tables,
+    embedder: Arc<dyn Embedder>,
+    progress: Arc<dyn IngestProgress>,
+    summary: &mut UpdateSummary,
+    parallelism: usize,
+) -> Result<(), IngestError> {
+    info!(collection = %name, archive = %archive_path.display(), "ingest start");
+    let listing = match list_archive(archive_path, kind).await {
+        Ok(listed) => listed,
+        Err(reason) => {
+            warn!(
+                collection = %name,
+                archive = %archive_path.display(),
+                error = %reason,
+                "archive could not be read; its documents are left in the index as they were",
+            );
+            summary.unreadable_collections.push(name.to_string());
+            return Ok(());
+        }
+    };
+    let archive_mtime = DateTime::<Utc>::from(listing.stamp.modified());
+    record_rejected(name, &listing.rejected, summary);
+    let paths: BTreeSet<PathBuf> = listing.documents.iter().map(|d| d.path.clone()).collect();
+    let db_index = load_existing_rows(&tables.chunks, name).await?;
+    let source_hashes = load_existing_source_hashes(&tables.sources, name).await?;
+    remove_orphans(tables, name, &paths, &db_index, &source_hashes, summary).await?;
+    progress.start_collection(name, listing.documents.len());
+    let mut to_read: Vec<ArchiveDocument> = Vec::new();
+    for document in listing.documents {
+        let path = document.path.as_path();
+        let unchanged = can_skip_unread(
+            db_index.get(path),
+            source_hashes.get(path).map(String::as_str),
+            archive_mtime,
+        );
+        if unchanged {
+            progress.start_file(path);
+            progress.finish_file(path, FileOutcome::Skipped);
+            record_outcome(summary, FileOutcome::Skipped);
+            continue;
+        }
+        to_read.push(document);
+    }
+    let source = ArchiveToRead {
+        collection: name,
+        path: archive_path,
+        kind,
+        stamp: listing.stamp,
+        mtime: archive_mtime,
+    };
+    read_and_ingest_archive_documents(
+        &source,
+        to_read,
+        tables,
+        &embedder,
+        &progress,
+        &db_index,
+        &source_hashes,
+        summary,
+        parallelism,
+    )
+    .await;
+    Ok(())
+}
+
+/// List an archive's documents off the async runtime.
+async fn list_archive(archive_path: &Path, kind: ArchiveKind) -> Result<ArchiveListing, String> {
+    let path = archive_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        archive::list_documents(&path, kind).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The archive a collection reads its documents from, the stamp it was
+/// listed with, and the mtime every document in it is recorded with (the
+/// stamp's).
+struct ArchiveToRead<'a> {
+    collection: &'a str,
+    path: &'a Path,
+    kind: ArchiveKind,
+    stamp: ArchiveStamp,
+    mtime: DateTime<Utc>,
+}
+
+/// Second pass over an archive: a blocking thread reads `to_read` in archive
+/// order and hands each document over a one-slot channel, so at most two
+/// read documents wait beyond those being processed (one in the slot, one
+/// held by the reader until the slot frees); ingest runs them with the same
+/// parallelism as files on disk (one at a time when it is 0). A
+/// document the reader never delivered — the archive broke or changed
+/// part-way — is counted as failed and keeps its previous index rows.
+#[allow(clippy::too_many_arguments)]
+async fn read_and_ingest_archive_documents(
+    source: &ArchiveToRead<'_>,
+    to_read: Vec<ArchiveDocument>,
+    tables: &Tables,
+    embedder: &Arc<dyn Embedder>,
+    progress: &Arc<dyn IngestProgress>,
+    db_index: &BTreeMap<PathBuf, DbRow>,
+    source_hashes: &BTreeMap<PathBuf, String>,
+    summary: &mut UpdateSummary,
+    parallelism: usize,
+) {
+    if to_read.is_empty() {
+        return;
+    }
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let reader = {
+        let path = source.path.to_path_buf();
+        let kind = source.kind;
+        let stamp = source.stamp;
+        let wanted = to_read.clone();
+        tokio::task::spawn_blocking(move || {
+            archive::read_documents(&path, kind, stamp, &wanted, |document, read| {
+                sender.blocking_send((document.path.clone(), read)).is_ok()
+            })
+        })
+    };
+    let reads = stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|read| (read, receiver))
+    });
+    let ingest = |(path, read): (PathBuf, Result<Vec<u8>, DocumentReadError>)| {
+        let existing = db_index.get(&path);
+        let sources_hash = source_hashes.get(&path).map(String::as_str);
+        ingest_archive_document(
+            source,
+            path,
+            read,
+            existing,
+            sources_hash,
+            tables,
+            Arc::clone(embedder),
+            progress,
+        )
+    };
+    let delivered: Vec<(PathBuf, FileOutcome)> = if parallelism == 0 {
+        reads.then(ingest).collect().await
+    } else {
+        reads
+            .map(ingest)
+            .buffer_unordered(parallelism)
+            .collect()
+            .await
+    };
+    match reader.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(collection = %source.collection, error = %e, "archive read stopped part-way")
+        }
+        Err(e) => warn!(collection = %source.collection, error = %e, "archive reader task failed"),
+    }
+    let delivered_paths: BTreeSet<&Path> = delivered.iter().map(|(p, _)| p.as_path()).collect();
+    for (_, outcome) in &delivered {
+        record_outcome(summary, *outcome);
+    }
+    for document in to_read
+        .iter()
+        .filter(|d| !delivered_paths.contains(d.path.as_path()))
+    {
+        progress.start_file(&document.path);
+        warn!(
+            collection = %source.collection,
+            path = %document.path.display(),
+            "ingest file-level failure (continuing): not read before the archive read stopped",
+        );
+        progress.finish_file(&document.path, FileOutcome::Failed);
+        record_outcome(summary, FileOutcome::Failed);
+    }
+}
+
+/// Ingest one document read out of an archive, reporting progress for it.
+#[allow(clippy::too_many_arguments)]
+async fn ingest_archive_document(
+    source: &ArchiveToRead<'_>,
+    path: PathBuf,
+    read: Result<Vec<u8>, DocumentReadError>,
+    existing: Option<&DbRow>,
+    sources_hash: Option<&str>,
+    tables: &Tables,
+    embedder: Arc<dyn Embedder>,
+    progress: &Arc<dyn IngestProgress>,
+) -> (PathBuf, FileOutcome) {
+    progress.start_file(&path);
+    // The listing only yields paths `FileFormat::from_path` recognises, so
+    // `None` would mean the two extension checks drifted apart; fail the one
+    // document rather than the whole run.
+    let format = FileFormat::from_path(&path)
+        .ok_or_else(|| "path has no extension mdya ingests".to_string());
+    let result = match (read, format) {
+        (Err(e), _) => Err(e.to_string()),
+        (_, Err(e)) => Err(e),
+        (Ok(bytes), Ok(format)) => {
+            let document = DocumentToIngest {
+                collection: source.collection,
+                rel_path: &path,
+                format,
+                mtime: source.mtime,
+                bytes,
+                existing,
+                sources_hash,
+            };
+            ingest_document(document, tables, embedder, progress)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    let outcome = result.unwrap_or_else(|error| {
+        warn!(
+            collection = %source.collection,
+            path = %path.display(),
+            error = %escape_control_characters(&error),
+            "ingest file-level failure (continuing)",
+        );
+        FileOutcome::Failed
+    });
+    progress.finish_file(&path, outcome);
+    (path, outcome)
+}
+
 /// Sequential file processing — runs when `runtime.embed_parallelism = 0`.
 /// Kept as a separate path (rather than `buffer_unordered(1)`) so users
 /// who explicitly disable parallelism get a literal `for` loop with no
@@ -364,7 +658,7 @@ async fn run_files_sequentially(
             warn!(
                 collection = %name,
                 path = %rel_path.display(),
-                error = %e,
+                error = %escape_control_characters(&e.to_string()),
                 "ingest file-level failure (continuing)",
             );
             FileOutcome::Failed
@@ -430,7 +724,7 @@ async fn run_files_in_parallel(
                 warn!(
                     collection = %name,
                     path = %rel_path.display(),
-                    error = %e,
+                    error = %escape_control_characters(&e.to_string()),
                     "ingest file-level failure (continuing)",
                 );
                 FileOutcome::Failed
@@ -600,20 +894,78 @@ async fn process_file(
     ensure_under_root(rel_path)?;
     let absolute = root.join(rel_path);
     let fs_mtime = read_mtime(&absolute)?;
-    // True only when this path has a `chunks` row AND the `sources` row
-    // agrees on `source_hash`. False for a new file (`existing == None`),
-    // where no comparison applies — those always take the write path
-    // below. A `false` for an *existing* file means the two tables
-    // diverged because a previous run was interrupted between their
-    // (non-atomic) commits, and must be repaired.
-    let sources_mirror_chunks =
-        existing.is_some_and(|row| sources_hash == Some(row.source_hash.as_str()));
-    // Fast path: mtime unchanged AND sources mirrors chunks → skip
-    // without reading the file.
-    if existing.is_some_and(|row| row.modified_at == fs_mtime) && sources_mirror_chunks {
+    if can_skip_unread(existing, sources_hash, fs_mtime) {
         return Ok(FileOutcome::Skipped);
     }
-    let (bytes, source_hash) = read_bytes_with_hash(&absolute)?;
+    let bytes = std::fs::read(&absolute)?;
+    ingest_document(
+        DocumentToIngest {
+            collection,
+            rel_path,
+            format,
+            mtime: fs_mtime,
+            bytes,
+            existing,
+            sources_hash,
+        },
+        tables,
+        embedder,
+        progress,
+    )
+    .await
+}
+
+/// True only when this path has a `chunks` row AND the `sources` row
+/// agrees on `source_hash`. False for a new document (`existing == None`),
+/// where no comparison applies — those always take the write path. A
+/// `false` for an *existing* document means the two tables diverged
+/// because a previous run was interrupted between their (non-atomic)
+/// commits, and must be repaired.
+fn sources_mirror_chunks(existing: Option<&DbRow>, sources_hash: Option<&str>) -> bool {
+    existing.is_some_and(|row| sources_hash == Some(row.source_hash.as_str()))
+}
+
+/// Fast path: mtime unchanged AND sources mirrors chunks → the document
+/// can be skipped without reading its bytes.
+fn can_skip_unread(
+    existing: Option<&DbRow>,
+    sources_hash: Option<&str>,
+    mtime: DateTime<Utc>,
+) -> bool {
+    existing.is_some_and(|row| row.modified_at == mtime)
+        && sources_mirror_chunks(existing, sources_hash)
+}
+
+/// One document's bytes, ready for the hash / extract / write stage —
+/// the part of ingest that does not care whether the bytes came from a
+/// file or from an archive entry.
+struct DocumentToIngest<'a> {
+    collection: &'a str,
+    rel_path: &'a Path,
+    format: FileFormat,
+    mtime: DateTime<Utc>,
+    bytes: Vec<u8>,
+    existing: Option<&'a DbRow>,
+    sources_hash: Option<&'a str>,
+}
+
+async fn ingest_document(
+    document: DocumentToIngest<'_>,
+    tables: &Tables,
+    embedder: Arc<dyn Embedder>,
+    progress: &Arc<dyn IngestProgress>,
+) -> Result<FileOutcome, IngestError> {
+    let DocumentToIngest {
+        collection,
+        rel_path,
+        format,
+        mtime: fs_mtime,
+        bytes,
+        existing,
+        sources_hash,
+    } = document;
+    let mirrors = sources_mirror_chunks(existing, sources_hash);
+    let source_hash = sha256_hex(&bytes);
     // `source_hash` is taken over the raw file bytes so the hash semantic
     // stays uniform across formats and an extractor version bump does not
     // silently trigger re-ingest of every PDF — that case is handled by
@@ -630,7 +982,7 @@ async fn process_file(
     // run. This is a separate Lance commit from the chunks write below
     // (no cross-table atomicity), so the source_hash gate above is what
     // makes a half-written pair self-heal on the next run.
-    if content_changed || !sources_mirror_chunks {
+    if content_changed || !mirrors {
         upsert_source(
             &tables.sources,
             collection,
@@ -685,20 +1037,19 @@ fn read_mtime(absolute: &Path) -> Result<DateTime<Utc>, IngestError> {
     Ok(DateTime::<Utc>::from(modified))
 }
 
-/// Read a file as raw bytes and return both the bytes and their SHA-256
-/// hex digest. Hashing happens over raw bytes (not the extracted text)
-/// so the comparator semantic stays uniform across formats.
+/// SHA-256 hex digest of a document's raw bytes. Hashing happens over raw
+/// bytes (not the extracted text) so the comparator semantic stays uniform
+/// across formats.
 ///
-/// UTF-8 decoding is no longer this function's concern: the per-format
+/// UTF-8 decoding is not this function's concern: the per-format
 /// `FileFormat::extract` step decides whether the bytes are Markdown
 /// (strict UTF-8) or PDF (delegated to `pdf-extract`). Format-specific
 /// errors surface via `IngestError::Extract`.
-fn read_bytes_with_hash(absolute: &Path) -> Result<(Vec<u8>, String), IngestError> {
-    let bytes = std::fs::read(absolute)?;
-    let digest = Sha256::digest(&bytes);
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     let hex = to_lower_hex(&digest);
     debug_assert_eq!(hex.len(), 64, "sha256 hex must be 64 chars");
-    Ok((bytes, hex))
+    hex
 }
 
 /// Lowercase hex encoding of raw bytes.
@@ -1135,6 +1486,25 @@ fn sql_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_root_is_an_archive_only_when_it_is_not_a_directory_and_is_named_like_one() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dir_named_like_a_zip = tmp.path().join("notes.zip");
+        std::fs::create_dir(&dir_named_like_a_zip).expect("mkdir");
+        let file = tmp.path().join("export.zip");
+        std::fs::write(&file, b"").expect("write");
+
+        assert_eq!(archive_kind_of(&dir_named_like_a_zip), None);
+        assert_eq!(archive_kind_of(&file), Some(ArchiveKind::Zip));
+        // Missing roots: a missing archive is still an archive (and so
+        // unreadable), a missing directory still walks as an empty one.
+        assert_eq!(
+            archive_kind_of(&tmp.path().join("gone.tgz")),
+            Some(ArchiveKind::TarGz)
+        );
+        assert_eq!(archive_kind_of(&tmp.path().join("gone")), None);
+    }
 
     #[test]
     fn record_outcome_increments_the_matching_counter() {

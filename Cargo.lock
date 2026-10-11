@@ -4853,6 +4853,7 @@ dependencies = [
  "clap",
  "dirs 7.0.0",
  "fd-lock",
+ "flate2",
  "futures",
  "hf-hub",
  "ignore",
@@ -4873,6 +4874,7 @@ dependencies = [
  "sha2 0.11.0",
  "shellexpand",
  "sysinfo",
+ "tar",
  "tempfile",
  "thiserror 2.0.21",
  "tokenizers 0.23.2",
@@ -4880,6 +4882,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]
@@ -8694,6 +8697,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
  "crc32fast",
+ "flate2",
  "indexmap 2.14.0",
  "memchr",
  "typed-path",

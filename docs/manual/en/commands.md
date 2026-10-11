@@ -46,7 +46,7 @@ It is safe to run any number of times. To start over, remove `~/.mdya/` by hand 
 
 ## `mdya collection add <path>`
 
-Registers a directory as a collection.
+Registers a directory, or an archive (`.zip` / `.tar` / `.tar.gz` / `.tgz`), as a collection.
 
 ```sh
 mdya collection add <path> [--name <NAME>] [--description <TEXT>]
@@ -54,8 +54,8 @@ mdya collection add <path> [--name <NAME>] [--description <TEXT>]
 
 | Argument / option | Purpose |
 |---|---|
-| `<path>` (required) | The directory to register. `~/...` is expanded |
-| `--name <NAME>` | Override the collection name (default: basename of `<path>`) |
+| `<path>` (required) | The directory or archive to register. `~/...` is expanded |
+| `--name <NAME>` | The collection name. For a directory it defaults to the basename of `<path>`; for an archive it is required |
 | `--description <TEXT>` | Human-readable description (shown by `mdya collection list`) |
 
 This only appends one entry to the `collections` section of `config.yml`. No indexing happens here. Indexing runs when you call `mdya update-all`.
@@ -65,7 +65,34 @@ Examples:
 ```sh
 mdya collection add ~/notes
 mdya collection add ~/work --name work-docs --description "Work notes"
+mdya collection add ~/Downloads/notion-export.zip --name notion
 ```
+
+### Registering an archive
+
+An archive is not extracted: the `.md` / `.markdown` / `.pdf` documents inside it are read directly. Its format is decided by extension, ignoring case.
+
+- A document's path is its name inside the archive (for example `docs/a.md`). `.` segments (such as a leading `./`) and empty segments are dropped, and `\` separators become `/`. A top-level directory is kept (for example `export/docs/a.md`).
+- When several entries share a path, the later one is used.
+- Only regular files are read; symbolic links, hard links and the like are not. A link's name does not become a document, but when the file it points to is in the archive, that file's content can be found under its own name. Entries where macOS keeps file metadata are not read: anything under a top-level `__MACOSX/`, and files whose file name starts with `._` (for example `docs/._a.md`).
+- GNU tar and bsdtar sparse files (files stored with their all-zero parts left out) are rebuilt into the original file and read.
+- An archive inside the archive (such as a `.zip`) is not opened. It is not a document, so it is skipped without being counted or warned about.
+- No `.gitignore` applies to an archive, whether inside it or around it.
+- These documents are not read and are counted as `failed`:
+  - documents whose name is not valid UTF-8 (written in Shift_JIS, for example), is an absolute path (including one that starts with a drive such as `C:`), or contains `..` or a control character
+  - documents in a zip that are compressed with anything other than deflate or no compression, and encrypted documents
+  - documents larger than 256 MiB once decompressed
+  - sparse files whose layout cannot be used (corrupt, too many fragments and so on)
+- There is no limit on the total size of the documents in an archive. Through compression or sparse files, even a small archive can hold many documents of up to 256 MiB each, which take that much longer to index and make the index that much larger.
+- These archives cannot be read as a whole (see [`mdya update-all`](#mdya-update-all)):
+  - archives that are missing, corrupt or cut short
+  - a `.tar` / `.tar.gz` / `.tgz` that does not end with its end-of-archive marker (two zero-filled blocks)
+  - a zip in which the compressed data of several entries overlaps
+  - archives whose document names add up to more than 256 MiB (each name counts 128 bytes more)
+  - a zip split across several files
+  - a zip with other data in front of it (such as a self-extracting program) whose internal offsets were not adjusted
+- Changes are detected from the archive's own modification time. While the archive is unchanged, the documents in it are `skipped` without being read. A `.tar` / `.tar.gz` / `.tgz` is still read in full on every run to list its contents (and decompressed, for `.tar.gz` / `.tgz`).
+- When the archive is rewritten while it is being read (its modification time or size changes), a warning is printed and nothing read from it mid-rewrite or after is indexed. If this happens while its contents are being listed, the archive cannot be read as a whole. If it happens while its documents are being read, the documents not read yet are counted as `failed` and keep their previous index entries. The next `mdya update-all` reads the archive again.
 
 ---
 
@@ -109,8 +136,10 @@ mdya update-all
 ```
 
 - Files with the `.md`, `.markdown`, or `.pdf` extension are indexed. `.pdf` is converted to plain text at ingest time and flows through the same chunker and embedder as Markdown.
+- An archive collection reads the documents with those extensions inside the archive (see [Registering an archive](#registering-an-archive)).
 - Symbolic links under a collection root are not followed (see [`collections` in configuration.md](configuration.md#collections)).
 - Paths excluded by `.gitignore` are not indexed when the collection root is inside a git repository (see [`collections` in configuration.md](configuration.md#collections)).
+- Files whose path contains a control character (Unicode category Cc: a newline, a tab, ESC and the like) are not read and count as `failed`. The same goes for documents inside an archive.
 - Parallelism is controlled by `runtime.embed_parallelism`.
 - Progress is shown on stderr, in a form that depends on whether a progress bar can be shown there (see [Progress display](#progress-display)).
 - At the end, a one-line summary is written to stderr. Nothing is written to stdout.
@@ -128,6 +157,8 @@ What each counter means:
 - `failed` — files that failed to ingest
 
 When `failed > 0`, the command exits with `1` (the summary is still printed).
+
+When the archive of an archive collection cannot be read (missing, corrupt, truncated, and so on), a warning is printed, that collection's index is left as it was — neither updated nor removed — and the other collections are still updated. The command then also exits with `1`. A directory collection whose directory is missing is treated as empty instead, and its documents are removed from the index. A missing directory whose name ends in an archive extension (a directory named `notes.zip`, for example) is the exception: its index is left as it was, as for a missing archive.
 
 ### Progress display
 
@@ -190,6 +221,8 @@ notes/checklist.md  score=0.751  chunks=1
 2 doc hits (showing 20 max)
 ```
 
+Control characters in snippets, except tabs, are shown escaped, as in `\u{1b}`.
+
 #### `--format json`
 
 A machine-friendly envelope. Feeds into `jq` and similar tools.
@@ -229,11 +262,11 @@ Envelope structure:
 
 #### `--format md`
 
-A Markdown-formatted view suitable for both humans and agents. Multi-line snippets are rendered as blockquotes, which improves readability. Good for pasting into an LLM context.
+A Markdown-formatted view suitable for both humans and agents. Multi-line snippets are rendered as blockquotes, which improves readability. Good for pasting into an LLM context. Control characters in snippets are escaped as in `human`.
 
 #### `--format xml`
 
-XML that mirrors the JSON structure 1:1.
+XML that mirrors the JSON structure 1:1, except that characters XML 1.0 cannot represent (the control characters U+0000–001F other than tab, newline and carriage return, and U+FFFE / U+FFFF) are replaced with U+FFFD.
 
 ### Error behavior
 
@@ -252,7 +285,7 @@ mdya get <collection> <path> [--chunk <N> [--chunk-end <M>]] [-f]
 | Argument | Purpose |
 |---|---|
 | `<collection>` (required) | Collection name (must be declared in `config.yml`) |
-| `<path>` (required) | Path relative to the collection root |
+| `<path>` (required) | Path relative to the collection root (for an archive collection, the path inside the archive) |
 
 | Option | Purpose |
 |---|---|
@@ -358,6 +391,8 @@ Switched embedding model to 'ollama:nomic-embed-text'. Re-embedded 312 document(
 ```
 
 When `failed > 0`, the command exits with `1`. The rest can be resumed by re-running `mdya update-all` normally.
+
+When an archive collection's archive cannot be read, the command also exits with `1`. That collection's documents are not re-embedded, so they no longer show up in search (the original text that `mdya get` returns without `--chunk` is kept). Run `mdya update-all` once the archive can be read again to restore them.
 
 ### When the index format is outdated
 

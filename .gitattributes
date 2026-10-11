@@ -8,3 +8,9 @@
 # inspects them, so `eol=lf` can never rewrite bytes inside them.
 *.safetensors binary
 *.pdf binary
+*.gz binary
+*.tgz binary
+*.tar binary
+*.zip binary
+tests/fixtures/archives/*.head binary
+tests/fixtures/archives/*.tail binary

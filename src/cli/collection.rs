@@ -1,11 +1,12 @@
 //! `mdya collection add <path>` implementation.
 //!
 //! Behavior:
-//! - collection name: basename of the expanded path, overridable by
-//!   `--name`.
-//! - path validation: expand tilde, then assert existence + `is_dir` at
-//!   this command's boundary. The `config.yml` stores the user-typed
-//!   string verbatim so `~/notes` round-trips.
+//! - path validation: expand tilde, then accept a directory, or a regular
+//!   file whose extension is an archive mdya reads (`.zip` / `.tar` /
+//!   `.tar.gz` / `.tgz`), at this command's boundary. The `config.yml`
+//!   stores the user-typed string verbatim so `~/notes` round-trips.
+//! - collection name: `--name`, or else the directory's basename. An
+//!   archive has no default name, so `--name` is required for one.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use thiserror::Error;
 
 use crate::cli::OutputFormat;
 use crate::config::{self, CollectionEntry, ConfigError, InvalidPathKind};
+use crate::ingest::archive::ArchiveKind;
 use crate::introspect::{self, output};
 
 #[derive(Debug, Error)]
@@ -76,13 +78,17 @@ fn validate_collection_path(path_arg: &Path) -> Result<PathBuf, ConfigError> {
             kind: InvalidPathKind::NotFound,
         });
     }
-    if !expanded.is_dir() {
-        return Err(ConfigError::InvalidCollectionPath {
-            path: expanded,
-            kind: InvalidPathKind::NotDirectory,
-        });
+    if expanded.is_dir() || is_archive_file(&expanded) {
+        return Ok(expanded);
     }
-    Ok(expanded)
+    Err(ConfigError::InvalidCollectionPath {
+        path: expanded,
+        kind: InvalidPathKind::NotDirectoryOrArchive,
+    })
+}
+
+fn is_archive_file(path: &Path) -> bool {
+    path.is_file() && ArchiveKind::from_path(path).is_some()
 }
 
 fn resolve_collection_name(
@@ -93,6 +99,13 @@ fn resolve_collection_name(
         // Empty `--name` is rejected by `validate_collection_name` in the
         // caller, so it does not need its own variant here.
         return Ok(n.to_string());
+    }
+    if !expanded_path.is_dir() {
+        return Err(ConfigError::InvalidCollectionPath {
+            path: expanded_path.to_path_buf(),
+            kind: InvalidPathKind::ArchiveNeedsName,
+        }
+        .into());
     }
     expanded_path
         .file_name()
@@ -202,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn non_directory_path_returns_not_directory() {
+    fn non_directory_non_archive_path_returns_not_directory_or_archive() {
         let tmp = TempDir::new().expect("tempdir");
         let base = init_dir(&tmp);
         let file_path = tmp.path().join("a.txt");
@@ -212,9 +225,66 @@ mod tests {
         assert!(matches!(
             err,
             CollectionAddError::Config(ConfigError::InvalidCollectionPath {
-                kind: InvalidPathKind::NotDirectory,
+                kind: InvalidPathKind::NotDirectoryOrArchive,
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn archive_with_name_is_added_with_the_path_as_typed() {
+        let tmp = TempDir::new().expect("tempdir");
+        let base = init_dir(&tmp);
+        let archive = tmp.path().join("export.ZIP");
+        std::fs::write(&archive, b"zip bytes are only read by update-all").expect("write");
+
+        run(Some(&base), &archive, Some("export"), None).expect("add");
+
+        let cfg = config::load(&base.join("config.yml")).expect("reload");
+        assert_eq!(
+            cfg.collections["export"].path,
+            archive.display().to_string()
+        );
+    }
+
+    #[test]
+    fn archive_without_name_returns_archive_needs_name() {
+        let tmp = TempDir::new().expect("tempdir");
+        let base = init_dir(&tmp);
+        let archive = tmp.path().join("repo.tar.gz");
+        std::fs::write(&archive, b"").expect("write");
+
+        let err = run(Some(&base), &archive, None, None).expect_err("must fail");
+
+        assert!(matches!(
+            err,
+            CollectionAddError::Config(ConfigError::InvalidCollectionPath {
+                kind: InvalidPathKind::ArchiveNeedsName,
+                ..
+            })
+        ));
+        let cfg = config::load(&base.join("config.yml")).expect("reload");
+        assert!(cfg.collections.is_empty());
+    }
+
+    #[test]
+    fn directory_named_like_an_archive_is_added_as_a_directory() {
+        let tmp = TempDir::new().expect("tempdir");
+        let base = init_dir(&tmp);
+        let dir = tmp.path().join("notes.zip");
+        std::fs::create_dir(&dir).expect("mkdir");
+
+        // Treated as a directory, so its basename is the default name —
+        // which the name rules then reject for the `.` — rather than the
+        // archive's "use --name" error.
+        let err = run(Some(&base), &dir, None, None).expect_err("must fail");
+        assert!(matches!(
+            err,
+            CollectionAddError::Config(ConfigError::InvalidCollectionName { .. })
+        ));
+        run(Some(&base), &dir, Some("notes"), None).expect("add");
+
+        let cfg = config::load(&base.join("config.yml")).expect("reload");
+        assert!(cfg.collections.contains_key("notes"));
     }
 }
