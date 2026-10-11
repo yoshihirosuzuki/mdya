@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-11
+
 ### Added
 
 - Chunk range reads: `mdya get --chunk <N> --chunk-end <M>` and the MCP `get_document` `chunk_end` parameter return chunks `N` through `M` (inclusive) as one contiguous piece of the original text, so a caller can read around a search hit in one call, or page through a document too large to fetch whole in pieces that fit the size cap. An end past the last chunk reads to the end of the document; `--chunk-end` without `--chunk`, or an end smaller than the start, is an error (MCP code `invalid_chunk_range`).
@@ -135,7 +137,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP server (`mdya mcp`) exposing `search_fts`, `search_vector`, and `search_hybrid` over stdio and streamable HTTP.
 - Prebuilt binaries and `curl | sh` / `irm | iex` installers for macOS (Apple Silicon, Intel), Linux (x86_64, aarch64), and Windows (x86_64).
 
-[Unreleased]: https://github.com/yoshihirosuzuki/mdya/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/yoshihirosuzuki/mdya/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.4.2
 [0.4.1]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.4.1
 [0.4.0]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.4.0
 [0.3.2]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.3.2
