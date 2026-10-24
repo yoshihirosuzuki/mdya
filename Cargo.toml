@@ -81,7 +81,7 @@ serde_json = "1"
 # tracks the 1.x line like mdya's other stable direct dependencies;
 # `Cargo.lock`, not this file, is what keeps the resolved version
 # from drifting.
-serde-saphyr = "1"
+serde-saphyr = "2"
 dirs = "7"
 shellexpand = "3"
 # Lockstep with the `lance-index` pin further down: lancedb requires the whole
