@@ -168,7 +168,7 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # those tests before bumping. A release that no longer panics on their
 # trigger inputs makes them fail by design; then drop the detection and the
 # pin together.
-pulldown-cmark = { version = "=0.13.4", default-features = false }
+pulldown-cmark = { version = "=0.13.5", default-features = false }
 # Recursive, `.gitignore`-aware file walker for the ingest pipeline (the
 # walker behind ripgrep). Replaces the direct `walkdir` dependency; walkdir
 # stays in the tree underneath `ignore`. Of its dependencies only `ignore`
