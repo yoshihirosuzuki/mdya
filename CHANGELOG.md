@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Bumped `rustls` 0.23.45 → 0.23.46 in the lockfile; only the `rustls` entry's `version` and `checksum` moved, and no manifest change was needed. This clears the four advisories that rustls 0.23.46 fixes:
+  - GHSA-c8m5-c952-6cm4 / RUSTSEC-2026-0346 (moderate): formatting a client session value (`Tls12ClientSessionValue`, `Tls13ClientSessionValue`) with `Debug` printed its TLS 1.2 master secret or TLS 1.3 resumption key.
+  - GHSA-vp88-798v-h67f / RUSTSEC-2026-0347 (low): when a server rejected Encrypted Client Hello (ECH), application data the client had buffered before the handshake completed was still sent to the outer server.
+  - GHSA-h2v8-394m-p7vv / RUSTSEC-2026-0348 (low): the optional Brotli certificate decompressor could be made to allocate up to 1 GiB before the peer was authenticated.
+  - GHSA-w44r-93j7-qv28 / RUSTSEC-2026-0349 (low): an unauthenticated `ServerHello` could leave later connections to the same server name offering only a classical X25519 share, so they could complete without the post-quantum hybrid key exchange.
+
+  In the binary, `rustls` reaches mdya only through `reqwest` 0.12, which `hf-hub` uses to download the embedding model, `lancedb`'s `lance-namespace-reqwest-client` uses, and mdya uses for the Ollama backend. As far as `cargo tree` shows, `ring` is the only crypto provider compiled into `rustls` there, and the `brotli` feature is off. Only seven crates in the lockfile depend on `rustls`, on `hyper-rustls`, or on a crate that re-exports `rustls` (`tokio-rustls`, `quinn`, `quinn-proto`), and so can name `rustls` types. Their sources and mdya's were checked, and no path to any of the four was found in the binary:
+  - GHSA-c8m5-c952-6cm4: none of them names the session value types or implements a session store, and the advisory notes that the built-in session cache keeps the values redacted.
+  - GHSA-vp88-798v-h67f: none of them configures ECH.
+  - GHSA-h2v8-394m-p7vv: the Brotli decompressor is not compiled in.
+  - GHSA-w44r-93j7-qv28: the `ring` provider's key exchange groups (X25519, secp256r1, secp384r1) include no post-quantum hybrid to lose.
+
+  Building from source also runs `rustls` as a client, through `reqwest` 0.13 with the `aws-lc-rs` provider, when the `lindera-ipadic` build script downloads the IPADIC dictionary. The reasons above for GHSA-c8m5-c952-6cm4, GHSA-vp88-798v-h67f and GHSA-h2v8-394m-p7vv hold there too: `brotli` is off in that build as well, and `reqwest` 0.13 is one of the seven crates checked. For GHSA-w44r-93j7-qv28, the `prefer-post-quantum` feature is off, so that provider lists the X25519MLKEM768 hybrid last, after X25519. The client opens each connection with the key exchange group it remembers for the server name, or with X25519 when it remembers none. Judging by the `rustls` sources, an attacker can make it remember any of the classical groups (X25519, secp256r1, secp384r1), but the client then opens without a hybrid share, as it does with nothing remembered, and a server that wants the hybrid answers with a HelloRetryRequest, which the advisory lists as not triggering the flaw.
+
 ## [0.4.2] - 2026-10-11
 
 ### Added
