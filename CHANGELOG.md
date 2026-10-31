@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Building from source also runs `rustls` as a client, through `reqwest` 0.13 with the `aws-lc-rs` provider, when the `lindera-ipadic` build script downloads the IPADIC dictionary. The reasons above for GHSA-c8m5-c952-6cm4, GHSA-vp88-798v-h67f and GHSA-h2v8-394m-p7vv hold there too: `brotli` is off in that build as well, and `reqwest` 0.13 is one of the seven crates checked. For GHSA-w44r-93j7-qv28, the `prefer-post-quantum` feature is off, so that provider lists the X25519MLKEM768 hybrid last, after X25519. The client opens each connection with the key exchange group it remembers for the server name, or with X25519 when it remembers none. Judging by the `rustls` sources, an attacker can make it remember any of the classical groups (X25519, secp256r1, secp384r1), but the client then opens without a hybrid share, as it does with nothing remembered, and a server that wants the hybrid answers with a HelloRetryRequest, which the advisory lists as not triggering the flaw.
 
+- Bumped `rustls-webpki` 0.103.15 → 0.103.16 in the lockfile; only its `version` and `checksum` moved. This clears RUSTSEC-2026-0382 (CVE-2026-111943): certificate verification could accept a path through distrusted emSign intermediate certificates, whose private keys are now widely known, when the trust anchors allowed it. 0.103.16 rejects any path containing those intermediates' public keys, whichever root store supplied the anchor. Judging by the sources, and without having tried it, the flaw is likely reachable in the binary's default configuration:
+  - When the embedding model is not cached yet, mdya downloads it from `https://huggingface.co` through `hf-hub` and `reqwest` 0.12.
+  - `reqwest` 0.12 trusts both the bundled `webpki-roots`, which still carried `emSign ECC Root CA - G3`, and the operating system's roots.
+  - Neither `hf-hub` nor mdya checks the contents of the downloaded files, so an attacker in the network path holding one of those keys could hand mdya a substituted model.
+
+  Building from source on Linux also uses `rustls-webpki`, with the operating system's roots, when the `lindera-ipadic` build script downloads the IPADIC dictionary through `rustls-platform-verifier` under `reqwest` 0.13. That script also compares the download's MD5 with a fixed value.
+
 ## [0.4.2] - 2026-10-11
 
 ### Added
