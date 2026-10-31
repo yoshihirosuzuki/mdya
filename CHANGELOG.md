@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Building from source on Linux also uses `rustls-webpki`, with the operating system's roots, when the `lindera-ipadic` build script downloads the IPADIC dictionary through `rustls-platform-verifier` under `reqwest` 0.13. That script also compares the download's MD5 with a fixed value.
 
+- Bumped `webpki-roots` 1.0.7 → 1.0.11 in the lockfile; only its `version` and `checksum` moved. This clears RUSTSEC-2026-0381 (the same CVE-2026-111943): the bundled root store included `emSign ECC Root CA - G3`, which 1.0.10 removes. `reqwest` 0.12 adds these roots to its clients in the binary, alongside the operating system's. The releases in between also add and remove other roots, so a server whose chain ends at a removed root may no longer be reachable unless the operating system's roots also accept it:
+  - 1.0.8 removes SecureSign Root CA12.
+  - 1.0.9 adds two Telia roots (EC and RSA TLS Root CA v3) and two SECOM roots (TLS ECC and TLS RSA Root CA 2024).
+  - 1.0.9 also removes Atos TrustedRoot 2011.
+  - 1.0.11 removes emSign Root CA - C1 and emSign ECC Root CA - C3.
+
 ## [0.4.2] - 2026-10-11
 
 ### Added
