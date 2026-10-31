@@ -15,7 +15,7 @@ repository = "https://github.com/yoshihirosuzuki/mdya"
 
 [package]
 name = "mdya"
-version = "0.4.2"
+version = "0.4.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -78,9 +78,9 @@ serde_json = "1"
 # points at for typed-only YAML consumers — which is exactly mdya's
 # usage profile (always-typed `Config` de/serialization, no
 # dynamic `Value` lookups). Upstream adopted semver at 1.0, so this
-# tracks the 1.x line like mdya's other stable direct dependencies;
-# `Cargo.lock`, not this file, is what keeps the resolved version
-# from drifting.
+# tracks its current major line like mdya's other stable direct
+# dependencies; `Cargo.lock`, not this file, is what keeps the resolved
+# version from drifting.
 serde-saphyr = "2"
 dirs = "7"
 shellexpand = "3"
