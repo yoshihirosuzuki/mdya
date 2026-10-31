@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-31
+
+### Changed
+
+- **Breaking (library):** `serde-saphyr` moves from 1.x to 2.x (`Cargo.toml` now asks for `"2"`), so `mdya::config::ConfigError::ParseYaml` now carries a serde-saphyr 2 `Error` and `ConfigError::SerializeYaml` a serde-saphyr 2 `ser::Error`. Code that builds or inspects these variants with serde-saphyr 1 errors no longer compiles, including code that uses `?` to turn a serde-saphyr 1 `ser::Error` into a `ConfigError`.
+- `config.yml` is now read with serde-saphyr 2.0.0 and its YAML parser `granit-parser` 2.0.0. Some of their changes let more YAML parse, but judging by their sources and release notes, two make a hand-edited `config.yml` that used to load fail with an error:
+  - A file whose first line is indented further than a later line used to load only the part before that line.
+  - A number, such as `runtime.memory_limit_mb` or `get.cli_max_bytes`, with a non-ASCII space before or after it, such as a full-width space (U+3000) or a no-break space, used to be read as the number.
+
+  The tests that write `config.yml` and read it back pass.
+
 ### Security
 
 - Bumped `rustls` 0.23.45 → 0.23.46 in the lockfile; only the `rustls` entry's `version` and `checksum` moved, and no manifest change was needed. This clears the four advisories that rustls 0.23.46 fixes:
@@ -179,7 +190,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP server (`mdya mcp`) exposing `search_fts`, `search_vector`, and `search_hybrid` over stdio and streamable HTTP.
 - Prebuilt binaries and `curl | sh` / `irm | iex` installers for macOS (Apple Silicon, Intel), Linux (x86_64, aarch64), and Windows (x86_64).
 
-[Unreleased]: https://github.com/yoshihirosuzuki/mdya/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/yoshihirosuzuki/mdya/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.4.3
 [0.4.2]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.4.2
 [0.4.1]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.4.1
 [0.4.0]: https://github.com/yoshihirosuzuki/mdya/releases/tag/v0.4.0
