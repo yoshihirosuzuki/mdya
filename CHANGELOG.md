@@ -23,6 +23,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Building from source also runs `rustls` as a client, through `reqwest` 0.13 with the `aws-lc-rs` provider, when the `lindera-ipadic` build script downloads the IPADIC dictionary. The reasons above for GHSA-c8m5-c952-6cm4, GHSA-vp88-798v-h67f and GHSA-h2v8-394m-p7vv hold there too: `brotli` is off in that build as well, and `reqwest` 0.13 is one of the seven crates checked. For GHSA-w44r-93j7-qv28, the `prefer-post-quantum` feature is off, so that provider lists the X25519MLKEM768 hybrid last, after X25519. The client opens each connection with the key exchange group it remembers for the server name, or with X25519 when it remembers none. Judging by the `rustls` sources, an attacker can make it remember any of the classical groups (X25519, secp256r1, secp384r1), but the client then opens without a hybrid share, as it does with nothing remembered, and a server that wants the hybrid answers with a HelloRetryRequest, which the advisory lists as not triggering the flaw.
 
+- Bumped `rustls-webpki` 0.103.15 → 0.103.16 in the lockfile; only its `version` and `checksum` moved. This clears RUSTSEC-2026-0382 (CVE-2026-111943): certificate verification could accept a path through distrusted emSign intermediate certificates, whose private keys are now widely known, when the trust anchors allowed it. 0.103.16 rejects any path containing those intermediates' public keys, whichever root store supplied the anchor. Judging by the sources, and without having tried it, the flaw is likely reachable in the binary's default configuration:
+  - When the embedding model is not cached yet, mdya downloads it from `https://huggingface.co` through `hf-hub` and `reqwest` 0.12.
+  - `reqwest` 0.12 trusts both the bundled `webpki-roots`, which still carried `emSign ECC Root CA - G3`, and the operating system's roots.
+  - Neither `hf-hub` nor mdya checks the contents of the downloaded files, so an attacker in the network path holding one of those keys could hand mdya a substituted model.
+
+  Building from source on Linux also uses `rustls-webpki`, with the operating system's roots, when the `lindera-ipadic` build script downloads the IPADIC dictionary through `rustls-platform-verifier` under `reqwest` 0.13. That script also compares the download's MD5 with a fixed value.
+
+- Bumped `webpki-roots` 1.0.7 → 1.0.11 in the lockfile; only its `version` and `checksum` moved. This clears RUSTSEC-2026-0381 (the same CVE-2026-111943): the bundled root store included `emSign ECC Root CA - G3`, which 1.0.10 removes. `reqwest` 0.12 adds these roots to its clients in the binary, alongside the operating system's. The releases in between also add and remove other roots, so a server whose chain ends at a removed root may no longer be reachable unless the operating system's roots also accept it:
+  - 1.0.8 removes SecureSign Root CA12.
+  - 1.0.9 adds two Telia roots (EC and RSA TLS Root CA v3) and two SECOM roots (TLS ECC and TLS RSA Root CA 2024).
+  - 1.0.9 also removes Atos TrustedRoot 2011.
+  - 1.0.11 removes emSign Root CA - C1 and emSign ECC Root CA - C3.
+
+- Bumped `webpki-root-certs` 1.0.7 → 1.0.11 in the lockfile; only its `version` and `checksum` moved. This clears RUSTSEC-2026-0383 (the same CVE-2026-111943), the same root removal as in `webpki-roots`, for the list of the roots' full certificates. In the lockfile only `rustls-platform-verifier` depends on it, and only when building for wasm32, so no build of mdya for its release targets compiles it.
+
+- Bumped `quinn-proto` 0.11.15 → 0.11.19 in the lockfile, clearing five advisories through which a QUIC peer could cause a panic or excessive memory use:
+  - RUSTSEC-2026-0338 / GHSA-465w-v9q3-7j98: zero-length STREAM frames could make it panic during unordered reads.
+  - RUSTSEC-2026-0339 / GHSA-hmxj-32vh-65vr: pending connection ID retirements could grow without bound.
+  - RUSTSEC-2026-0340 / GHSA-3g6h-r5qx-f6hq: a peer's minimum ACK delay could make it panic when sending ACK_FREQUENCY frames is enabled.
+  - RUSTSEC-2026-0341 / GHSA-qfwj-vfxf-92j2: the memory guard on stream reassembly could be bypassed.
+  - RUSTSEC-2026-0342 / GHSA-2hv7-gw8g-gpq5: zero-length DATAGRAM frames could bypass the receive buffer limit.
+
+  `quinn-proto` sits in the lockfile under `reqwest`'s optional HTTP/3 support. As far as `cargo tree` shows, nothing in the workspace enables that support, and no build of the workspace includes `quinn-proto`. The `quinn-proto` entry also moves to `getrandom` 0.4.2 and `rand` 0.10.1, both already in the lockfile, and the lockfile adds `rand_pcg` 0.10.2, a new dependency of `quinn-proto`. `getrandom` 0.3.4 drops `js-sys` and `wasm-bindgen` from its dependencies, since only `quinn-proto` 0.11.15 had asked for its WebAssembly support.
+
+- Bumped `zstd-sys` 2.0.16+zstd.1.5.7 → 2.1.2+zstd.1.5.7 in the lockfile; only its `version` and `checksum` moved, and the bundled zstd C library stays at 1.5.7. This clears RUSTSEC-2026-0410, which affects only wasm32: there, a failed allocation in the shim that `zstd-sys` gives the C library could corrupt memory during decompression. `zstd-sys` is in the binary, under `zstd` 0.13, but none of the release targets is wasm32. From 2.1.0 the crate's license is BSD-3-Clause instead of MIT/Apache-2.0; the bundled C library was already BSD-licensed. The releases in between also change how the C library is built, for example by building the assembly only on x86_64.
+
 ## [0.4.2] - 2026-10-11
 
 ### Added
