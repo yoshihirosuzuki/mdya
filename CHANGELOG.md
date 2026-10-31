@@ -47,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `quinn-proto` sits in the lockfile under `reqwest`'s optional HTTP/3 support. As far as `cargo tree` shows, nothing in the workspace enables that support, and no build of the workspace includes `quinn-proto`. The `quinn-proto` entry also moves to `getrandom` 0.4.2 and `rand` 0.10.1, both already in the lockfile, and the lockfile adds `rand_pcg` 0.10.2, a new dependency of `quinn-proto`. `getrandom` 0.3.4 drops `js-sys` and `wasm-bindgen` from its dependencies, since only `quinn-proto` 0.11.15 had asked for its WebAssembly support.
 
+- Bumped `zstd-sys` 2.0.16+zstd.1.5.7 → 2.1.2+zstd.1.5.7 in the lockfile; only its `version` and `checksum` moved, and the bundled zstd C library stays at 1.5.7. This clears RUSTSEC-2026-0410, which affects only wasm32: there, a failed allocation in the shim that `zstd-sys` gives the C library could corrupt memory during decompression. `zstd-sys` is in the binary, under `zstd` 0.13, but none of the release targets is wasm32. From 2.1.0 the crate's license is BSD-3-Clause instead of MIT/Apache-2.0; the bundled C library was already BSD-licensed. The releases in between also change how the C library is built, for example by building the assembly only on x86_64.
+
 ## [0.4.2] - 2026-10-11
 
 ### Added
