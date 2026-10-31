@@ -38,6 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bumped `webpki-root-certs` 1.0.7 → 1.0.11 in the lockfile; only its `version` and `checksum` moved. This clears RUSTSEC-2026-0383 (the same CVE-2026-111943), the same root removal as in `webpki-roots`, for the list of the roots' full certificates. In the lockfile only `rustls-platform-verifier` depends on it, and only when building for wasm32, so no build of mdya for its release targets compiles it.
 
+- Bumped `quinn-proto` 0.11.15 → 0.11.19 in the lockfile, clearing five advisories through which a QUIC peer could cause a panic or excessive memory use:
+  - RUSTSEC-2026-0338 / GHSA-465w-v9q3-7j98: zero-length STREAM frames could make it panic during unordered reads.
+  - RUSTSEC-2026-0339 / GHSA-hmxj-32vh-65vr: pending connection ID retirements could grow without bound.
+  - RUSTSEC-2026-0340 / GHSA-3g6h-r5qx-f6hq: a peer's minimum ACK delay could make it panic when sending ACK_FREQUENCY frames is enabled.
+  - RUSTSEC-2026-0341 / GHSA-qfwj-vfxf-92j2: the memory guard on stream reassembly could be bypassed.
+  - RUSTSEC-2026-0342 / GHSA-2hv7-gw8g-gpq5: zero-length DATAGRAM frames could bypass the receive buffer limit.
+
+  `quinn-proto` sits in the lockfile under `reqwest`'s optional HTTP/3 support. As far as `cargo tree` shows, nothing in the workspace enables that support, and no build of the workspace includes `quinn-proto`. The `quinn-proto` entry also moves to `getrandom` 0.4.2 and `rand` 0.10.1, both already in the lockfile, and the lockfile adds `rand_pcg` 0.10.2, a new dependency of `quinn-proto`. `getrandom` 0.3.4 drops `js-sys` and `wasm-bindgen` from its dependencies, since only `quinn-proto` 0.11.15 had asked for its WebAssembly support.
+
 ## [0.4.2] - 2026-10-11
 
 ### Added
