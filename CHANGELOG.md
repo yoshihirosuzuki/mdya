@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 1.0.9 also removes Atos TrustedRoot 2011.
   - 1.0.11 removes emSign Root CA - C1 and emSign ECC Root CA - C3.
 
+- Bumped `webpki-root-certs` 1.0.7 → 1.0.11 in the lockfile; only its `version` and `checksum` moved. This clears RUSTSEC-2026-0383 (the same CVE-2026-111943), the same root removal as in `webpki-roots`, for the list of the roots' full certificates. In the lockfile only `rustls-platform-verifier` depends on it, and only when building for wasm32, so no build of mdya for its release targets compiles it.
+
 ## [0.4.2] - 2026-10-11
 
 ### Added
