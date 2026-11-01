@@ -1,10 +1,5 @@
 [workspace]
-members = [
-    ".",
-    "xtask/generate-tiny-bert",
-    "xtask/generate-tiny-modernbert",
-    "xtask/generate-test-pdfs",
-]
+members = ["."]
 resolver = "3"
 
 [workspace.package]
@@ -23,24 +18,13 @@ repository.workspace = true
 description = "Local Markdown retrieval primitive (BM25 + on-device vector + MCP)."
 keywords = ["markdown", "search", "retrieval", "mcp", "local-first"]
 categories = ["command-line-utilities", "text-processing"]
-# Keep the published crate to what a `cargo install mdya` consumer needs.
-# Integration tests (and their fixtures), CI workflows, and repo/dev tooling
-# are not used when building from the crates.io tarball. The archives in
-# `tests/fixtures/archives` stay in, without the script that makes them:
-# the unit tests in `src/ingest/archive/tests.rs` read them, so `cargo test`
-# on the tarball passes. Anything else added under `tests/` is packaged
-# unless it is listed below. That includes an integration test split into
-# `tests/<name>/main.rs`, which fails to build from the tarball if it uses
-# `tests/common`. Check with `cargo package --list`.
+# Keep the published crate to what a `cargo install mdya` consumer needs:
+# CI workflows and repo/dev tooling are not used when building from the
+# crates.io tarball. Check with `cargo package --list`.
 exclude = [
     "/.github",
     "/.cargo",
-    "/tests/*.rs",
-    "/tests/common",
-    "/tests/fixtures/pdfs",
-    "/tests/fixtures/tiny_bert",
-    "/tests/fixtures/tiny_modernbert",
-    "/tests/fixtures/archives/generate.py",
+    "/clippy.toml",
     "/dist-workspace.toml",
     "/justfile",
     "/rustfmt.toml",
@@ -57,199 +41,22 @@ name = "mdya"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1"
-thiserror = "2"
-clap = { version = "4", features = ["derive", "env"] }
-arrow-array = "58"
-arrow-schema = "58"
-futures = "0.3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "process", "net", "signal", "sync"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# Pure-Rust YAML (de)serializer for serde. Replaces `serde_yaml_ng`
-# (a maintenance fork of the deprecated `serde_yaml`) so the
-# `unsafe-libyaml` C-port (96%+ unsafe expressions) drops out of the
-# mdya-direct dependency edge. `serde-saphyr` builds on the
-# `granit-parser` pure-Rust stack (a fork of the original
-# `saphyr-parser` project; the "saphyr" name is historical) and is
-# one of the migration paths the upstream `serde_yml` 0.0.13 shim
-# points at for typed-only YAML consumers — which is exactly mdya's
-# usage profile (always-typed `Config` de/serialization, no
-# dynamic `Value` lookups). Upstream adopted semver at 1.0, so this
-# tracks its current major line like mdya's other stable direct
-# dependencies; `Cargo.lock`, not this file, is what keeps the resolved
-# version from drifting.
-serde-saphyr = "2"
-dirs = "7"
-shellexpand = "3"
-# Lockstep with the `lance-index` pin further down: lancedb requires the whole
-# `lance-*` ecosystem at one exact version, so bumping either crate on its own
-# cannot compile. See the note on `lance-index` for the detail.
-lancedb = { version = "=0.37.1", default-features = false }
-# Embedded IPADIC dictionary for Lance's FTS `lindera/ipadic` tokenizer.
-# The `embed-ipadic` feature triggers `lindera-ipadic`'s build.rs to fetch
-# `mecab-ipadic-2.7.0-20070801.tar.gz` from Lindera.dev (md5-verified)
-# and `include_bytes!` the compiled dictionary into the rlib. At run
-# time mdya redirects Lance's `language_model_home` via the
-# `LANCE_LANGUAGE_MODEL_HOME` env var into `~/.mdya/lance-models/` and
-# writes a tiny `config.yml` whose `segmenter.dictionary: embedded://ipadic`
-# makes Lance read the embedded dictionary — no foreign disk write,
-# no `*-sys`. Pinned exact-version to mirror the `lindera v3.0.7` already
-# present transitively via `lance-tokenizer`; declaring it here unifies
-# cargo features so the transitive copy picks up `embed-ipadic`. mdya
-# itself does not call any lindera API; the direct dep exists solely to
-# set features and pin the version in `Cargo.lock`. Verified in
-# `tests/verify_lindera_ipadic.rs`.
-lindera = { version = "=3.0.7", default-features = false, features = ["embed-ipadic", "mmap"] }
-# Lockstep: the three `candle-*` crates must move together. Bumping only
-# one leaves two versions of `candle_core::Tensor` in the dep graph, and
-# any code that crosses the boundary fails to compile because the two
-# `Tensor` types are distinct. Dependabot's per-crate bump PRs therefore
-# cannot be merged individually.
-candle-core = { version = "=0.11.0", default-features = false }
-candle-nn = { version = "=0.11.0", default-features = false }
-candle-transformers = { version = "=0.11.0", default-features = false }
-tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
-hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls"] }
-# HTTP client for the optional `ollama:<model>` embedding backend.
-# reqwest is already a prod-tree dependency (pulled by hf-hub for
-# model downloads and by lancedb's namespace client), so this direct entry
-# adds no new top-level dependency — it only pins the version/features mdya
-# relies on. `default-features = false` drops `default-tls` (native-tls =
-# OpenSSL C), and that one sticks: the resolved feature set has no
-# `native-tls`. `rustls-tls` reuses the ring/rustls stack already present,
-# `json` enables the `/api/embed` (de)serialization. The Ollama endpoint is
-# plain HTTP/1 loopback, so mdya does not ask for `http2` — but the build
-# gets it anyway, because `hf-hub`'s `tokio` feature and
-# `lance-namespace-reqwest-client` each enable it and cargo unifies features
-# across the graph. Turning a feature off here narrows what mdya requires,
-# not what the final binary contains.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rmcp = { version = "3.4", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
-# axum HTTP layer hosting rmcp's `StreamableHttpService` as a tower service for
-# the `mdya mcp --http` daemon. `default-features = false` + `http1` +
-# `tokio` is the minimal set rmcp's own example builds against — no multipart,
-# ws, or TLS (the daemon is loopback-only). Pure Rust, no `*-sys`.
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-# Cross-platform advisory file lock for the MCP HTTP daemon pid file.
-# The daemon holds an exclusive lock on `~/.mdya/mcp.pid` for its
-# whole lifetime so a second instance refuses to start; the OS releases the
-# lock on exit *or* crash, so no stale lock survives a `kill -9`. fd-lock is
-# the rustup project's own locking crate: normal deps are `cfg-if` plus
-# `rustix` (unix) / `windows-sys` (windows), both already in the tree and
-# binding-only (no bundled C / no `cc-rs`). Verified via `cargo tree`.
-fd-lock = "4"
-# `CancellationToken` for the MCP HTTP daemon's graceful shutdown: on
-# Ctrl-C we cancel the token so rmcp's `StreamableHttpService` tears down active
-# SSE sessions instead of letting axum's graceful shutdown wait on never-ending
-# streams. Already in the tree transitively (tokio/lance); lifted to a direct
-# dep with no default features (`CancellationToken` needs none). Pure Rust.
-tokio-util = { version = "0.7", default-features = false }
-# Interactive progress UI for `mdya update-all`. Log lines coexist with the
-# bars via `cli::log_writer`, which suspends the active `MultiProgress`
-# around each tracing event (no tracing-subscriber layer involved).
-indicatif = "0.18"
-# RSS polling for the runtime memory guard. Default features
-# (component / disk / network / user) are disabled to keep transitive deps to
-# `system` only — the watchdog reads its own process's RSS and nothing else.
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
-# Markdown event-based parser for heading-aware chunking. Default
-# features (getopts / html) are disabled — chunking only needs the parser,
-# not the CLI or HTML escaping. Pure Rust, no `*-sys` / no `cc-rs`.
-# Pinned exactly: the chunker works around an offset-iterator panic in
-# 0.13.4 (https://github.com/pulldown-cmark/pulldown-cmark/issues/1129) by
-# detecting the affected documents up front (`offset_parser_would_panic` in
-# src/chunking/markdown.rs), and the detection relies on how 0.13.4 behaves
-# at the panic site. Its tests fail when an upgrade changes that behaviour,
-# but they only cover builds that use Cargo.lock; the pin keeps a
-# `cargo install mdya` without `--locked` on the version they cover. Run
-# those tests before bumping. A release that no longer panics on their
-# trigger inputs makes them fail by design; then drop the detection and the
-# pin together.
-pulldown-cmark = { version = "=0.13.4", default-features = false }
-# Recursive, `.gitignore`-aware file walker for the ingest pipeline (the
-# walker behind ripgrep). Replaces the direct `walkdir` dependency; walkdir
-# stays in the tree underneath `ignore`. Of its dependencies only `ignore`
-# itself and `globset` are new to the lockfile — walkdir, same-file,
-# crossbeam-deque, memchr, regex-automata, regex-syntax, aho-corasick,
-# bstr, log and (Windows only) winapi-util were already present. Pure
-# Rust, no `*-sys` / no `cc-rs`.
-ignore = "0.4"
-# Archive collections: read `.md` / `.markdown` / `.pdf` documents straight
-# out of a `.zip` / `.tar` / `.tar.gz` / `.tgz` registered as a collection.
-# Both crates were already in the lockfile (tar under lindera-ipadic's build
-# script through lindera-dictionary's `build_rs` feature, flate2 under
-# several crates), so no package is added; tar and filetime join the runtime
-# tree. mdya walks tar and zip archives itself: tar only lends its header
-# type, and flate2 decompresses `.tar.gz` and deflated zip entries (its
-# miniz_oxide backend). tar drops its default `xattr` feature, since nothing
-# is extracted to disk. Pure Rust, no `*-sys` / no `cc-rs`.
-tar = { version = "0.4", default-features = false }
-flate2 = "1"
-# Pure Rust PDF text extractor for `.pdf` ingest.
-# Internally pulls lopdf + adobe-cmap-parser + cff-parser + encoding_rs +
-# euclid + postscript + type1-encoding-parser + unicode-normalization + log
-# + RustCrypto (aes/cbc/ecb for encrypted-PDF read path). Audited via
-# `cargo tree -p pdf-extract --edges normal | grep -E '(-sys$| -sys )'` —
-# no new `*-sys` / C-FFI binding beyond mdya's existing tree.
-pdf-extract = "0.12"
-# SHA-256 for `chunks.source_hash` two-stage incremental judgment.
-# RustCrypto, pure Rust.
-sha2 = "0.11"
-# `chrono::DateTime<Utc>` is the canonical mtime type for the chunks /
-# sources schemas; already present in the tree transitively via lancedb,
-# lifted to a direct dep here so the ingest module owns its semantic
-# version.
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-# JSON Schema derive for `SearchResponse` / `SearchHit` / `SearchMode`.
-# Already pulled transitively by `rmcp` 2.1 (default +
-# `chrono04` features), lifted to a direct dep so the search module's
-# `#[derive(JsonSchema)]` invocations have an explicit version pin and
-# do not regress if rmcp narrows its feature set later. `derive` is
-# part of `default` (verified against `GREsau/schemars` v1.2.1
-# `Cargo.toml`), so no `features = [...]` override is needed. Pure
-# Rust, no `*-sys`.
-schemars = "1"
-# `FullTextSearchQuery` / `SCORE_COL` for `mdya search fts`.
-# lancedb's `query.rs` doc example also imports them directly from
-# `lance-index`; lancedb does not re-export them. Pinned exactly to the
-# version lancedb resolves transitively — lancedb 0.37 requires the whole
-# `lance-*` ecosystem at `=10.0.0`, and a direct pin that disagrees puts two
-# `FullTextSearchQuery` types in the tree, so `full_text_search` fails to
-# typecheck. Bump this, the `[dev-dependencies]` copy, and `lancedb` in one
-# step. Pure Rust, no `*-sys`.
-lance-index = "=10.0.0"
-
-[features]
-default = []
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-
-[dev-dependencies]
-assert_cmd = "2"
-insta = "1"
-predicates = "3"
-rmcp = { version = "3.4", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "process"] }
-anyhow = "1"
-tempfile = "3"
-futures = "0.3"
-arrow-array = "58"
-arrow-schema = "58"
-lance-index = "=10.0.0"
-# Builds zip archives in the archive collection tests. Already in the
-# lockfile under candle-core, which requires `^8.6`, so 9.x would add a
-# second copy.
-zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+# Pinned exactly: the components will rely on lancedb behaviour checked
+# against a specific version, so the version moves only on purpose. Used
+# without the `remote` feature (the client for a LanceDB server, which mdya
+# does not use). `default-features = false` keeps any feature lancedb adds to
+# its defaults off unless it is chosen here.
+lancedb = { version = "=0.41.0", default-features = false }
 
 [profile.release]
 lto = "thin"
 strip = "symbols"
 opt-level = 3
 codegen-units = 1
-panic = "abort"
+# Unwind on panic, so that `gateway` can catch an unexpected failure and
+# report it: the CLI will exit with a message asking for a bug report, and the
+# MCP server will fail only the tool call that panicked and keep serving.
+panic = "unwind"
 
 # The profile that 'dist' will build with
 [profile.dist]
@@ -257,13 +64,23 @@ inherits = "release"
 lto = "thin"
 
 [lints.clippy]
-# `serde-saphyr` (and the deprecated `serde_yaml` it transitively replaces
-# under `lindera`) carries a larger `Error` enum than its predecessors, so
-# `Result<_, ConfigError>` / `Result<_, IngestError>` / `Result<_, SearchError>`
-# now trip clippy's `result_large_err` size threshold. Boxing the error
-# variants in each enum would be a workspace-wide ergonomic regression
-# (every `?` site loses direct field access on the source), so the lint is
-# accepted here. The same rationale is implicit in clippy's own
-# documentation, which calls the lint a soft suggestion appropriate for
-# crates with intentionally rich error payloads.
-result_large_err = "allow"
+# In MCP stdio mode, stdout carries the protocol, so only the `gateway` module
+# writes to it. `print!` and `println!` are allowed for the whole `gateway`
+# module (src/gateway.rs). `std::io::stdout` is in `disallowed-methods`
+# (clippy.toml).
+print_stdout = "deny"
+# The methods listed in clippy.toml: `std::io::stdout` and the `std::env`
+# functions that read or set environment variables.
+disallowed_methods = "deny"
+# An unexpected failure is a panic; every expected failure is an error value.
+# Outside tests, `.unwrap()` is not used. `.expect()` and `panic!` are used
+# only where the code can say why the call cannot fail: write that reason in
+# the message, and acknowledge the call with `#[expect(clippy::expect_used)]`
+# or `#[expect(clippy::panic)]` on the enclosing statement or item.
+# Tests may use all four: clippy.toml allows the first three in tests, and
+# src/lib.rs allows `unimplemented!` in the library's unit tests. A test crate
+# under `tests/` needs the same `cfg_attr` at its top to use `unimplemented!`.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unimplemented = "deny"

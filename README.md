@@ -143,7 +143,6 @@ runtime:
 
 ```sh
 just check    # fmt-check + clippy (-D warnings) + cargo test (full workspace) + cargo audit
-just smoke    # smoke tests only
 just          # list available recipes
 ```
 

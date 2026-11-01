@@ -1,0 +1,30 @@
+# Clippy configuration. Which lints are on, and why, is in `[lints.clippy]` in
+# Cargo.toml.
+
+# Only `gateway` touches stdout and environment variables. Clippy cannot allow
+# one entry of this list and keep the others, so `gateway` allows
+# `clippy::disallowed_methods` on the specific functions that need one of
+# these, not on the whole module. Tests are not exempt either: a test that sets
+# an environment variable races with the other tests in the same process, and
+# a test that reads one depends on the environment it happens to run in. A
+# value that cargo puts in the environment (from `.cargo/config.toml`, for
+# example) can be read at compile time with `env!`.
+disallowed-methods = [
+    { path = "std::io::stdout", reason = "only `gateway` writes to stdout" },
+    { path = "std::env::var", reason = "only `gateway` reads environment variables" },
+    { path = "std::env::var_os", reason = "only `gateway` reads environment variables" },
+    { path = "std::env::vars", reason = "only `gateway` reads environment variables" },
+    { path = "std::env::vars_os", reason = "only `gateway` reads environment variables" },
+    { path = "std::env::set_var", reason = "only `gateway` sets environment variables, before any other thread starts" },
+    { path = "std::env::remove_var", reason = "only `gateway` sets environment variables, before any other thread starts" },
+]
+
+# A failing test should stop right where it fails.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+# Clippy allows `.unwrap()` and `.expect()` in constants by default. Check them
+# there too, so that the rule in Cargo.toml has no exception outside tests.
+allow-unwrap-in-consts = false
+allow-expect-in-consts = false
