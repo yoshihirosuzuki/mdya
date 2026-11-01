@@ -10,10 +10,12 @@ use async_trait::async_trait;
 use crate::types::{BoxError, ChunkEmbedding, EmbeddingModel, EmbeddingVector};
 
 use ollama::{HttpEmbedEndpoint, OllamaPreparation};
+use on_device::{HubSettings, OnDevicePreparation};
 use prepared::PreparedOnFirstUse;
 use supported::SupportedModel;
 
 mod ollama;
+mod on_device;
 mod prepared;
 mod supported;
 #[cfg(test)]
@@ -50,7 +52,18 @@ pub fn create(settings: EmbeddingSettings) -> Arc<dyn Embedding> {
                 Box::new(preparation),
             ))
         }
-        SupportedModel::OnDevice(_) => todo!("the models run on this PC"),
+        SupportedModel::OnDevice(on_device_model) => {
+            let preparation = OnDevicePreparation::new(
+                on_device_model,
+                settings.model_cache_dir,
+                HubSettings::hugging_face(settings.hf_token),
+            );
+            Arc::new(PreparedOnFirstUse::new(
+                settings.model,
+                on_device::spec(on_device_model).max_chunks_per_call,
+                Box::new(preparation),
+            ))
+        }
     }
 }
 
@@ -117,6 +130,22 @@ mod tests {
 
         assert_eq!(embedding.model_name(), "ollama:nomic-embed-text");
         assert_eq!(embedding.max_chunks_per_call(), ollama::MAX_CHUNKS_PER_CALL);
+    }
+
+    #[tokio::test]
+    async fn does_not_touch_the_cache_directory_when_ollama_runs_the_model() {
+        let parent = tempfile::tempdir().unwrap();
+        let cache_dir = parent.path().join("cache");
+        let embedding = create(EmbeddingSettings {
+            model: "ollama:nomic-embed-text".to_owned(),
+            model_cache_dir: cache_dir.clone(),
+            hf_token: None,
+            // Nothing listens here, so preparing the model fails.
+            ollama_endpoint: "http://127.0.0.1:9".to_owned(),
+        });
+
+        assert!(embedding.model().await.is_err());
+        assert!(!cache_dir.exists());
     }
 
     #[test]
