@@ -13,6 +13,10 @@ use crate::types::{
     BoxError, CollectionName, DocumentOutcome, Key, ProgressSink, Time, TypeAttributes,
 };
 
+mod location;
+
+pub use location::absolute_location;
+
 /// An ingest implementation. Each one is created by its own module's `create`
 /// and also offers `check_attribute_names`, callable without creating it:
 ///
@@ -164,11 +168,5 @@ pub async fn ingest_items(
     progress: &dyn ProgressSink,
 ) -> Result<UpdateReport, UpdateStopped> {
     let _ = (instruction, items, contents, format, index, progress);
-    todo!()
-}
-
-/// Makes a location absolute.
-pub fn absolute_location(location: &str, base: &LocationBase) -> Result<PathBuf, IngestError> {
-    let _ = (location, base);
     todo!()
 }
