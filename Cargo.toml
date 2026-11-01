@@ -45,6 +45,13 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait = "0.1.92"
+# Runs the embedding models on this PC, on the CPU. Their GPU and vendor math
+# library backends are features, all left off. candle-nn and
+# candle-transformers ask for candle-core 0.11 themselves, so the build has one
+# candle-core, whose tensor type the three share.
+candle-core = { version = "0.11.1", default-features = false }
+candle-nn = { version = "0.11.1", default-features = false }
+candle-transformers = { version = "0.11.1", default-features = false }
 # The shared ingest flow processes several documents at once within one task
 # (`FuturesUnordered`), because what it borrows (the progress sink) keeps it
 # from spawning a task per document, and catches the panics of the futures it
@@ -70,19 +77,24 @@ lancedb = { version = "=0.41.0", default-features = false }
 lindera = { version = "=3.0.7", default-features = false, features = ["embed-ipadic"] }
 lindera-dictionary = { version = "=3.0.7", default-features = false }
 lindera-ipadic = { version = "=3.0.7", default-features = false }
-# The HTTP client for handing embedding to Ollama. 0.12 rather than the latest
-# 0.13, with the same features that lance's namespace client already uses
-# (rustls with the ring provider, the operating system's root certificates,
-# JSON), so that this adds no crate to the binary. 0.13 would put a second
-# copy of reqwest in the binary; the 0.13 in Cargo.lock is only for the build
-# script of lindera-ipadic. Move to 0.13 once the reqwest in lancedb's
-# dependencies is 0.13.
+# The HTTP client for fetching models from Hugging Face and for handing
+# embedding to Ollama. 0.12 rather than the latest 0.13, with the same
+# features that lance's namespace client already uses (rustls with the ring
+# provider, the operating system's root certificates, JSON), so that this adds
+# no crate to the binary. 0.13 would put a second copy of reqwest in the
+# binary; the 0.13 in Cargo.lock is only for the build script of
+# lindera-ipadic. Move to 0.13 once the reqwest in lancedb's dependencies is
+# 0.13.
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt", "sync"], default-features = false }
+# Splits texts into the tokens the models on this PC take. Without the default
+# features, which bring in C (onig) and C++ (esaxx_fast) code; regular
+# expressions come from fancy-regex instead.
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+tokio = { version = "1.54.1", features = ["fs", "io-util", "rt", "sync"], default-features = false }
 # The components log through the `tracing` macros, and `gateway` sets the
 # receiver that writes the logs out. mdya asks for only `std`, not the default
 # `attributes` feature (`#[instrument]`). A component that uses
