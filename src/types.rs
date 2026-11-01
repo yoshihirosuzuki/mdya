@@ -2,6 +2,9 @@
 //! one component's functions use lives in that component's module instead, so
 //! that components do not depend on each other just for types.
 
+#[cfg(test)]
+pub(crate) mod test_double;
+
 /// A chunk: the part of a document's body that it covers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Chunk {

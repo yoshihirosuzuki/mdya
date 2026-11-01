@@ -1,4 +1,6 @@
-//! Shared setup for the tests that use full-text search.
+//! Shared setup for tests. The log receiver test double is in
+//! [`log_receiver`]; the rest of this module prepares full-text search for the
+//! tests that use it.
 //!
 //! LanceDB reads the full-text search dictionary configuration from the
 //! directory in `LANCE_LANGUAGE_MODEL_HOME`. Tests never set that variable:
@@ -14,6 +16,8 @@ use std::path::Path;
 use tokio::sync::OnceCell;
 
 use crate::index::{DICTIONARY_CONFIG, place_fts_dictionary_config};
+
+pub(crate) mod log_receiver;
 
 static PREPARED: OnceCell<()> = OnceCell::const_new();
 

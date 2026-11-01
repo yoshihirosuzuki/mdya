@@ -77,6 +77,12 @@ serde_json = "1.0.154"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt", "sync"], default-features = false }
+# The components log through the `tracing` macros, and `gateway` sets the
+# receiver that writes the logs out. mdya asks for only `std`, not the default
+# `attributes` feature (`#[instrument]`). A component that uses
+# `#[instrument]` asks for `attributes` here first: it is enabled today only
+# because lancedb depends on `tracing` with its default features.
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 [profile.release]
 lto = "thin"
@@ -125,3 +131,7 @@ futures = "0.3.34"
 # `io-util` and `net` for the tests that answer HTTP requests in place of a
 # server, on a local port.
 tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt"] }
+# For the log receiver test double (src/test_support/log_receiver.rs), which
+# records events through a layer on a registry. The default features (`fmt`
+# and the formatting around it) are for writing logs out and are not needed.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
