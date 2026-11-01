@@ -1,13 +1,13 @@
-The Gemma3 encoder and rotary-embedding implementation in mdya's
-`src/embedding/embeddinggemma_model/` module is adapted from Hugging Face's
+The Gemma 3 network and its rotary position embedding in mdya's
+`src/embedding/on_device/encoder/gemma3.rs` are adapted from Hugging Face's
 text-embeddings-inference project
 (https://github.com/huggingface/text-embeddings-inference), specifically its
-candle backend (backends/candle/src/models/gemma3.rs, dense.rs, and
-layers/rotary.rs).
+candle backend (backends/candle/src/models/gemma3.rs and
+backends/candle/src/layers/rotary.rs).
 
 text-embeddings-inference is licensed under the Apache License, Version 2.0:
 
-    Copyright Hugging Face Inc.
+    Copyright 2022 Hugging Face
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.

@@ -47,9 +47,10 @@ pub(super) struct ModelSpec {
     /// The context length, in tokens: the `max_seq_length` that the model's
     /// sentence-transformers configuration gives.
     context_length: usize,
-    /// The smallest number of chunks per call whose time per chunk was within
-    /// 5% of the fastest measured (`real_model_tests::measure_chunks_per_call`,
-    /// on an Apple M4 with 10 cores).
+    /// The smallest number of chunks per call whose time per chunk, averaged
+    /// over 3 calls, was within 5% of the fastest measured
+    /// (`real_model_tests::measure_chunks_per_call`, on an Apple M4 with 10
+    /// cores).
     /// The memory of a call grows with its chunks, and several calls run at
     /// once, so a larger number would add memory while saving at most 5% of
     /// the time per chunk.
@@ -80,9 +81,18 @@ pub(super) fn spec(model: OnDeviceModel) -> ModelSpec {
             query_prefix: "",
             document_prefix: "",
             context_length: 256,
-            max_chunks_per_call: chunks(16),
+            max_chunks_per_call: chunks(4),
         },
-        OnDeviceModel::EmbeddingGemma300m => todo!("google/embeddinggemma-300m"),
+        // https://huggingface.co/google/embeddinggemma-300m: the `query` and
+        // `document` prompts of its config_sentence_transformers.json.
+        OnDeviceModel::EmbeddingGemma300m => ModelSpec {
+            revision: "57c266a740f537b4dc058e1b0cda161fd15afa75",
+            architecture: Architecture::Gemma3Dense,
+            query_prefix: "task: search result | query: ",
+            document_prefix: "title: none | text: ",
+            context_length: 2048,
+            max_chunks_per_call: chunks(4),
+        },
     }
 }
 
@@ -125,12 +135,17 @@ impl ModelPreparation for OnDevicePreparation {
     async fn prepare(&self) -> Result<Arc<dyn PreparedModel>, EmbeddingError> {
         let spec = spec(self.model);
         let hub = Hub::connect(&self.hub.base, self.hub.token.clone()).map_err(unavailable)?;
+        let files: Vec<&str> = FILES
+            .iter()
+            .chain(encoder::extra_files(spec.architecture))
+            .copied()
+            .collect();
         let dir = hub
             .fetch(
                 &self.cache_dir,
                 self.model.repository(),
                 spec.revision,
-                &FILES,
+                &files,
             )
             .await
             .map_err(unavailable)?;
@@ -192,10 +207,12 @@ impl Runner {
     }
 
     /// The embedding vector of each text in `tokens`: the mean of the hidden
-    /// states of its tokens, scaled to length 1.
+    /// states of its tokens, put through the layers the model has after the
+    /// mean, and scaled to length 1.
     fn vectors(&self, tokens: &Tokens) -> Result<Vec<EmbeddingVector>, BoxError> {
         let hidden = self.encoder.hidden_states(&tokens.ids, &tokens.mask)?;
-        Ok(mean_and_normalize(&hidden, &tokens.mask)?.to_vec2::<f32>()?)
+        let projected = self.encoder.project(&mean(&hidden, &tokens.mask)?)?;
+        Ok(scaled_to_length_one(&projected)?.to_vec2::<f32>()?)
     }
 
     fn embed(&self, texts: Vec<String>) -> Result<Vec<ChunkEmbedding>, BoxError> {
@@ -250,20 +267,25 @@ fn configured(
 }
 
 /// The mean of `hidden` (texts, tokens, hidden) over the tokens that `mask`
-/// (texts, tokens) marks, each row scaled to length 1. Scaling does not change
-/// the cosine similarity that search compares vectors by, and makes the vectors
-/// of every model alike, whether or not its own pipeline scales them.
-fn mean_and_normalize(hidden: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
+/// (texts, tokens) marks.
+fn mean(hidden: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
     let weights = mask.to_dtype(DType::F32)?.unsqueeze(2)?;
     let summed = hidden.broadcast_mul(&weights)?.sum(1)?;
     let counts = weights.sum(1)?.clamp(1.0_f32, f32::INFINITY)?;
-    let means = summed.broadcast_div(&counts)?;
-    let lengths = means
+    summed.broadcast_div(&counts)
+}
+
+/// Each row of `vectors` (texts, dimension) scaled to length 1. Scaling does
+/// not change the cosine similarity that search compares vectors by, and makes
+/// the vectors of every model alike, whether or not its own pipeline scales
+/// them.
+fn scaled_to_length_one(vectors: &Tensor) -> candle_core::Result<Tensor> {
+    let lengths = vectors
         .sqr()?
         .sum_keepdim(1)?
         .sqrt()?
         .clamp(1e-12_f32, f32::INFINITY)?;
-    means.broadcast_div(&lengths)
+    vectors.broadcast_div(&lengths)
 }
 
 /// A model ready to make embedding vectors.
@@ -412,8 +434,28 @@ mod tests {
                 panic!("the network panicked");
             }
             self.calls.lock().unwrap().push(ids.to_vec2::<u32>()?);
-            let ids = ids.to_dtype(DType::F32)?.unsqueeze(2)?;
-            Tensor::cat(&[&ids, &ids.ones_like()?], 2)
+            id_and_one(ids)
+        }
+    }
+
+    /// `[id, 1]` for each token `id`.
+    fn id_and_one(ids: &Tensor) -> candle_core::Result<Tensor> {
+        let ids = ids.to_dtype(DType::F32)?.unsqueeze(2)?;
+        Tensor::cat(&[&ids, &ids.ones_like()?], 2)
+    }
+
+    /// Stands in for a network with a layer after the mean, which squares the
+    /// first value: `[x, y]` becomes `[x², y]`.
+    struct SquaringEncoder;
+
+    impl Encoder for SquaringEncoder {
+        fn hidden_states(&self, ids: &Tensor, _mask: &Tensor) -> candle_core::Result<Tensor> {
+            id_and_one(ids)
+        }
+
+        fn project(&self, means: &Tensor) -> candle_core::Result<Tensor> {
+            let first = means.narrow(1, 0, 1)?.sqr()?;
+            Tensor::cat(&[&first, &means.narrow(1, 1, 1)?], 1)
         }
     }
 
@@ -499,6 +541,26 @@ mod tests {
                 .iter()
                 .all(|embedding| embedding.covers_whole_chunk)
         );
+    }
+
+    #[tokio::test]
+    async fn applies_the_layers_after_the_mean_before_scaling_to_length_one() {
+        let tokenizer = Tokenizer::from_bytes(TOKENIZER).unwrap();
+        let runner = Runner {
+            tokenizer: configured(tokenizer, 16, PAD).unwrap(),
+            encoder: Box::new(SquaringEncoder),
+        };
+        let model = LoadedModel::with_probed_dimension(Arc::new(runner), spec(16))
+            .await
+            .unwrap();
+
+        let embeddings = model.embed_chunks(&["a b"]).await.unwrap();
+
+        // Squaring each token before the mean would give the mean of the
+        // squares; scaling before the layer would not give length 1.
+        let ids = [CLS, DOC, A, B, SEP];
+        let mean = ids.iter().map(|id| *id as f32).sum::<f32>() / ids.len() as f32;
+        assert_close(&embeddings[0].vector, &normalized(&[mean * mean, 1.0]));
     }
 
     #[tokio::test]
