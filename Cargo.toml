@@ -64,10 +64,19 @@ lancedb = { version = "=0.41.0", default-features = false }
 lindera = { version = "=3.0.7", default-features = false, features = ["embed-ipadic"] }
 lindera-dictionary = { version = "=3.0.7", default-features = false }
 lindera-ipadic = { version = "=3.0.7", default-features = false }
+# The HTTP client for handing embedding to Ollama. 0.12 rather than the latest
+# 0.13, with the same features that lance's namespace client already uses
+# (rustls with the ring provider, the operating system's root certificates,
+# JSON), so that this adds no crate to the binary. 0.13 would put a second
+# copy of reqwest in the binary; the 0.13 in Cargo.lock is only for the build
+# script of lindera-ipadic. Move to 0.13 once the reqwest in lancedb's
+# dependencies is 0.13.
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt"], default-features = false }
+tokio = { version = "1.54.1", features = ["rt", "sync"], default-features = false }
 
 [profile.release]
 lto = "thin"
@@ -113,4 +122,6 @@ unimplemented = "deny"
 arrow-array = "58"
 arrow-schema = "58"
 futures = "0.3.34"
-tokio = { version = "1.54.1", features = ["macros", "rt"] }
+# `io-util` and `net` for the tests that answer HTTP requests in place of a
+# server, on a local port.
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt"] }
