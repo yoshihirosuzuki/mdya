@@ -3,18 +3,19 @@
 //! they share, and making locations absolute.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::format::{FileType, Format, FormatError};
-use crate::index::{Index, IndexError};
+use crate::format::{FileType, FormatError};
+use crate::index::IndexError;
 use crate::types::{
     BoxError, CollectionName, DocumentOutcome, Key, ProgressSink, Time, TypeAttributes,
 };
 
+mod flow;
 mod location;
 
+pub use flow::ingest_items;
 pub use location::absolute_location;
 
 /// An ingest implementation. Each one is created by its own module's `create`
@@ -156,17 +157,4 @@ pub trait ItemContents: Send {
     /// The next item's content, or why it could not be read or confirmed to
     /// belong to the item. `None` after the last item.
     async fn next(&mut self) -> Option<Result<Vec<u8>, BoxError>>;
-}
-
-/// The ingest flow shared by the implementations that walk a source.
-pub async fn ingest_items(
-    instruction: &UpdateInstruction,
-    items: IngestItems,
-    contents: &mut dyn ItemContents,
-    format: Arc<dyn Format>,
-    index: Arc<dyn Index>,
-    progress: &dyn ProgressSink,
-) -> Result<UpdateReport, UpdateStopped> {
-    let _ = (instruction, items, contents, format, index, progress);
-    todo!()
 }
