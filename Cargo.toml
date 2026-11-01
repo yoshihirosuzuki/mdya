@@ -20,10 +20,13 @@ keywords = ["markdown", "search", "retrieval", "mcp", "local-first"]
 categories = ["command-line-utilities", "text-processing"]
 # Keep the published crate to what a `cargo install mdya` consumer needs:
 # CI workflows and repo/dev tooling are not used when building from the
-# crates.io tarball. Check with `cargo package --list`.
+# crates.io tarball. `.cargo/` stays in, because the tests read the
+# environment variable that `.cargo/config.toml` sets, so that `cargo test` in
+# the unpacked tarball builds. `cargo install` ignores a package's local
+# configuration unless it installs with `--path`. Check with
+# `cargo package --list`.
 exclude = [
     "/.github",
-    "/.cargo",
     "/clippy.toml",
     "/dist-workspace.toml",
     "/justfile",
@@ -41,12 +44,30 @@ name = "mdya"
 path = "src/lib.rs"
 
 [dependencies]
+async-trait = "0.1.92"
 # Pinned exactly: the components will rely on lancedb behaviour checked
 # against a specific version, so the version moves only on purpose. Used
 # without the `remote` feature (the client for a LanceDB server, which mdya
 # does not use). `default-features = false` keeps any feature lancedb adds to
 # its defaults off unless it is chosen here.
 lancedb = { version = "=0.41.0", default-features = false }
+# Only to turn on `embed-ipadic` for the lindera that lance uses for
+# full-text search, so that the IPADIC dictionary is built into the binary and
+# never downloaded at run time. mdya does not call lindera itself. The
+# dictionary is fetched at build time, by lindera-ipadic's build script.
+# lindera, lindera-dictionary (which builds and loads the dictionary), and
+# lindera-ipadic (which decides which dictionary to fetch) are pinned exactly,
+# so that a build without `--locked` does not pick a newer dictionary that may
+# tokenize differently from the one an existing full-text search index was
+# built with. mdya uses the last two only for this pin. Move all three
+# together with the lindera version that lance's tokenizer requires.
+lindera = { version = "=3.0.7", default-features = false, features = ["embed-ipadic"] }
+lindera-dictionary = { version = "=3.0.7", default-features = false }
+lindera-ipadic = { version = "=3.0.7", default-features = false }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt"], default-features = false }
 
 [profile.release]
 lto = "thin"
@@ -84,3 +105,12 @@ unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 unimplemented = "deny"
+
+[dev-dependencies]
+# The arrow major version that lancedb 0.41.0 uses. Tests build record batches
+# for lancedb with these, so another major version would be a second,
+# incompatible copy of the same types.
+arrow-array = "58"
+arrow-schema = "58"
+futures = "0.3.34"
+tokio = { version = "1.54.1", features = ["macros", "rt"] }

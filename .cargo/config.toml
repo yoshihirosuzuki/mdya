@@ -12,3 +12,13 @@
 # variable is inert on every non-Windows target.
 [env]
 AWS_LC_SYS_PREBUILT_NASM = "1"
+# Tests that use full-text search need LanceDB to find its dictionary
+# configuration through LANCE_LANGUAGE_MODEL_HOME. The variable belongs to the
+# whole process, and setting it while other test threads run is unsound, so
+# tests never set it: cargo sets it here, for every process it runs, to one
+# directory that all tests share (see src/test_support.rs). `force` overrides
+# a value already in the environment, so that tests do not depend on the
+# developer's shell. mdya itself is to set the variable when it starts, which
+# replaces this value under `cargo run` too, except when the data directory's
+# path is not Unicode and mdya leaves the variable alone.
+LANCE_LANGUAGE_MODEL_HOME = { value = "target/mdya-test-data/index_language_models", relative = true, force = true }
