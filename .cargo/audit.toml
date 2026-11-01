@@ -1,32 +1,39 @@
 # cargo-audit configuration for mdya.
 #
-# Each entry below is an "unmaintained" informational advisory from an upstream
-# crate. None of these is a CVE or security advisory. They are accepted as
-# WONTFIX because mdya cannot fix the upstream crate directly; resolution is
-# expected to come from upstream replacing the crate, or from transitive
-# dependency evolution.
+# Every entry below is an advisory against a crate that mdya reaches only
+# through another dependency and cannot replace on its own. Each group says
+# which dependency brings the crate in and when to remove the entries.
 #
-# When an upstream release drops one of these crates, remove the matching ID
-# from this list. Do NOT add CVE or RUSTSEC security advisories here.
+# A security advisory (a vulnerability or unsoundness) is listed here only
+# while no version of the dependency that mdya can use has the fix. Remove it
+# as soon as one does. Details: https://rustsec.org/advisories/<ID>.html
 
 [advisories]
 ignore = [
-    # encoding (unmaintained, via lindera)
-    # https://rustsec.org/advisories/RUSTSEC-2021-0153.html
-    "RUSTSEC-2021-0153",
-    # paste (unmaintained, via datafusion -> lance)
-    # https://rustsec.org/advisories/RUSTSEC-2024-0436.html
+    # paste (unmaintained, via lance-bitpacking and lance-index -> nalgebra ->
+    # simba). Remove when lance no longer depends on it.
     "RUSTSEC-2024-0436",
-    # number_prefix (unmaintained, via hf-hub -> indicatif)
-    # https://rustsec.org/advisories/RUSTSEC-2025-0119.html
-    "RUSTSEC-2025-0119",
-    # bincode (unmaintained, via lindera and lance-tokenizer)
-    # https://rustsec.org/advisories/RUSTSEC-2025-0141.html
-    "RUSTSEC-2025-0141",
-    # ttf-parser (unmaintained, via pdf-extract -> lopdf and via xtask -> krilla -> rustybuzz)
-    # https://rustsec.org/advisories/RUSTSEC-2026-0192.html
-    "RUSTSEC-2026-0192",
-    # rustybuzz (unmaintained, via xtask -> krilla)
-    # https://rustsec.org/advisories/RUSTSEC-2026-0206.html
-    "RUSTSEC-2026-0206",
+
+    # unsafe-libyaml (unmaintained, via lindera -> serde_yaml_ng; lance uses
+    # lindera for full-text search). Remove when lindera no longer depends on it.
+    "RUSTSEC-2024-0449",
+
+    # zstd 0.13 and zstd-safe 7 (via arrow-ipc 58). The fixes are in zstd 0.14
+    # and zstd-safe 8, which arrow-ipc uses from 60 on, while lancedb 0.41.0
+    # requires arrow 58. Remove these when lancedb moves to an arrow release
+    # whose arrow-ipc uses zstd 0.14. RUSTSEC-2026-0391, 0398, and 0403 are
+    # vulnerabilities; the others are unsound.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0395",
+    "RUSTSEC-2026-0396",
+    "RUSTSEC-2026-0397",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0399",
+    "RUSTSEC-2026-0400",
+    "RUSTSEC-2026-0401",
+    "RUSTSEC-2026-0402",
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0404",
+    "RUSTSEC-2026-0405",
+    "RUSTSEC-2026-0406",
 ]

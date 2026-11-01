@@ -1,16 +1,9 @@
-//! mdya library crate. Re-exports module entry points so binary and tests
-//! share the same surface.
+//! mdya: local retrieval over your own documents, from the command line or as
+//! an MCP server.
 
-pub mod chunking;
-pub mod cli;
-pub mod config;
-pub mod embedding;
-pub mod extract;
-pub mod format;
-pub mod get;
-pub mod ingest;
-pub mod introspect;
-pub mod mcp;
-pub mod runtime;
-pub mod search;
-pub mod store;
+// Clippy has no setting that allows `unimplemented!` in tests, so allow it for
+// the library's test build. The non-test build still checks the code outside
+// tests.
+#![cfg_attr(test, allow(clippy::unimplemented))]
+
+pub mod gateway;

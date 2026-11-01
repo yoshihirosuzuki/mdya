@@ -24,9 +24,9 @@ When reporting, please include:
 
 Acknowledgement of reports usually happens within a few business days. There is no formal SLA — mdya is maintained by one person.
 
-## Informational advisories
+## Ignored advisories
 
-`cargo audit` runs daily on a schedule, and a failing run opens an issue labelled `security-advisory`. It also runs locally as part of `just check`. Upstream crates flagged as `unmaintained` (informational, not CVE) that mdya cannot fix directly are tracked in [`.cargo/audit.toml`](.cargo/audit.toml). Each ignored advisory is reviewed when an upstream release drops the crate. CVE / RUSTSEC security advisories are never suppressed.
+`cargo audit` runs daily on a schedule, and a failing run opens an issue labelled `security-advisory`. It also runs locally as part of `just check`. Advisories against crates that mdya reaches only through another dependency, and cannot replace on its own, are listed in [`.cargo/audit.toml`](.cargo/audit.toml), each with the dependency that brings the crate in and the condition for removing the entry. An `unmaintained` advisory stays there until the dependency drops the crate. A security advisory (a vulnerability or unsoundness) is listed only while no version of the dependency that mdya can use has the fix, and is removed as soon as one does.
 
 ## How fixes are shipped
 

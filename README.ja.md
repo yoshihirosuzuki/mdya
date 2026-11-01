@@ -143,7 +143,6 @@ runtime:
 
 ```sh
 just check    # fmt-check + clippy (-D warnings) + cargo test (全 workspace) + cargo audit
-just smoke    # smoke テストのみ実行
 just          # recipe 一覧を表示
 ```
 
