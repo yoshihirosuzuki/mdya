@@ -2,9 +2,10 @@
 //! cache directory.
 //!
 //! The files of a model at a revision go to
-//! `<cache>/<owner>/<name>/<revision>/<file>`. A file that is already there is
-//! used without asking Hugging Face. A file being fetched is written to a
-//! partial file next to it (`.<file>.<random>.part`), and moved to its name
+//! `<cache>/<owner>/<name>/<revision>/<file>`, where `<file>` may include a
+//! subdirectory of the repository. A file that is already there is used
+//! without asking Hugging Face. A file being fetched is written to a partial
+//! file next to it (`.<file name>.<random>.part`), and moved to its name
 //! only when it is complete and only if no file is there yet, so that a reader
 //! never sees half a file. Processes that share the cache and fetch the same
 //! file at once each fetch it; the content at a revision is the same, so
@@ -66,7 +67,9 @@ impl Hub {
 
     /// Makes sure that `files` of `repository` (`owner/name`) at `revision`
     /// are in `cache_dir`, fetching the ones that are not, and returns the
-    /// directory they are in. Creates the directories it needs.
+    /// directory they are in. A file may be in a subdirectory of the
+    /// repository (`2_Dense/model.safetensors`), and goes in the same
+    /// subdirectory. Creates the directories it needs.
     pub(super) async fn fetch(
         &self,
         cache_dir: &Path,
@@ -77,36 +80,42 @@ impl Hub {
         let mut dir = cache_dir.to_owned();
         dir.extend(repository.split('/'));
         dir.push(revision);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|error| cache_error(&dir, error))?;
+        let paths: Vec<PathBuf> = files.iter().map(|file| dir.join(file)).collect();
+        let mut dirs: Vec<PathBuf> = paths
+            .iter()
+            .map(|path| place_of(path).0.to_owned())
+            .chain([dir.clone()])
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        for dir in &dirs {
+            tokio::fs::create_dir_all(dir)
+                .await
+                .map_err(|error| cache_error(dir, error))?;
+        }
         // Only a failure to hand the work to a thread (the runtime shutting
         // down) can be returned, and the cleanup is not needed for the fetch.
-        let _ = blocking({
-            let dir = dir.clone();
-            move || remove_stale_partials(&dir)
-        })
-        .await;
-        for file in files {
-            let path = dir.join(file);
-            if tokio::fs::try_exists(&path)
+        let _ = blocking(move || dirs.iter().for_each(|dir| remove_stale_partials(dir))).await;
+        for (file, path) in files.iter().zip(&paths) {
+            if tokio::fs::try_exists(path)
                 .await
-                .map_err(|error| cache_error(&path, error))?
+                .map_err(|error| cache_error(path, error))?
             {
                 continue;
             }
             let url = format!("{}/{repository}/resolve/{revision}/{file}", self.base);
-            self.download(&url, &dir, file).await?;
+            self.download(&url, path).await?;
         }
         Ok(dir)
     }
 
-    /// Downloads `url` to a partial file of `file` in `dir`, then moves it to
-    /// `file` unless a file is already there.
-    async fn download(&self, url: &str, dir: &Path, file: &str) -> Result<(), BoxError> {
+    /// Downloads `url` to a partial file next to `path`, then moves it to
+    /// `path` unless a file is already there.
+    async fn download(&self, url: &str, path: &Path) -> Result<(), BoxError> {
         let mut response = self.request(url).await?;
         let expected = response.content_length();
-        let (out, partial) = new_partial(dir, file).await?;
+        let (dir, name) = place_of(path);
+        let (out, partial) = new_partial(dir, name).await?;
         let mut out = tokio::fs::File::from_std(out);
         let mut written: u64 = 0;
         while let Some(piece) = response.chunk().await? {
@@ -128,7 +137,7 @@ impl Hub {
                 written,
             }));
         }
-        persist(out, partial, dir.join(file)).await
+        persist(out, partial, path.to_owned()).await
     }
 
     async fn request(&self, url: &str) -> Result<reqwest::Response, BoxError> {
@@ -142,6 +151,19 @@ impl Hub {
         }
         Ok(response)
     }
+}
+
+/// The directory of `path`, a file of a model, and the name of the file.
+#[expect(clippy::expect_used)]
+fn place_of(path: &Path) -> (&Path, &str) {
+    let dir = path
+        .parent()
+        .expect("a file of a model is in the model's directory");
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the files of the models have names in UTF-8");
+    (dir, name)
 }
 
 /// Creates a partial file for `file` in `dir`, locked for as long as the
@@ -737,6 +759,62 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("model.safetensors")).unwrap(),
             "weights"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetches_a_file_in_a_subdirectory_into_that_subdirectory() {
+        let stand_in =
+            StandIn::start(files_answered(&[("2_Dense/model.safetensors", "dense")])).await;
+        let cache = tempfile::tempdir().unwrap();
+
+        let dir = Hub::connect(&stand_in.base, None)
+            .unwrap()
+            .fetch(
+                cache.path(),
+                "owner/model",
+                REVISION,
+                &["2_Dense/model.safetensors"],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stand_in.received()[0].path,
+            path_of("2_Dense/model.safetensors")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("2_Dense").join("model.safetensors")).unwrap(),
+            "dense"
+        );
+        assert_eq!(entries(&dir.join("2_Dense")), ["model.safetensors"]);
+    }
+
+    #[tokio::test]
+    async fn removes_partial_files_of_stopped_fetches_in_a_subdirectory() {
+        let cache = tempfile::tempdir().unwrap();
+        let subdirectory = model_dir(cache.path()).join("2_Dense");
+        place_partials(
+            &subdirectory,
+            &[".model.safetensors.a1.part"],
+            &[".model.safetensors.b2.part"],
+        );
+        std::fs::write(subdirectory.join("model.safetensors"), "dense").unwrap();
+
+        Hub::connect("http://127.0.0.1:9", None)
+            .unwrap()
+            .fetch(
+                cache.path(),
+                "owner/model",
+                REVISION,
+                &["2_Dense/model.safetensors"],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            entries(&subdirectory),
+            [".model.safetensors.b2.part", "model.safetensors"]
         );
     }
 
