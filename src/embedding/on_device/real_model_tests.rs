@@ -11,9 +11,9 @@
 //!   google/embeddinggemma-300m, whose files need permission and a token.
 //!   Keep the file outside the repository, so that it is never committed.
 //!   Without it, that test fails to fetch the model.
-//! - `MDYA_TEST_MODEL_CACHE_DIR`: the directory to fetch the models to, kept
-//!   between runs. Without it, each test fetches to a new temporary
-//!   directory.
+//! - `MDYA_TEST_MODEL_CACHE_DIR`: the absolute path of the directory to fetch
+//!   the models to, kept between runs. Without it, each test fetches to a new
+//!   temporary directory.
 //!
 //! The all-MiniLM-L6-v2 and embeddinggemma-300m tests also need Ollama running
 //! at its default endpoint with `all-minilm` and `embeddinggemma` pulled, to
@@ -67,7 +67,10 @@ fn hf_token() -> Option<String> {
 fn embedding(model: &str, cache: &Cache) -> Arc<dyn Embedding> {
     create(EmbeddingSettings {
         model: model.to_owned(),
-        model_cache_dir: cache.dir.clone(),
+        model_cache_dir: {
+            let dir = cache.dir.clone();
+            Arc::new(move || Ok(dir.clone()))
+        },
         hf_token: hf_token(),
         ollama_endpoint: "http://127.0.0.1:11434".to_owned(),
     })

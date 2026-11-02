@@ -26,13 +26,20 @@ pub struct EmbeddingSettings {
     /// The embedding model setting. It must name a supported model (see
     /// [`is_supported_model`]).
     pub model: String,
-    pub model_cache_dir: PathBuf,
+    /// Decides the embedding model cache directory and returns it, as an
+    /// absolute path. It is called each time a model run on this PC is
+    /// prepared, again after a preparation that failed or panicked, and never
+    /// when Ollama runs the model. It is called from async code, so it should
+    /// not block for long. An error it returns makes the model unavailable,
+    /// as the source of [`EmbeddingError::ModelUnavailable`].
+    pub model_cache_dir: Arc<dyn Fn() -> Result<PathBuf, BoxError> + Send + Sync>,
     pub hf_token: Option<String>,
     pub ollama_endpoint: String,
 }
 
-/// Creates the component. Nothing is downloaded or loaded until a function
-/// first needs the model.
+/// Creates the component. Nothing is downloaded or loaded until the model is
+/// first needed. `model_cache_dir` is not called before then, nor ever for a
+/// model that Ollama runs.
 ///
 /// Panics when the setting names no supported model: `config` hands over only
 /// a setting that does.
@@ -103,12 +110,33 @@ pub trait Embedding: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
+    /// Settings whose `model_cache_dir` must not be called.
     fn settings(model: &str) -> EmbeddingSettings {
         EmbeddingSettings {
             model: model.to_owned(),
-            model_cache_dir: PathBuf::from("not-used"),
+            model_cache_dir: Arc::new(|| panic!("model_cache_dir was called")),
+            hf_token: None,
+            ollama_endpoint: "http://127.0.0.1:11434".to_owned(),
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the cache directory cannot be decided")]
+    struct NoCacheDir;
+
+    /// Settings for a model run on this PC, whose cache directory cannot be
+    /// decided. Counts the calls to `model_cache_dir` in `calls`.
+    fn settings_without_a_cache_dir(calls: Arc<AtomicUsize>) -> EmbeddingSettings {
+        EmbeddingSettings {
+            model: "sentence-transformers/all-MiniLM-L6-v2".to_owned(),
+            model_cache_dir: Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(Box::new(NoCacheDir))
+            }),
             hf_token: None,
             ollama_endpoint: "http://127.0.0.1:11434".to_owned(),
         }
@@ -133,19 +161,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_touch_the_cache_directory_when_ollama_runs_the_model() {
-        let parent = tempfile::tempdir().unwrap();
-        let cache_dir = parent.path().join("cache");
+    async fn does_not_call_model_cache_dir_when_ollama_runs_the_model() {
+        // `settings` gives a `model_cache_dir` that panics when called.
         let embedding = create(EmbeddingSettings {
-            model: "ollama:nomic-embed-text".to_owned(),
-            model_cache_dir: cache_dir.clone(),
-            hf_token: None,
             // Nothing listens here, so preparing the model fails.
             ollama_endpoint: "http://127.0.0.1:9".to_owned(),
+            ..settings("ollama:nomic-embed-text")
         });
 
         assert!(embedding.model().await.is_err());
-        assert!(!cache_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn returns_an_error_of_model_cache_dir_as_the_source_of_an_unavailable_model() {
+        let embedding = create(settings_without_a_cache_dir(Arc::default()));
+
+        let error = embedding.model().await.unwrap_err();
+
+        let EmbeddingError::ModelUnavailable { source } = error else {
+            panic!("expected ModelUnavailable, got {error:?}");
+        };
+        assert!(source.is::<NoCacheDir>());
+    }
+
+    #[tokio::test]
+    async fn calls_model_cache_dir_for_each_preparation_of_the_model() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedding = create(settings_without_a_cache_dir(calls.clone()));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        assert!(embedding.model().await.is_err());
+        assert!(embedding.embed_query("query").await.is_err());
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

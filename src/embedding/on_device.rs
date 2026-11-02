@@ -96,11 +96,13 @@ pub(super) fn spec(model: OnDeviceModel) -> ModelSpec {
     }
 }
 
-/// Prepares a model run on this PC: fetches its files unless they are in the
-/// cache, loads it, and learns its dimension by embedding a short text.
+/// Prepares a model run on this PC: calls `cache_dir`, fetches the model's
+/// files unless they are already under the directory it returns, loads the
+/// model, and learns its dimension by embedding a short text.
 pub(super) struct OnDevicePreparation {
     model: OnDeviceModel,
-    cache_dir: PathBuf,
+    /// Decides the cache directory and returns it, as an absolute path.
+    cache_dir: Arc<dyn Fn() -> Result<PathBuf, BoxError> + Send + Sync>,
     hub: HubSettings,
 }
 
@@ -121,7 +123,11 @@ impl HubSettings {
 }
 
 impl OnDevicePreparation {
-    pub(super) fn new(model: OnDeviceModel, cache_dir: PathBuf, hub: HubSettings) -> Self {
+    pub(super) fn new(
+        model: OnDeviceModel,
+        cache_dir: Arc<dyn Fn() -> Result<PathBuf, BoxError> + Send + Sync>,
+        hub: HubSettings,
+    ) -> Self {
         Self {
             model,
             cache_dir,
@@ -134,6 +140,9 @@ impl OnDevicePreparation {
 impl ModelPreparation for OnDevicePreparation {
     async fn prepare(&self) -> Result<Arc<dyn PreparedModel>, EmbeddingError> {
         let spec = spec(self.model);
+        // Called first, so that a cache directory that cannot be decided fails
+        // the preparation before anything else is done.
+        let cache_dir = (self.cache_dir)().map_err(unavailable)?;
         let hub = Hub::connect(&self.hub.base, self.hub.token.clone()).map_err(unavailable)?;
         let files: Vec<&str> = FILES
             .iter()
@@ -141,12 +150,7 @@ impl ModelPreparation for OnDevicePreparation {
             .copied()
             .collect();
         let dir = hub
-            .fetch(
-                &self.cache_dir,
-                self.model.repository(),
-                spec.revision,
-                &files,
-            )
+            .fetch(&cache_dir, self.model.repository(), spec.revision, &files)
             .await
             .map_err(unavailable)?;
         let runner = run_blocking(move || Runner::load(&dir, &spec)).await?;

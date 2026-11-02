@@ -5,7 +5,6 @@
 //! checked with Ollama 0.40.13.
 
 use std::error::Error as _;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::embedding::{Embedding, EmbeddingError, EmbeddingSettings, create};
@@ -15,8 +14,8 @@ const ENDPOINT: &str = "http://127.0.0.1:11434";
 fn embedding(model: &str) -> Arc<dyn Embedding> {
     create(EmbeddingSettings {
         model: model.to_owned(),
-        // Ollama keeps its own models; the cache directory is not used.
-        model_cache_dir: PathBuf::from("not-used"),
+        // Ollama keeps its own models; `model_cache_dir` is not called.
+        model_cache_dir: Arc::new(|| panic!("model_cache_dir was called")),
         hf_token: None,
         ollama_endpoint: ENDPOINT.to_owned(),
     })
