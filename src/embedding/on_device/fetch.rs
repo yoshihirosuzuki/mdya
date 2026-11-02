@@ -50,14 +50,25 @@ pub(super) struct Hub {
 }
 
 impl Hub {
-    /// A hub at `base` (Hugging Face itself, or a stand-in in tests). `token`
-    /// is sent with every request, for models whose use needs permission.
+    /// A hub at `base` (Hugging Face itself). `token` is sent with every
+    /// request, for models whose use needs permission.
     pub(super) fn connect(base: &str, token: Option<String>) -> Result<Self, BoxError> {
-        // The proxy is not taken from environment variables: mdya reads no
-        // environment variable for where to connect. Redirects are followed,
-        // because Hugging Face answers with a redirect to where the file is
-        // served; reqwest drops the token on a redirect to another host.
-        let client = reqwest::Client::builder().no_proxy().build()?;
+        // Requests go through the proxy that `HTTPS_PROXY` and the like name,
+        // unless `NO_PROXY` lists the host, as reqwest reads them.
+        Self::connect_with(reqwest::Client::builder(), base, token)
+    }
+
+    /// A hub as `connect` makes it, with a client that `builder` makes. The
+    /// tests pass a builder without a proxy, for their stand-in on this PC.
+    fn connect_with(
+        builder: reqwest::ClientBuilder,
+        base: &str,
+        token: Option<String>,
+    ) -> Result<Self, BoxError> {
+        // Redirects are followed, because Hugging Face answers with a redirect
+        // to where the file is served; reqwest drops the token on a redirect
+        // to another host.
+        let client = builder.build()?;
         Ok(Self {
             client,
             base: base.trim_end_matches('/').to_owned(),
@@ -433,6 +444,12 @@ mod tests {
         )
     }
 
+    /// A hub at `base` whose requests go directly there, whatever proxy the
+    /// environment variables of the machine running the tests name.
+    fn hub_at(base: &str, token: Option<String>) -> Hub {
+        Hub::connect_with(reqwest::Client::builder().no_proxy(), base, token).unwrap()
+    }
+
     const REVISION: &str = "0123abcd";
 
     fn path_of(file: &str) -> String {
@@ -486,7 +503,7 @@ mod tests {
         .await;
         let cache = tempfile::tempdir().unwrap();
         let cache_dir = cache.path().join("not-yet-there");
-        let hub = Hub::connect(&stand_in.base, None).unwrap();
+        let hub = hub_at(&stand_in.base, None);
 
         let dir = hub
             .fetch(
@@ -514,13 +531,13 @@ mod tests {
     async fn uses_the_files_in_the_cache_without_asking_hugging_face() {
         let stand_in = StandIn::start(files_answered(&[("config.json", "{}")])).await;
         let cache = tempfile::tempdir().unwrap();
-        let hub = Hub::connect(&stand_in.base, None).unwrap();
+        let hub = hub_at(&stand_in.base, None);
         hub.fetch(cache.path(), "owner/model", REVISION, &["config.json"])
             .await
             .unwrap();
 
         // Nothing listens here, so asking would fail.
-        let offline = Hub::connect("http://127.0.0.1:9", None).unwrap();
+        let offline = hub_at("http://127.0.0.1:9", None);
         let dir = offline
             .fetch(cache.path(), "owner/model", REVISION, &["config.json"])
             .await
@@ -538,13 +555,11 @@ mod tests {
         let stand_in = StandIn::start(files_answered(&[("a", "1"), ("b", "2")])).await;
         let cache = tempfile::tempdir().unwrap();
 
-        Hub::connect(&stand_in.base, Some("hf_secret".to_owned()))
-            .unwrap()
+        hub_at(&stand_in.base, Some("hf_secret".to_owned()))
             .fetch(cache.path(), "owner/model", REVISION, &["a"])
             .await
             .unwrap();
-        Hub::connect(&stand_in.base, None)
-            .unwrap()
+        hub_at(&stand_in.base, None)
             .fetch(cache.path(), "owner/model", REVISION, &["b"])
             .await
             .unwrap();
@@ -575,8 +590,7 @@ mod tests {
         let stand_in = StandIn::start(answers).await;
         let cache = tempfile::tempdir().unwrap();
 
-        let dir = Hub::connect(&stand_in.base, None)
-            .unwrap()
+        let dir = hub_at(&stand_in.base, None)
             .fetch(
                 cache.path(),
                 "owner/model",
@@ -609,8 +623,7 @@ mod tests {
         let stand_in = StandIn::start(answers).await;
         let cache = tempfile::tempdir().unwrap();
 
-        let error = Hub::connect(&stand_in.base, None)
-            .unwrap()
+        let error = hub_at(&stand_in.base, None)
             .fetch(cache.path(), "owner/model", REVISION, &["config.json"])
             .await
             .unwrap_err();
@@ -637,8 +650,7 @@ mod tests {
         let stand_in = StandIn::start(answers).await;
         let cache = tempfile::tempdir().unwrap();
 
-        let result = Hub::connect(&stand_in.base, None)
-            .unwrap()
+        let result = hub_at(&stand_in.base, None)
             .fetch(
                 cache.path(),
                 "owner/model",
@@ -662,8 +674,7 @@ mod tests {
             &[".model.safetensors.c3.part"],
         );
 
-        Hub::connect(&stand_in.base, None)
-            .unwrap()
+        hub_at(&stand_in.base, None)
             .fetch(
                 cache.path(),
                 "owner/model",
@@ -688,8 +699,7 @@ mod tests {
         place_partials(&dir, &[".config.json.a1.part"], &[]);
         std::fs::write(dir.join("config.json"), "{}").unwrap();
 
-        Hub::connect("http://127.0.0.1:9", None)
-            .unwrap()
+        hub_at("http://127.0.0.1:9", None)
             .fetch(cache.path(), "owner/model", REVISION, &["config.json"])
             .await
             .unwrap();
@@ -711,8 +721,7 @@ mod tests {
         held.lock().unwrap();
         std::fs::write(dir.join("model.safetensors"), "weights").unwrap();
 
-        Hub::connect("http://127.0.0.1:9", None)
-            .unwrap()
+        hub_at("http://127.0.0.1:9", None)
             .fetch(
                 cache.path(),
                 "owner/model",
@@ -736,7 +745,7 @@ mod tests {
         let stand_in =
             StandIn::start_in_batches(files_answered(&[("model.safetensors", "weights")]), 2).await;
         let cache = tempfile::tempdir().unwrap();
-        let hub = Arc::new(Hub::connect(&stand_in.base, None).unwrap());
+        let hub = Arc::new(hub_at(&stand_in.base, None));
 
         let fetches: Vec<_> = (0..2)
             .map(|_| {
@@ -768,8 +777,7 @@ mod tests {
             StandIn::start(files_answered(&[("2_Dense/model.safetensors", "dense")])).await;
         let cache = tempfile::tempdir().unwrap();
 
-        let dir = Hub::connect(&stand_in.base, None)
-            .unwrap()
+        let dir = hub_at(&stand_in.base, None)
             .fetch(
                 cache.path(),
                 "owner/model",
@@ -801,8 +809,7 @@ mod tests {
         );
         std::fs::write(subdirectory.join("model.safetensors"), "dense").unwrap();
 
-        Hub::connect("http://127.0.0.1:9", None)
-            .unwrap()
+        hub_at("http://127.0.0.1:9", None)
             .fetch(
                 cache.path(),
                 "owner/model",

@@ -1,5 +1,6 @@
 //! Ollama's embedding endpoint over HTTP (`POST /api/embed`).
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,22 +40,52 @@ impl HttpEmbedEndpoint {
         endpoint: &str,
         model: &OllamaModelName,
     ) -> Result<Arc<dyn EmbedEndpoint>, BoxError> {
-        // The texts go only to the server that the endpoint setting names.
-        // Without these, reqwest would take a proxy from environment variables
-        // such as `HTTPS_PROXY` (mdya reads no environment variable for the
-        // endpoint), and follow redirects, which for status 307 and 308 send
-        // the same request, texts included, to the URL the answer names. A
-        // redirect answer is taken as an error answer instead.
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        // Redirects are not followed: for status 307 and 308, reqwest would
+        // send the same request, texts included, to the URL the answer names,
+        // which the endpoint setting does not name. A redirect answer is taken
+        // as an error answer instead.
+        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        // An Ollama on this PC is reached directly, whatever proxy the
+        // environment variables name, as Go's standard library does for
+        // `localhost` and loopback addresses: a proxy on another machine would
+        // take the texts off this PC, and would look for the Ollama on its own
+        // machine. Any other endpoint goes through the proxy that `HTTP_PROXY`
+        // and the like name, unless `NO_PROXY` lists its host, as reqwest
+        // reads them. The host looked at is that of the URL the requests go
+        // to, so that it is the host they reach.
+        let url = embed_url(endpoint);
+        if is_on_this_pc(&url) {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build()?;
         Ok(Arc::new(Self {
             client,
-            url: embed_url(endpoint),
+            url,
             model: model.clone(),
         }))
     }
+}
+
+/// Whether `url` names this PC: its host is `localhost` or a loopback
+/// address. A string that is not a URL names no host.
+fn is_on_this_pc(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // An IPv6 host comes in brackets.
+    let address = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    address
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.to_canonical().is_loopback())
 }
 
 /// The URL of the embedding endpoint of the Ollama at `endpoint`. A trailing
@@ -429,6 +460,51 @@ mod tests {
 
         assert_eq!(cut, format!("{}…", "a".repeat(MESSAGE_MAX_BYTES - 4)));
         assert!(cut.len() <= MESSAGE_MAX_BYTES);
+    }
+
+    #[test]
+    fn takes_localhost_and_loopback_addresses_as_this_pc() {
+        for url in [
+            "http://localhost:11434/api/embed",
+            "http://LOCALHOST:11434/api/embed",
+            "http://127.0.0.1:11434/api/embed",
+            "http://127.1.2.3/api/embed",
+            "http://[::1]:11434/api/embed",
+            "http://[::ffff:127.0.0.1]:11434/api/embed",
+        ] {
+            assert!(is_on_this_pc(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn takes_other_hosts_and_strings_that_are_not_urls_as_not_this_pc() {
+        for url in [
+            "http://192.168.1.10:11434/api/embed",
+            "https://example.com/ollama/api/embed",
+            "http://localhost.example.com/api/embed",
+            // Reaches this PC on some systems, but is not a loopback address,
+            // as in Go's standard library.
+            "http://0.0.0.0:11434/api/embed",
+            "http://[::2]:11434/api/embed",
+            "http://[::ffff:192.168.1.10]:11434/api/embed",
+            "not a URL",
+        ] {
+            assert!(!is_on_this_pc(url), "{url}");
+        }
+    }
+
+    // An endpoint with no host, `http://`, becomes `http:/api/embed`, which
+    // reqwest reads as the host `api`; the judgment is about that host too.
+    #[test]
+    fn judges_the_host_of_the_url_that_the_requests_go_to() {
+        let no_host = embed_url("http://");
+
+        assert!(is_on_this_pc(&embed_url("http://localhost:11434/")));
+        assert_eq!(
+            reqwest::Url::parse(&no_host).unwrap().host_str(),
+            Some("api")
+        );
+        assert!(!is_on_this_pc(&no_host));
     }
 
     #[test]
