@@ -1,9 +1,11 @@
-//! Escapes U+007F and U+0080 to U+009F in JSON that has already been written
-//! out, as `\u007f` and so on. JSON's own escaping covers only U+0000 to
-//! U+001F, and RFC 8259 lets any character be escaped, so the JSON reads
-//! the same.
+//! Escapes U+007F, U+0080 to U+009F, and the characters that change the
+//! direction of text (U+202A to U+202E and U+2066 to U+2069) in JSON that
+//! has already been written out, as `\u007f` and so on. JSON's own escaping
+//! covers only U+0000 to U+001F, and RFC 8259 lets any character be escaped,
+//! so the JSON reads the same.
 
 use std::io::{self, Write};
+use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
@@ -13,13 +15,41 @@ use super::JsonEscape;
 
 /// The first byte of U+0080 to U+009F in UTF-8; the second is 0x80 to 0x9F.
 const C1_LEAD: u8 = 0xC2;
+/// The first byte of the characters that change the direction of text in
+/// UTF-8: U+202A to U+202E are 0xE2 0x80 0xAA to 0xAE, and U+2066 to U+2069
+/// are 0xE2 0x81 0xA6 to 0xA9.
+const DIRECTION_LEAD: u8 = 0xE2;
 const DELETE: u8 = 0x7F;
 
-/// Escapes JSON that arrives in pieces. Keeps a trailing `C1_LEAD` byte until
-/// the next piece shows whether it starts a C1 control character.
+/// Escapes JSON that arrives in pieces. Keeps the bytes at the end of a piece
+/// that may begin a character to escape, until the next piece shows whether
+/// they do.
 #[derive(Default)]
 pub(super) struct JsonEscaper {
-    held: Option<u8>,
+    held: Held,
+}
+
+/// The bytes kept from the end of the last piece.
+#[derive(Clone, Copy, Default)]
+enum Held {
+    #[default]
+    Nothing,
+    C1Lead,
+    DirectionLead,
+    /// `DIRECTION_LEAD` and the second byte, 0x80 or 0x81.
+    DirectionLeadAnd(u8),
+}
+
+impl Held {
+    /// Appends the held bytes, unchanged.
+    fn push_to(self, out: &mut Vec<u8>) {
+        match self {
+            Self::Nothing => {}
+            Self::C1Lead => out.push(C1_LEAD),
+            Self::DirectionLead => out.push(DIRECTION_LEAD),
+            Self::DirectionLeadAnd(second) => out.extend_from_slice(&[DIRECTION_LEAD, second]),
+        }
+    }
 }
 
 impl JsonEscaper {
@@ -35,32 +65,53 @@ impl JsonEscaper {
         }
     }
 
-    /// Appends the held byte, if any, unchanged.
+    /// Appends the held bytes, if any, unchanged.
     fn release(&mut self, out: &mut Vec<u8>) {
-        if let Some(lead) = self.held.take() {
-            out.push(lead);
-        }
+        mem::take(&mut self.held).push_to(out);
     }
 
     fn push_byte(&mut self, byte: u8, out: &mut Vec<u8>) {
-        if let Some(lead) = self.held.take() {
+        match (mem::take(&mut self.held), byte) {
             // After `C1_LEAD`, 0x80 to 0x9F is U+0080 to U+009F: the code
             // point equals the second byte.
-            if (0x80..=0x9F).contains(&byte) {
-                push_json_escape(byte, out);
-                return;
+            (Held::C1Lead, 0x80..=0x9F) => push_json_escape(u32::from(byte), out),
+            // After `DIRECTION_LEAD`, 0x80 followed by 0xAA to 0xAE is
+            // U+202A to U+202E, and 0x81 followed by 0xA6 to 0xA9 is U+2066
+            // to U+2069.
+            (Held::DirectionLead, 0x80 | 0x81) => self.held = Held::DirectionLeadAnd(byte),
+            (Held::DirectionLeadAnd(second @ 0x80), 0xAA..=0xAE)
+            | (Held::DirectionLeadAnd(second @ 0x81), 0xA6..=0xA9) => {
+                push_json_escape(direction_code_point(second, byte), out);
             }
-            out.push(lead);
+            (held, _) => {
+                // What is held, if anything, does not begin a character to
+                // escape, but `byte` may.
+                held.push_to(out);
+                self.push_first_byte(byte, out);
+            }
         }
+    }
+
+    /// Looks at a byte with nothing held before it.
+    fn push_first_byte(&mut self, byte: u8, out: &mut Vec<u8>) {
         match byte {
-            DELETE => push_json_escape(DELETE, out),
-            C1_LEAD => self.held = Some(byte),
+            DELETE => push_json_escape(u32::from(DELETE), out),
+            C1_LEAD => self.held = Held::C1Lead,
+            DIRECTION_LEAD => self.held = Held::DirectionLead,
             _ => out.push(byte),
         }
     }
 }
 
-fn push_json_escape(code_point: u8, out: &mut Vec<u8>) {
+/// The code point of the character that is `DIRECTION_LEAD`, `second`, and
+/// `third` in UTF-8.
+fn direction_code_point(second: u8, third: u8) -> u32 {
+    (u32::from(DIRECTION_LEAD & 0x0F) << 12)
+        | (u32::from(second & 0x3F) << 6)
+        | u32::from(third & 0x3F)
+}
+
+fn push_json_escape(code_point: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(format!("\\u{code_point:04x}").as_bytes());
 }
 
@@ -257,6 +308,108 @@ mod tests {
     }
 
     #[test]
+    fn characters_that_change_the_direction_of_text_become_json_escapes() {
+        let json = "[\"\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}\"]";
+
+        assert_eq!(
+            escape_all(&[json.as_bytes()]),
+            br#"["\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"]"#
+        );
+    }
+
+    #[test]
+    fn other_characters_near_the_direction_characters_stay() {
+        // U+061C, U+200E, and U+200F also have the Unicode property
+        // Bidi_Control. U+061C is 0xD8 0x9C. Every other character in the
+        // string is three bytes starting with 0xE2, like the characters that
+        // change the direction of text. U+200E, U+200F, U+2014, U+2026,
+        // U+2029, and U+202F start with 0xE2 0x80, U+2060, U+2065, and
+        // U+206A with 0xE2 0x81, and U+20AC with 0xE2 0x82.
+        let json = "\"\u{61c}\u{200e}\u{200f}\u{2014}\u{2026}\u{2029}\u{202f}\u{2060}\u{2065}\u{206a}\u{20ac}\"";
+
+        assert_eq!(escape_all(&[json.as_bytes()]), json.as_bytes());
+    }
+
+    #[test]
+    fn a_direction_character_split_anywhere_is_escaped() {
+        for (character, escaped) in [('\u{202e}', br#""\u202e""#), ('\u{2066}', br#""\u2066""#)] {
+            let json = format!("\"{character}\"");
+            let bytes = json.as_bytes();
+
+            assert_eq!(escape_all(&[&bytes[..2], &bytes[2..]]), escaped);
+            assert_eq!(escape_all(&[&bytes[..3], &bytes[3..]]), escaped);
+            assert_eq!(
+                escape_all(&[&bytes[..2], &bytes[2..3], &bytes[3..]]),
+                escaped
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_that_break_off_are_passed_on_and_the_next_byte_is_looked_at_again() {
+        // Not valid UTF-8, but no byte may be lost, and a character to escape
+        // right after the bytes that broke off is still escaped.
+        // The input, the bytes passed on unchanged, and the escape after them.
+        let cases: [(&[u8], &[u8], &[u8]); 7] = [
+            (
+                &[DIRECTION_LEAD, 0x80, C1_LEAD, 0x80],
+                &[DIRECTION_LEAD, 0x80],
+                br"\u0080",
+            ),
+            (
+                &[C1_LEAD, DIRECTION_LEAD, 0x80, 0xAE],
+                &[C1_LEAD],
+                br"\u202e",
+            ),
+            (
+                &[DIRECTION_LEAD, 0x80, DIRECTION_LEAD, 0x80, 0xAE],
+                &[DIRECTION_LEAD, 0x80],
+                br"\u202e",
+            ),
+            (
+                &[DIRECTION_LEAD, 0x81, DELETE],
+                &[DIRECTION_LEAD, 0x81],
+                br"\u007f",
+            ),
+            (
+                &[DIRECTION_LEAD, DIRECTION_LEAD, 0x81, 0xA6],
+                &[DIRECTION_LEAD],
+                br"\u2066",
+            ),
+            (
+                &[DIRECTION_LEAD, C1_LEAD, 0x80],
+                &[DIRECTION_LEAD],
+                br"\u0080",
+            ),
+            (&[DIRECTION_LEAD, DELETE], &[DIRECTION_LEAD], br"\u007f"),
+        ];
+
+        for (input, passed_on, escaped) in cases {
+            assert_eq!(
+                escape_all(&[input]),
+                [passed_on, escaped].concat(),
+                "{input:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn direction_bytes_held_at_the_end_are_released_unchanged() {
+        assert_eq!(
+            escape_all(&[b"\"a", &[DIRECTION_LEAD]]),
+            [b'"', b'a', DIRECTION_LEAD]
+        );
+        assert_eq!(
+            escape_all(&[&[DIRECTION_LEAD, 0x80]]),
+            [DIRECTION_LEAD, 0x80]
+        );
+        assert_eq!(
+            escape_all(&[&[DIRECTION_LEAD, 0x81]]),
+            [DIRECTION_LEAD, 0x81]
+        );
+    }
+
+    #[test]
     fn a_character_split_between_pieces_is_escaped() {
         let bytes = "\"\u{9b}\"".as_bytes();
         let (first, second) = bytes.split_at(2);
@@ -315,6 +468,30 @@ mod tests {
         writer.flush().unwrap();
 
         assert_eq!(output.bytes(), br#""\u0080""#);
+    }
+
+    #[test]
+    fn the_writer_handles_a_direction_character_split_into_three_writes() {
+        let output = CapturedOutput::new();
+        let mut writer = JsonEscapeWriter::new(output.clone());
+
+        writer.write_all(&[b'"', DIRECTION_LEAD]).unwrap();
+        writer.write_all(&[0x80]).unwrap();
+        writer.write_all(&[0xAE, b'"']).unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(output.bytes(), br#""\u202e""#);
+    }
+
+    #[test]
+    fn flush_writes_two_held_bytes_unchanged() {
+        let output = CapturedOutput::new();
+        let mut writer = JsonEscapeWriter::new(output.clone());
+
+        writer.write_all(&[b'"', DIRECTION_LEAD, 0x81]).unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(output.bytes(), [b'"', DIRECTION_LEAD, 0x81]);
     }
 
     #[test]
@@ -724,6 +901,41 @@ mod tests {
         reader_end.read_to_end(&mut read).await.unwrap();
 
         assert_eq!(read, br#""\u009b""#);
+    }
+
+    #[tokio::test]
+    async fn the_async_writer_escapes_a_direction_character_split_between_writes() {
+        let (writer_end, mut reader_end) = tokio::io::duplex(64);
+        let mut writer = AsyncJsonEscapeWriter::new(writer_end);
+
+        writer
+            .write_all(&[b'"', DIRECTION_LEAD, 0x81])
+            .await
+            .unwrap();
+        writer.write_all(&[0xA6, b'"']).await.unwrap();
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        let mut read = Vec::new();
+        reader_end.read_to_end(&mut read).await.unwrap();
+
+        assert_eq!(read, br#""\u2066""#);
+    }
+
+    #[tokio::test]
+    async fn the_async_writer_writes_two_held_bytes_on_shutdown() {
+        let (writer_end, mut reader_end) = tokio::io::duplex(64);
+        let mut writer = AsyncJsonEscapeWriter::new(writer_end);
+
+        writer
+            .write_all(&[b'"', DIRECTION_LEAD, 0x81])
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        let mut read = Vec::new();
+        reader_end.read_to_end(&mut read).await.unwrap();
+
+        assert_eq!(read, [b'"', DIRECTION_LEAD, 0x81]);
     }
 
     /// An asynchronous writer that takes one byte per call and counts

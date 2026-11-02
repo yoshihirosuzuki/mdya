@@ -12,8 +12,9 @@
 //! command line and the MCP server, `operations` calls the components for each
 //! operation, `cli` and `mcp` talk to the user, `write_lock` keeps one write
 //! operation at a time, `log_progress` writes logs and progress to stderr,
-//! `escape` makes control characters harmless, and `error_report` turns every
-//! error into an exit code, an MCP error, and an explanation.
+//! `escape` makes control characters and the characters that change the
+//! direction of text harmless, and `error_report` turns every error into an
+//! exit code, an MCP error, and an explanation.
 
 #![allow(clippy::print_stdout)]
 
