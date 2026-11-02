@@ -1,14 +1,32 @@
-//! A test double for [`ProgressSink`], for the unit tests of the functions
-//! that report progress.
+//! Test doubles for the types: a [`ProgressSink`], for the unit tests of the
+//! functions that report progress, and a [`DirLookup`] with fixed answers, for
+//! the unit tests of the functions that make paths absolute.
 
-// Parts of the double are for tests that the components using it have not
+// Parts of the doubles are for tests that the components using them have not
 // written yet.
 #![allow(dead_code)]
 
-use std::sync::Mutex;
+use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use super::{Progress, ProgressSink};
+use super::{DirLookup, Progress, ProgressSink};
+
+/// A `DirLookup` whose functions give these answers every time they are
+/// called: `None` for an unknown home directory, and an error of `ErrorKind`
+/// for a working directory that cannot be read.
+pub(crate) fn test_dir_lookup(
+    home_dir: Option<&str>,
+    current_dir: Result<&str, io::ErrorKind>,
+) -> DirLookup {
+    let home_dir = home_dir.map(PathBuf::from);
+    let current_dir = current_dir.map(PathBuf::from);
+    DirLookup {
+        home_dir: Arc::new(move || home_dir.clone()),
+        current_dir: Arc::new(move || current_dir.clone().map_err(io::Error::from)),
+    }
+}
 
 /// Records every progress it receives. Unlike the sink `gateway` makes, it
 /// drops no report, so a test can check each one.
@@ -48,9 +66,30 @@ impl ProgressSink for TestProgressSink {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
+
+    #[test]
+    fn a_test_dir_lookup_gives_its_answers_every_time() {
+        let dirs = test_dir_lookup(Some("/home/me"), Ok("/work"));
+
+        for _ in 0..2 {
+            assert_eq!((dirs.home_dir)(), Some(PathBuf::from("/home/me")));
+            assert_eq!((dirs.current_dir)().unwrap(), PathBuf::from("/work"));
+        }
+    }
+
+    #[test]
+    fn a_test_dir_lookup_can_answer_that_neither_directory_is_known() {
+        let dirs = test_dir_lookup(None, Err(io::ErrorKind::NotFound));
+
+        for _ in 0..2 {
+            assert_eq!((dirs.home_dir)(), None);
+            assert_eq!(
+                (dirs.current_dir)().unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+        }
+    }
 
     #[test]
     fn reports_passed_through_the_trait_are_kept_in_order() {

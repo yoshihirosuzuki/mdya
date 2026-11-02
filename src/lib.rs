@@ -15,6 +15,7 @@ pub mod format;
 pub mod gateway;
 pub mod index;
 pub mod ingest;
+pub mod path;
 pub mod query;
 pub mod raw_ingest;
 #[cfg(test)]

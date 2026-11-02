@@ -1,22 +1,18 @@
 //! The `ingest` role: what every collection type's ingest implementation
-//! (`file_ingest`, `archive_ingest`, `raw_ingest`) offers, the ingest flow
-//! they share, and making locations absolute.
-
-use std::path::PathBuf;
+//! (`file_ingest`, `archive_ingest`, `raw_ingest`) offers, and the ingest flow
+//! they share.
 
 use async_trait::async_trait;
 
 use crate::format::{FileType, FormatError};
 use crate::index::IndexError;
 use crate::types::{
-    BoxError, CollectionName, DocumentOutcome, Key, ProgressSink, Time, TypeAttributes,
+    BoxError, CollectionName, DirLookup, DocumentOutcome, Key, ProgressSink, Time, TypeAttributes,
 };
 
 mod flow;
-mod location;
 
 pub use flow::ingest_items;
-pub use location::absolute_location;
 
 /// An ingest implementation. Each one is created by its own module's `create`
 /// and also offers `check_attribute_names`, callable without creating it:
@@ -31,11 +27,12 @@ pub trait Ingest: Send + Sync {
     /// Whether documents can be ingested by passing their content.
     fn supports_put(&self) -> bool;
     /// Checks the type-specific attributes and returns them with locations
-    /// made absolute.
+    /// made absolute by [`crate::path::make_path_absolute`], which takes
+    /// `dirs`.
     async fn check_attributes(
         &self,
         attributes: TypeAttributes,
-        base: &LocationBase,
+        dirs: &DirLookup,
     ) -> Result<TypeAttributes, IngestError>;
     /// Updates the collection from its source.
     async fn update(
@@ -45,13 +42,6 @@ pub trait Ingest: Send + Sync {
     ) -> Result<UpdateReport, UpdateStopped>;
     /// Ingests one document from the content passed in.
     async fn put(&self, instruction: PutInstruction) -> Result<DocumentOutcome, IngestError>;
-}
-
-/// What locations are made absolute against.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LocationBase {
-    pub working_dir: PathBuf,
-    pub home_dir: Option<PathBuf>,
 }
 
 /// An instruction to update a collection.
@@ -104,7 +94,8 @@ pub enum IngestError {
     #[error("the type-specific attributes are missing or unexpected")]
     AttributesMissingOrExtra,
     /// The location was not found, or its kind could not be read. `source`
-    /// tells why (including an unknown home directory).
+    /// tells why, including a [`crate::path::MakePathAbsoluteError`] when the
+    /// location could not be made absolute.
     #[error("the location was not found")]
     LocationNotFound { source: BoxError },
     #[error("the location does not fit the collection type")]

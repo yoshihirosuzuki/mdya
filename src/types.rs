@@ -2,6 +2,9 @@
 //! one component's functions use lives in that component's module instead, so
 //! that components do not depend on each other just for types.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 #[cfg(test)]
 pub(crate) mod test_double;
 
@@ -51,6 +54,16 @@ pub struct ChunkEmbedding {
 
 /// The cause of an error, kept as the `source` of the error that wraps it.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// The functions that find the home directory and the working directory, for
+/// [`crate::path::make_path_absolute`]. The real functions are meant to call
+/// `std::env::home_dir` and `std::env::current_dir`; in tests, they give fixed
+/// answers.
+#[derive(Clone)]
+pub struct DirLookup {
+    pub home_dir: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>,
+    pub current_dir: Arc<dyn Fn() -> std::io::Result<PathBuf> + Send + Sync>,
+}
 
 /// A key: the name that tells documents apart within a collection. When it is
 /// a path, the separator is `/`.

@@ -13,13 +13,12 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::ingest::{
-    Ingest, IngestError, LocationBase, PutInstruction, UpdateInstruction, UpdateReport,
-    UpdateStopped,
+    Ingest, IngestError, PutInstruction, UpdateInstruction, UpdateReport, UpdateStopped,
 };
-use crate::types::{DocumentOutcome, Progress, ProgressSink, TypeAttributes};
+use crate::types::{DirLookup, DocumentOutcome, Progress, ProgressSink, TypeAttributes};
 
 type CheckFn =
-    dyn Fn(TypeAttributes, &LocationBase) -> Result<TypeAttributes, IngestError> + Send + Sync;
+    dyn Fn(TypeAttributes, &DirLookup) -> Result<TypeAttributes, IngestError> + Send + Sync;
 type UpdateFn = dyn Fn(&UpdateInstruction, &dyn ProgressSink) -> Result<UpdateReport, UpdateStopped>
     + Send
     + Sync;
@@ -39,7 +38,9 @@ pub(crate) struct TestIngest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IngestCall {
-    CheckAttributes(TypeAttributes, LocationBase),
+    /// Only the attributes: the `DirLookup` holds functions, which cannot be
+    /// compared.
+    CheckAttributes(TypeAttributes),
     Update(UpdateInstruction),
     Put(PutInstruction),
 }
@@ -64,7 +65,7 @@ impl TestIngest {
 
     pub(crate) fn on_check_attributes(
         mut self,
-        f: impl Fn(TypeAttributes, &LocationBase) -> Result<TypeAttributes, IngestError>
+        f: impl Fn(TypeAttributes, &DirLookup) -> Result<TypeAttributes, IngestError>
         + Send
         + Sync
         + 'static,
@@ -122,13 +123,10 @@ impl Ingest for TestIngest {
     async fn check_attributes(
         &self,
         attributes: TypeAttributes,
-        base: &LocationBase,
+        dirs: &DirLookup,
     ) -> Result<TypeAttributes, IngestError> {
-        self.record(IngestCall::CheckAttributes(
-            attributes.clone(),
-            base.clone(),
-        ));
-        (self.check)(attributes, base)
+        self.record(IngestCall::CheckAttributes(attributes.clone()));
+        (self.check)(attributes, dirs)
     }
 
     async fn update(
@@ -157,7 +155,10 @@ pub(crate) fn report_documents(progress: &dyn ProgressSink, done: u64, total: u6
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use crate::gateway::operations::test_double::{ProgressEvent, TestProgress};
+    use crate::types::test_double::test_dir_lookup;
     use crate::types::{CollectionName, Key};
 
     use super::*;
@@ -220,15 +221,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_attributes_records_the_base() {
+    async fn check_attributes_records_the_attributes() {
         let ingest = TestIngest::new().supporting(false, true);
-        let base = LocationBase {
-            working_dir: "/work".into(),
-            home_dir: None,
-        };
+        let dirs = test_dir_lookup(None, Ok("/work"));
 
         let attributes = ingest
-            .check_attributes(TypeAttributes::default(), &base)
+            .check_attributes(TypeAttributes::default(), &dirs)
             .await
             .unwrap();
 
@@ -236,8 +234,27 @@ mod tests {
         assert!(!ingest.supports_update());
         assert_eq!(
             ingest.calls(),
-            vec![IngestCall::CheckAttributes(TypeAttributes::default(), base)]
+            vec![IngestCall::CheckAttributes(TypeAttributes::default())]
         );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_check_handler_answers_and_receives_the_dir_lookup() {
+        // Unlike the default handler, this one fails, and only when it gets
+        // the working directory given below.
+        let ingest = TestIngest::new().on_check_attributes(|attributes, dirs| {
+            if (dirs.current_dir)().unwrap() == Path::new("/work") {
+                return Err(IngestError::LocationTypeMismatch);
+            }
+            Ok(attributes)
+        });
+        let dirs = test_dir_lookup(None, Ok("/work"));
+
+        let result = ingest
+            .check_attributes(TypeAttributes::default(), &dirs)
+            .await;
+
+        assert!(matches!(result, Err(IngestError::LocationTypeMismatch)));
     }
 
     #[tokio::test]
