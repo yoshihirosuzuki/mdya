@@ -71,7 +71,8 @@ pub(crate) trait ErrorReport: Send + Sync {
     fn explain(&self, error: &GatewayError, style: ExplainStyle) -> String;
 
     /// The MCP error. Its `message` is the explanation, without color and
-    /// without replacing control characters.
+    /// without replacing control characters or the characters that change
+    /// the direction of text.
     fn mcp_error(&self, error: &GatewayError) -> McpErrorBody;
 
     /// The explanation of an unexpected failure, asking for a bug report.
@@ -81,7 +82,8 @@ pub(crate) trait ErrorReport: Send + Sync {
     fn mcp_panic_error(&self) -> McpErrorBody;
 }
 
-/// Creates the real one. It replaces control characters with `escape`.
+/// Creates the real one. It replaces control characters and the characters
+/// that change the direction of text with `escape`.
 pub(crate) fn error_report(escape: Arc<dyn Escape>) -> Arc<dyn ErrorReport> {
     let _ = escape;
     todo!()

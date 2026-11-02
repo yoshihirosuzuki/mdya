@@ -18,7 +18,8 @@ pub(crate) mod test_double;
 /// replace it.
 pub(crate) trait Console: Send + Sync {
     /// Writes a message or an explanation to stderr as it is: the caller has
-    /// already replaced the control characters and added the line breaks.
+    /// already replaced the control characters and the characters that change
+    /// the direction of text, and added the line breaks.
     fn write_stderr(&self, text: &str);
 
     /// Starts showing the progress of one operation.

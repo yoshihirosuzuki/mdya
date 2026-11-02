@@ -1,6 +1,8 @@
-//! Makes the characters mdya writes harmless to terminals: replaces control
-//! characters with visible ones in human-readable output, and escapes U+007F
-//! and U+0080 to U+009F in JSON output.
+//! Keeps the text mdya writes from controlling the terminal or from showing
+//! as something it is not. In human-readable output, replaces control
+//! characters and the characters that change the direction of text with
+//! visible ones; in JSON output, escapes U+007F, U+0080 to U+009F, and the
+//! characters that change the direction of text.
 
 #![cfg_attr(
     not(test),
@@ -21,19 +23,22 @@ pub(crate) mod test_double;
 /// What the other submodules use from this one. A trait, so that their tests
 /// can replace it.
 pub(crate) trait Escape: Send + Sync {
-    /// Replaces the control characters (Unicode general category Cc) in a
-    /// string that comes from ingested data or from the user with visible
-    /// ones: `\n`, `\t`, and `\r` for line feed, tab, and carriage return,
-    /// and `\u{1b}` and the like for the others. The caller passes only such
-    /// strings, not the line breaks it adds itself.
+    /// Replaces the control characters (Unicode general category Cc) and the
+    /// characters that change the direction of text (U+202A to U+202E and
+    /// U+2066 to U+2069) in a string that comes from ingested data or from
+    /// the user with visible ones: `\n`, `\t`, and `\r` for line feed, tab,
+    /// and carriage return, and `\u{1b}`, `\u{202e}`, and the like for the
+    /// others. The caller passes only such strings, not the line breaks it
+    /// adds itself.
     fn replace_controls<'a>(&self, text: &'a str) -> Cow<'a, str>;
 
-    /// Wraps a writer that JSON is written to, so that U+007F and U+0080 to
-    /// U+009F are written as JSON escapes. The caller flushes only after a
-    /// whole JSON value; a character split across a flush is not escaped. A
-    /// write is accepted before it reaches the inner writer; if the inner
-    /// writer fails, a later `write` or `flush` tries the bytes again and
-    /// returns the error if it fails again.
+    /// Wraps a writer that JSON is written to, so that U+007F, U+0080 to
+    /// U+009F, and the characters that change the direction of text are
+    /// written as JSON escapes. The caller flushes only after a whole JSON
+    /// value; a character split across a flush is not escaped. A write is
+    /// accepted before it reaches the inner writer; if the inner writer
+    /// fails, a later `write` or `flush` tries the bytes again and returns
+    /// the error if it fails again.
     fn json_writer(&self, inner: Box<dyn Write + Send>) -> Box<dyn Write + Send>;
 
     /// The same as [`Escape::json_writer`], for an asynchronous writer, except
@@ -52,11 +57,11 @@ pub(crate) trait Escape: Send + Sync {
 /// Escapes JSON that arrives in pieces. A character split between two pieces
 /// is escaped all the same.
 pub(crate) trait JsonEscape: Send {
-    /// Appends `input`, escaped, to `out`. Keeps a trailing byte that may
-    /// begin a character to escape until the next call.
+    /// Appends `input`, escaped, to `out`. Keeps up to two trailing bytes
+    /// that may begin a character to escape until the next call.
     fn push(&mut self, input: &[u8], out: &mut Vec<u8>);
 
-    /// Appends the byte kept from the last call, if any, unchanged, to `out`.
+    /// Appends the bytes kept from the last call, if any, unchanged, to `out`.
     fn finish(self: Box<Self>, out: &mut Vec<u8>);
 }
 
