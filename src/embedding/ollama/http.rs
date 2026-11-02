@@ -476,6 +476,26 @@ mod tests {
         }
     }
 
+    // The host of each of these URLs is another form of a loopback IPv4
+    // address, which `reqwest::Url` reads as `127.0.0.1`. Requests to these
+    // URLs go to `127.0.0.1`, so the URLs are taken as this PC too.
+    #[test]
+    fn takes_other_forms_of_a_loopback_ipv4_address_as_this_pc() {
+        for url in [
+            "http://127.1:11434/api/embed",
+            "http://2130706433:11434/api/embed",
+            "http://0x7f.0.0.1:11434/api/embed",
+            "http://0177.0.0.1:11434/api/embed",
+        ] {
+            assert_eq!(
+                reqwest::Url::parse(url).unwrap().host_str(),
+                Some("127.0.0.1"),
+                "{url}"
+            );
+            assert!(is_on_this_pc(url), "{url}");
+        }
+    }
+
     #[test]
     fn takes_other_hosts_and_strings_that_are_not_urls_as_not_this_pc() {
         for url in [
