@@ -1,16 +1,26 @@
 //! Writes logs, messages, and progress to stderr, so that a log or a message
-//! written while a progress bar is on screen does not break the bar.
+//! written while the one-line progress display is on screen does not break
+//! it.
 
 #![expect(dead_code, reason = "the rest of `gateway` does not use these yet")]
 
 use std::ffi::OsStr;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::LogSettings;
 use super::escape::Escape;
 use super::operations::GatewayProgressSink;
+use progress::StderrProgress;
+use screen::Screen;
 
+mod fields;
+mod filter;
+mod pretty;
+mod progress;
+mod progress_text;
+mod receiver;
+mod screen;
 #[cfg(test)]
 pub(crate) mod test_double;
 
@@ -49,7 +59,12 @@ pub(crate) struct LogFilter {
 
 /// A directive in `RUST_LOG` that was not valid and was ignored.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct IgnoredDirective(pub(crate) String);
+pub(crate) struct IgnoredDirective {
+    /// The directive, without the spaces around it.
+    pub(crate) directive: String,
+    /// What is wrong with it.
+    pub(crate) detail: String,
+}
 
 /// `--log-level` was not valid.
 #[derive(Debug, thiserror::Error)]
@@ -63,45 +78,129 @@ pub(crate) struct InvalidLogLevel {
 /// Decides which logs to write from `--log-level` (`flag`) and `RUST_LOG`
 /// (`env`). An invalid `--log-level` is an error; the invalid directives of
 /// `RUST_LOG` are ignored and returned, so that they can be logged as a
-/// warning once the log receiver is set.
+/// warning once the log receiver is set. Without `--log-level` and without a
+/// valid directive in `RUST_LOG`, the logs from `warn` up are written.
+///
+/// The directives are separated by commas, and each is in the syntax of
+/// `tracing-subscriber`'s `EnvFilter`, with spaces around it allowed. A
+/// directive of one word must be a log level, so that a misspelt level is
+/// not taken for the name of a target.
 pub(crate) fn log_filter(
     flag: Option<&str>,
     env: Option<&OsStr>,
 ) -> Result<(LogFilter, Vec<IgnoredDirective>), InvalidLogLevel> {
-    let _ = (flag, env);
-    todo!()
+    filter::log_filter(flag, env)
+}
+
+/// Measures the width of a terminal, in columns. `None` if it cannot.
+pub(crate) type MeasureWidth = Arc<dyn Fn() -> Option<usize> + Send + Sync>;
+
+/// Measures the width of the terminal that the process's stderr is. The real
+/// [`MeasureWidth`].
+pub(crate) fn stderr_width() -> Option<usize> {
+    let (terminal_size::Width(columns), _) = terminal_size::terminal_size_of(std::io::stderr())?;
+    Some(usize::from(columns))
 }
 
 /// stderr, shared by logs, messages, and progress. The real [`Console`].
-pub(crate) struct SharedStderr {}
+pub(crate) struct SharedStderr {
+    screen: Arc<Mutex<Screen>>,
+    terminal: Option<MeasureWidth>,
+    escape: Arc<dyn Escape>,
+}
 
 impl Console for SharedStderr {
     fn write_stderr(&self, text: &str) {
-        let _ = text;
-        todo!()
+        // A message that cannot be written to stderr has nowhere else to go.
+        let _ = lock(&self.screen).write(text.as_bytes());
     }
 
     fn start_progress(&self, kind: ProgressKind) -> Arc<dyn ProgressDisplay> {
-        let _ = kind;
-        todo!()
+        let screen = Arc::clone(&self.screen);
+        Arc::new(StderrProgress::start(screen, kind, self.terminal.clone()))
     }
 }
 
-/// Wraps the stderr that `run_with` received. `can_draw_bar` is whether a
-/// progress bar can be drawn there; otherwise progress is a line every ten
-/// seconds.
+/// Wraps the stderr that `run_with` received. `terminal` measures the width
+/// of the terminal that stderr is, where the progress can be drawn again in
+/// place on one line; `None` where it cannot, such as a file. Where the width
+/// cannot be measured either, the progress is added line by line, at the
+/// start and every ten seconds.
 pub(crate) fn shared_stderr(
     stderr: Box<dyn Write + Send>,
-    can_draw_bar: bool,
+    terminal: Option<MeasureWidth>,
     escape: Arc<dyn Escape>,
 ) -> Arc<SharedStderr> {
-    let _ = (stderr, can_draw_bar, escape);
-    todo!()
+    Arc::new(SharedStderr {
+        screen: Arc::new(Mutex::new(Screen::new(stderr))),
+        terminal,
+        escape,
+    })
+}
+
+/// Locks `mutex`. A panic while it was locked leaves what it guards fit to
+/// use: stderr to write to, and the progress to show.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Sets the process-wide log receiver. The real
 /// [`super::Factories::set_log_receiver`].
 pub(crate) fn set_log_receiver(settings: LogSettings) {
-    let _ = settings;
-    todo!()
+    receiver::set_log_receiver(settings);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::escape::test_double::TestEscape;
+    use crate::gateway::test_double::captured::CapturedOutput;
+
+    #[test]
+    fn a_message_is_written_to_stderr_as_it_is() {
+        let output = CapturedOutput::new();
+        let stderr = shared_stderr(Box::new(output.clone()), None, Arc::new(TestEscape::new()));
+
+        stderr.write_stderr("Updated notes.\n");
+
+        assert_eq!(output.text(), "Updated notes.\n");
+    }
+
+    fn progress_shown(terminal: Option<MeasureWidth>) -> String {
+        let output = CapturedOutput::new();
+        let stderr = shared_stderr(
+            Box::new(output.clone()),
+            terminal,
+            Arc::new(TestEscape::new()),
+        );
+
+        let display = stderr.start_progress(ProgressKind::Update);
+        let shown = output.text();
+        display.finish();
+        shown
+    }
+
+    #[test]
+    fn on_a_terminal_the_progress_is_drawn_in_place() {
+        let shown = progress_shown(Some(Arc::new(|| Some(80))));
+
+        assert!(
+            shown.starts_with('\r') && !shown.contains('\n'),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn on_a_terminal_whose_width_cannot_be_measured_the_progress_is_added_line_by_line() {
+        let shown = progress_shown(Some(Arc::new(|| None)));
+
+        assert!(!shown.contains('\r') && shown.ends_with('\n'), "{shown:?}");
+    }
+
+    #[test]
+    fn elsewhere_the_progress_is_added_line_by_line() {
+        let shown = progress_shown(None);
+
+        assert!(!shown.contains('\r') && shown.ends_with('\n'), "{shown:?}");
+    }
 }
