@@ -18,11 +18,13 @@ use crate::index::{Index, IndexError, IndexStatus};
 use crate::ingest::{Ingest, IngestError, UpdateReport};
 use crate::query::{ChunkRangeRequest, Query, QueryError, SearchMode, SearchUnit};
 use crate::types::{
-    CollectionName, CollectionType, DocumentOutcome, Key, ProgressSink, TypeAttributes,
+    BoxError, CollectionName, CollectionType, DirLookup, DocumentOutcome, Key, ProgressSink,
+    TypeAttributes,
 };
 
 use super::write_lock::{WriteLock, WriteLockError};
 
+mod assembled;
 #[cfg(test)]
 pub(crate) mod test_double;
 
@@ -43,8 +45,7 @@ pub(crate) trait Operations: Send + Sync {
         &self,
         input: ChangeCollectionInput,
     ) -> Result<CollectionInfo, OperationError>;
-    async fn update_collections(&self, input: UpdateInput)
-    -> Result<UpdateOutcome, OperationError>;
+    async fn update_collection(&self, input: UpdateInput) -> Result<UpdateOutcome, OperationError>;
     async fn update_all(&self, input: UpdateAllInput) -> Result<UpdateOutcome, OperationError>;
     async fn put_document(&self, input: PutInput) -> Result<PutOutcome, OperationError>;
     async fn delete_document(
@@ -76,8 +77,7 @@ pub(crate) fn version() -> VersionOutput {
 
 /// Creates the operations over the assembled components.
 pub(crate) fn operations(parts: OperationParts) -> Arc<dyn Operations> {
-    let _ = parts;
-    todo!()
+    Arc::new(assembled::AssembledOperations::new(parts))
 }
 
 /// What the operations are created with.
@@ -92,8 +92,13 @@ pub(crate) struct OperationParts {
     pub(crate) ingests: BTreeMap<CollectionType, Arc<dyn Ingest>>,
     /// Creates the `embedding` for a newly set embedding model.
     pub(crate) create_embedding: Arc<dyn Fn(EmbeddingSettings) -> Arc<dyn Embedding> + Send + Sync>,
-    pub(crate) model_cache_dir: PathBuf,
+    /// Passed on in the [`EmbeddingSettings`] for a newly set embedding
+    /// model.
+    pub(crate) model_cache_dir: Arc<dyn Fn() -> Result<PathBuf, BoxError> + Send + Sync>,
     pub(crate) hf_token: Option<String>,
+    /// Passed to the ingest implementations to make the places in
+    /// type-specific attributes absolute.
+    pub(crate) dirs: DirLookup,
     /// How many documents to process at once (1 to 1024).
     pub(crate) parallelism: usize,
     pub(crate) write_lock: Arc<dyn WriteLock>,
@@ -142,8 +147,7 @@ pub(crate) struct ChangeCollectionInput {
 }
 
 pub(crate) struct UpdateInput {
-    /// One or more.
-    pub(crate) collections: Vec<CollectionName>,
+    pub(crate) collection: CollectionName,
     pub(crate) overwrite: bool,
     pub(crate) progress: Arc<dyn GatewayProgressSink>,
     pub(crate) optimize: bool,
@@ -196,8 +200,13 @@ impl SearchLimit {
 
     /// The limit to pass to `query`.
     pub(crate) fn to_usize(&self) -> usize {
-        todo!()
+        capped(self.0, usize::MAX)
     }
+}
+
+/// `value` as a `T`, or `max` when a `T` cannot hold it.
+fn capped<T: TryFrom<u64>>(value: u64, max: T) -> T {
+    T::try_from(value).unwrap_or(max)
 }
 
 pub(crate) struct GetDocumentInput {
@@ -327,19 +336,23 @@ pub(crate) struct SettingsOutput {
 
 impl Serialize for SettingsOutput {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let _ = serializer;
-        todo!()
+        serializer.collect_map(
+            self.entries
+                .iter()
+                .map(|(name, value)| (name.as_str(), value)),
+        )
     }
 }
 
+/// An object whose members are not named: the settings operation has no MCP
+/// tool, so no client reads this schema to find them.
 impl JsonSchema for SettingsOutput {
     fn schema_name() -> std::borrow::Cow<'static, str> {
-        todo!()
+        "SettingsOutput".into()
     }
 
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let _ = generator;
-        todo!()
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "object" })
     }
 }
 
@@ -416,39 +429,67 @@ pub(crate) struct RebuildOutcome {
     pub(crate) status_error: Option<IndexError>,
 }
 
+/// The anomalies whose condition holds, in the order given. Each `anomalies`
+/// gives them in the order `OutcomeAnomaly` declares them, each once.
+fn anomalies_where<const N: usize>(conditions: [(OutcomeAnomaly, bool); N]) -> Vec<OutcomeAnomaly> {
+    conditions
+        .into_iter()
+        .filter_map(|(anomaly, holds)| holds.then_some(anomaly))
+        .collect()
+}
+
 impl DeleteCollectionOutcome {
     pub(crate) fn anomalies(&self) -> Vec<OutcomeAnomaly> {
-        todo!()
+        anomalies_where([(OutcomeAnomaly::Declined, matches!(self, Self::Declined))])
     }
 }
 
 impl UpdateOutcome {
     pub(crate) fn anomalies(&self) -> Vec<OutcomeAnomaly> {
-        todo!()
+        anomalies_where([
+            (OutcomeAnomaly::DocumentsFailed, self.counts.failed > 0),
+            (
+                OutcomeAnomaly::SourcesUnreadable,
+                !self.unreadable_sources.is_empty() || self.counts.unreadable_places > 0,
+            ),
+            (
+                OutcomeAnomaly::StatusUnreadable,
+                self.status_error.is_some(),
+            ),
+        ])
     }
 }
 
 impl PutOutcome {
     pub(crate) fn anomalies(&self) -> Vec<OutcomeAnomaly> {
-        todo!()
+        anomalies_where([(
+            OutcomeAnomaly::StatusUnreadable,
+            self.status_error.is_some(),
+        )])
     }
 }
 
 impl DeleteDocumentOutcome {
     pub(crate) fn anomalies(&self) -> Vec<OutcomeAnomaly> {
-        todo!()
+        anomalies_where([(OutcomeAnomaly::Declined, matches!(self, Self::Declined))])
     }
 }
 
 impl SettingChangeOutcome {
     pub(crate) fn anomalies(&self) -> Vec<OutcomeAnomaly> {
-        todo!()
+        anomalies_where([(
+            OutcomeAnomaly::StatusUnreadable,
+            matches!(self.index_status, Some(Err(_))),
+        )])
     }
 }
 
 impl RebuildOutcome {
     pub(crate) fn anomalies(&self) -> Vec<OutcomeAnomaly> {
-        todo!()
+        anomalies_where([(
+            OutcomeAnomaly::StatusUnreadable,
+            self.status_error.is_some(),
+        )])
     }
 }
 
@@ -456,8 +497,21 @@ impl RebuildOutcome {
 /// `error_report` maps every case in one place.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OperationError {
+    /// No collection has the name.
     #[error("the collection does not exist")]
     CollectionNotFound { collection: CollectionName },
+    /// The collection's type has no update.
+    #[error("the collection cannot be updated")]
+    UpdateNotSupported { collection: CollectionName },
+    /// The collection's type does not take document contents.
+    #[error("the collection does not take document contents")]
+    PutNotSupported { collection: CollectionName },
+    /// The collection has no document with the key.
+    #[error("the document does not exist")]
+    DocumentNotFound {
+        collection: CollectionName,
+        key: Key,
+    },
     #[error("the write lock was not taken")]
     WriteLock(#[source] WriteLockError),
     #[error("the output is too large")]
@@ -486,7 +540,9 @@ pub(crate) enum OperationError {
     },
     #[error("the settings failed")]
     Config(#[source] ConfigError),
-    /// `counts` includes the collections whose update had finished.
+    /// `counts` is summed over the collections updated so far: those finished,
+    /// those skipped because their source could not be read, and the one the
+    /// update stopped in.
     #[error("the update stopped")]
     UpdateStopped {
         counts: UpdateReport,
@@ -495,8 +551,9 @@ pub(crate) enum OperationError {
     },
 }
 
-/// The collection name and key passed to the component function that failed.
-/// `None` for what was not passed.
+/// The collection name and key passed to the component function that failed,
+/// or the collection the operation found the problem in. `None` for what was
+/// not passed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ErrorContext {
     pub(crate) collection: Option<CollectionName>,
@@ -525,5 +582,268 @@ mod tests {
         .unwrap();
 
         assert_eq!(json, serde_json::json!({ "version": "mdya 1.2.3" }));
+    }
+
+    #[test]
+    fn a_search_limit_of_20_is_passed_on_as_20() {
+        assert_eq!(SearchLimit::new(20).to_usize(), 20);
+    }
+
+    #[test]
+    fn the_largest_search_limit_is_passed_on_as_the_largest_usize() {
+        assert_eq!(SearchLimit::new(u64::MAX).to_usize(), usize::MAX);
+    }
+
+    // A `u64` always fits in a 64-bit `usize`, so the cap is checked with a
+    // narrower type.
+    #[test]
+    fn a_value_too_large_for_the_type_is_capped_at_its_largest_value() {
+        assert_eq!(capped(70_000, u16::MAX), u16::MAX);
+    }
+
+    #[test]
+    fn a_value_the_type_can_hold_is_kept() {
+        assert_eq!(capped(7, u16::MAX), 7);
+    }
+
+    #[test]
+    fn the_search_limit_is_written_as_given() {
+        let json = serde_json::to_value(SearchLimit::new(u64::MAX)).unwrap();
+
+        assert_eq!(json, serde_json::json!(u64::MAX));
+    }
+
+    #[test]
+    fn the_settings_are_written_as_one_object_in_the_order_of_the_entries() {
+        let output = SettingsOutput {
+            entries: vec![
+                (SettingName::McpShowVersion, serde_json::json!(false)),
+                (SettingName::EmbeddingModel, serde_json::json!("all-minilm")),
+                (SettingName::GetCliLimitBytes, serde_json::json!(4096)),
+            ],
+        };
+
+        let json = serde_json::to_string(&output).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"mcp.show_version":false,"embedding.model":"all-minilm","get.cli_limit_bytes":4096}"#
+        );
+    }
+
+    #[test]
+    fn the_schema_of_the_settings_is_an_object() {
+        let schema = schemars::schema_for!(SettingsOutput);
+
+        assert_eq!(schema.get("type"), Some(&serde_json::json!("object")));
+        assert_eq!(
+            schema.get("title"),
+            Some(&serde_json::json!("SettingsOutput"))
+        );
+    }
+
+    fn collection(name: &str) -> CollectionName {
+        CollectionName(name.to_owned())
+    }
+
+    fn key(key: &str) -> Key {
+        Key(key.to_owned())
+    }
+
+    fn update_outcome(
+        counts: UpdateReport,
+        unreadable: &[&str],
+        status_unreadable: bool,
+    ) -> UpdateOutcome {
+        UpdateOutcome {
+            counts,
+            unreadable_sources: unreadable.iter().map(|name| collection(name)).collect(),
+            status_error: status_unreadable.then_some(IndexError::RebuildIncomplete),
+        }
+    }
+
+    #[test]
+    fn a_deleted_collection_has_no_anomaly() {
+        let outcome = DeleteCollectionOutcome::Deleted {
+            collection: collection("notes"),
+        };
+
+        assert_eq!(outcome.anomalies(), []);
+    }
+
+    #[test]
+    fn a_declined_collection_deletion_is_declined() {
+        assert_eq!(
+            DeleteCollectionOutcome::Declined.anomalies(),
+            [OutcomeAnomaly::Declined]
+        );
+    }
+
+    #[test]
+    fn an_update_that_read_everything_has_no_anomaly() {
+        let counts = UpdateReport {
+            added: 3,
+            changed: 1,
+            unchanged: 5,
+            reingested: 1,
+            deleted: 2,
+            ..UpdateReport::default()
+        };
+
+        assert_eq!(update_outcome(counts, &[], false).anomalies(), []);
+    }
+
+    #[test]
+    fn an_update_with_a_failed_document_has_documents_failed() {
+        let counts = UpdateReport {
+            failed: 1,
+            ..UpdateReport::default()
+        };
+
+        assert_eq!(
+            update_outcome(counts, &[], false).anomalies(),
+            [OutcomeAnomaly::DocumentsFailed]
+        );
+    }
+
+    #[test]
+    fn an_update_that_skipped_a_collection_has_sources_unreadable() {
+        assert_eq!(
+            update_outcome(UpdateReport::default(), &["notes"], false).anomalies(),
+            [OutcomeAnomaly::SourcesUnreadable]
+        );
+    }
+
+    #[test]
+    fn an_update_that_could_not_read_a_place_has_sources_unreadable() {
+        let counts = UpdateReport {
+            unreadable_places: 1,
+            ..UpdateReport::default()
+        };
+
+        assert_eq!(
+            update_outcome(counts, &[], false).anomalies(),
+            [OutcomeAnomaly::SourcesUnreadable]
+        );
+    }
+
+    #[test]
+    fn an_update_has_each_anomaly_once_in_the_order_of_the_declaration() {
+        let counts = UpdateReport {
+            failed: 2,
+            unreadable_places: 3,
+            ..UpdateReport::default()
+        };
+
+        assert_eq!(
+            update_outcome(counts, &["notes", "memos"], true).anomalies(),
+            [
+                OutcomeAnomaly::DocumentsFailed,
+                OutcomeAnomaly::SourcesUnreadable,
+                OutcomeAnomaly::StatusUnreadable,
+            ]
+        );
+    }
+
+    fn put_outcome(status_unreadable: bool) -> PutOutcome {
+        PutOutcome {
+            collection: collection("notes"),
+            key: key("a.md"),
+            outcome: DocumentOutcome::Added,
+            status_error: status_unreadable.then_some(IndexError::RebuildIncomplete),
+        }
+    }
+
+    #[test]
+    fn a_put_that_read_the_status_has_no_anomaly() {
+        assert_eq!(put_outcome(false).anomalies(), []);
+    }
+
+    #[test]
+    fn a_put_that_could_not_read_the_status_has_status_unreadable() {
+        assert_eq!(
+            put_outcome(true).anomalies(),
+            [OutcomeAnomaly::StatusUnreadable]
+        );
+    }
+
+    #[test]
+    fn a_deleted_document_has_no_anomaly() {
+        let outcome = DeleteDocumentOutcome::Deleted {
+            collection: collection("notes"),
+            key: key("a.md"),
+            supports_update: true,
+        };
+
+        assert_eq!(outcome.anomalies(), []);
+    }
+
+    #[test]
+    fn a_declined_document_deletion_is_declined() {
+        assert_eq!(
+            DeleteDocumentOutcome::Declined.anomalies(),
+            [OutcomeAnomaly::Declined]
+        );
+    }
+
+    fn setting_change_outcome(
+        index_status: Option<Result<IndexStatus, IndexError>>,
+    ) -> SettingChangeOutcome {
+        SettingChangeOutcome {
+            change: SettingChange {
+                name: SettingName::EmbeddingModel,
+                before: serde_json::json!("all-minilm"),
+                after: serde_json::json!("embeddinggemma"),
+            },
+            index_status,
+        }
+    }
+
+    #[test]
+    fn a_setting_change_without_the_index_status_has_no_anomaly() {
+        assert_eq!(setting_change_outcome(None).anomalies(), []);
+    }
+
+    #[test]
+    fn a_setting_change_with_the_index_status_has_no_anomaly() {
+        let status = IndexStatus {
+            compared_model_name: "embeddinggemma".to_owned(),
+            compared_dimension: crate::index::DimensionResult::NotChecked,
+            models: Vec::new(),
+            collections: BTreeMap::new(),
+            document_count: 0,
+            chunk_count: 0,
+            chunks_without_vector: 0,
+        };
+
+        assert_eq!(setting_change_outcome(Some(Ok(status))).anomalies(), []);
+    }
+
+    #[test]
+    fn a_setting_change_that_could_not_read_the_index_status_has_status_unreadable() {
+        assert_eq!(
+            setting_change_outcome(Some(Err(IndexError::RebuildIncomplete))).anomalies(),
+            [OutcomeAnomaly::StatusUnreadable]
+        );
+    }
+
+    #[test]
+    fn a_rebuild_that_read_the_status_has_no_anomaly() {
+        let outcome = RebuildOutcome {
+            rebuilt_chunks: 120,
+            status_error: None,
+        };
+
+        assert_eq!(outcome.anomalies(), []);
+    }
+
+    #[test]
+    fn a_rebuild_that_could_not_read_the_status_has_status_unreadable() {
+        let outcome = RebuildOutcome {
+            rebuilt_chunks: 0,
+            status_error: Some(IndexError::RebuildIncomplete),
+        };
+
+        assert_eq!(outcome.anomalies(), [OutcomeAnomaly::StatusUnreadable]);
     }
 }
