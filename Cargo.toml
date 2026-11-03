@@ -77,6 +77,10 @@ lancedb = { version = "=0.41.0", default-features = false }
 lindera = { version = "=3.0.7", default-features = false, features = ["embed-ipadic"] }
 lindera-dictionary = { version = "=3.0.7", default-features = false }
 lindera-ipadic = { version = "=3.0.7", default-features = false }
+# Colors the names of the values in the logs and the parts of the pretty log
+# format that `gateway` writes itself. The same crate that tracing-subscriber
+# colors the rest with.
+nu-ansi-term = "0.50.3"
 # The HTTP client for fetching models from Hugging Face and for handing
 # embedding to Ollama. 0.12 rather than the latest 0.13, with the same
 # features that lance's namespace client already uses (rustls with the ring
@@ -93,6 +97,10 @@ schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tempfile = "3.27.0"
+# Measures the width of the terminal that stderr is, so that the one-line
+# progress display fills the line without wrapping. It uses the rustix and
+# windows-sys that the build already has, without `unsafe` in mdya.
+terminal_size = "0.4.4"
 thiserror = "2.0.21"
 # Splits texts into the tokens the models on this PC take. Without the default
 # features, which bring in C (onig) and C++ (esaxx_fast) code; regular
@@ -105,6 +113,19 @@ tokio = { version = "1.54.1", features = ["fs", "io-util", "rt", "sync"], defaul
 # `#[instrument]` asks for `attributes` here first: it is enabled today only
 # because lancedb depends on `tracing` with its default features.
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+# For the pretty log format that `gateway` writes itself: a log of the `log`
+# crate arrives with `log` as its target and its real target among its values,
+# and `NormalizeEvent` gives the real one back, as tracing-subscriber's own
+# formats do with its `tracing-log` feature.
+tracing-log = { version = "0.2.0", default-features = false }
+# Writes the logs out. `fmt` writes them in the three output formats (`json`
+# for the JSON one), `ansi` colors them, and `env-filter` picks them by the
+# directives of `--log-level` and `RUST_LOG`. With `tracing-log`, setting the
+# receiver also sets it as the receiver of the `log` crate, which datafusion,
+# lance, reqwest, tokenizers, and other dependencies log through, so that
+# their logs are picked and written out in the same way. The log receiver test
+# double (src/test_support/log_receiver.rs) uses `registry` as well.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "registry", "std", "tracing-log"] }
 
 [profile.release]
 lto = "thin"
@@ -153,7 +174,3 @@ futures = "0.3.34"
 # `io-util` and `net` for the tests that answer HTTP requests in place of a
 # server, on a local port.
 tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt"] }
-# For the log receiver test double (src/test_support/log_receiver.rs), which
-# records events through a layer on a registry. The default features (`fmt`
-# and the formatting around it) are for writing logs out and are not needed.
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }

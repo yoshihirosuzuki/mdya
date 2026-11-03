@@ -83,7 +83,6 @@ pub struct Io {
 
 /// How logs are written. `run_with` hands it to
 /// [`Factories::set_log_receiver`]; only this crate reads it.
-#[expect(dead_code, reason = "`log_progress` does not read these yet")]
 pub struct LogSettings {
     /// Which logs to write, already checked.
     pub(crate) filter: log_progress::LogFilter,
@@ -91,7 +90,8 @@ pub struct LogSettings {
     /// Whether to color the logs.
     pub(crate) color: bool,
     /// Where to write them: stderr, shared with messages and progress so that
-    /// a log written while a progress bar is on screen does not break the bar.
+    /// a log written while the one-line progress display is on screen does
+    /// not break it.
     pub(crate) stderr: Arc<log_progress::SharedStderr>,
 }
 
