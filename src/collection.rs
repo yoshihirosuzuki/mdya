@@ -69,9 +69,66 @@ pub trait Collections: Send + Sync {
     ) -> Result<CollectionInfo, CollectionError>;
 }
 
-/// Checks a collection name against the naming rules. Callable without
-/// creating the component.
+/// The longest collection name, in characters.
+const MAX_NAME_LENGTH: usize = 64;
+
+/// Checks a collection name against the naming rules: 1 to 64 characters,
+/// each an ASCII letter or digit, `-`, or `_`. Callable without creating the
+/// component.
 pub fn check_collection_name(name: &CollectionName) -> Result<(), CollectionError> {
-    let _ = name;
-    todo!()
+    let name = name.0.as_str();
+    // Counting bytes counts characters here: any character that is not ASCII
+    // fails the second check anyway.
+    let has_allowed_length = (1..=MAX_NAME_LENGTH).contains(&name.len());
+    let has_only_allowed_characters = name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    if has_allowed_length && has_only_allowed_characters {
+        return Ok(());
+    }
+    Err(CollectionError::NameInvalid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(name: &str) -> Result<(), CollectionError> {
+        check_collection_name(&CollectionName(name.to_owned()))
+    }
+
+    #[test]
+    fn accepts_ascii_letters_digits_hyphens_and_underscores() {
+        for name in ["a", "notes", "Work-Notes_2", "_", "-", "0"] {
+            assert!(check(name).is_ok(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_a_name_of_64_characters() {
+        assert!(check(&"a".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn rejects_an_empty_name() {
+        assert!(matches!(check(""), Err(CollectionError::NameInvalid)));
+    }
+
+    #[test]
+    fn rejects_a_name_of_65_characters() {
+        assert!(matches!(
+            check(&"a".repeat(65)),
+            Err(CollectionError::NameInvalid)
+        ));
+    }
+
+    #[test]
+    fn rejects_other_characters() {
+        for name in ["my notes", "a.b", "a/b", "a\\b", "メモ", "é", "a\n"] {
+            assert!(
+                matches!(check(name), Err(CollectionError::NameInvalid)),
+                "{name:?}"
+            );
+        }
+    }
 }

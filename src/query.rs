@@ -98,16 +98,116 @@ pub trait Query: Send + Sync {
     ) -> Result<String, QueryError>;
 }
 
-/// Checks a search request without reading anything. Callable without
-/// creating the component.
+/// Checks a search request without reading anything: the query has something
+/// other than white space (as `char::is_whitespace` sees it, so the
+/// ideographic space counts as white space too), and the limit is 1 or more.
+/// When both are wrong, the empty query is reported. Callable without creating
+/// the component.
 pub fn check_search_request(request: &SearchRequest) -> Result<(), QueryError> {
-    let _ = request;
-    todo!()
+    if request.query.trim().is_empty() {
+        return Err(QueryError::EmptyQuery);
+    }
+    if request.limit == 0 {
+        return Err(QueryError::ZeroLimit);
+    }
+    Ok(())
 }
 
-/// Checks a chunk range without reading anything. Callable without creating
-/// the component.
+/// Checks a chunk range without reading anything: an end needs a start, and is
+/// not before it. Callable without creating the component.
 pub fn check_chunk_range(range: &ChunkRangeRequest) -> Result<(), QueryError> {
-    let _ = range;
-    todo!()
+    match (range.start, range.end) {
+        (None, Some(_)) => Err(QueryError::InvalidChunkRange),
+        (Some(start), Some(end)) if end < start => Err(QueryError::InvalidChunkRange),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(query: &str, limit: usize) -> SearchRequest {
+        SearchRequest {
+            query: query.to_owned(),
+            mode: SearchMode::Hybrid,
+            collections: Vec::new(),
+            limit,
+            unit: SearchUnit::Document,
+        }
+    }
+
+    fn range(start: Option<usize>, end: Option<usize>) -> ChunkRangeRequest {
+        ChunkRangeRequest { start, end }
+    }
+
+    #[test]
+    fn accepts_a_query_with_something_other_than_spaces_and_a_limit_of_1_or_more() {
+        for (query, limit) in [("rust", 1), (" rust ", 20), ("検索", usize::MAX)] {
+            assert!(
+                check_search_request(&request(query, limit)).is_ok(),
+                "{query:?} {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_query_that_is_empty_or_only_spaces() {
+        for query in ["", " ", "\t\n", "\u{3000}"] {
+            assert!(
+                matches!(
+                    check_search_request(&request(query, 20)),
+                    Err(QueryError::EmptyQuery)
+                ),
+                "{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_limit_of_0() {
+        assert!(matches!(
+            check_search_request(&request("rust", 0)),
+            Err(QueryError::ZeroLimit)
+        ));
+    }
+
+    #[test]
+    fn reports_the_empty_query_first_when_the_limit_is_also_0() {
+        assert!(matches!(
+            check_search_request(&request(" ", 0)),
+            Err(QueryError::EmptyQuery)
+        ));
+    }
+
+    #[test]
+    fn accepts_no_range_a_start_alone_or_an_end_not_before_the_start() {
+        for (start, end) in [
+            (None, None),
+            (Some(0), None),
+            (Some(3), Some(3)),
+            (Some(3), Some(5)),
+        ] {
+            assert!(
+                check_chunk_range(&range(start, end)).is_ok(),
+                "{start:?} {end:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_end_without_a_start() {
+        assert!(matches!(
+            check_chunk_range(&range(None, Some(3))),
+            Err(QueryError::InvalidChunkRange)
+        ));
+    }
+
+    #[test]
+    fn rejects_an_end_before_the_start() {
+        assert!(matches!(
+            check_chunk_range(&range(Some(5), Some(4))),
+            Err(QueryError::InvalidChunkRange)
+        ));
+    }
 }
