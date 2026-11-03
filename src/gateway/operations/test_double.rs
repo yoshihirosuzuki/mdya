@@ -43,7 +43,7 @@ pub(crate) struct TestOperations {
     delete_collection: Option<Handler<DeleteCollectionInput, DeleteCollectionOutcome>>,
     list_collections: Option<Handler<(), CollectionList>>,
     change_collection: Option<Handler<ChangeCollectionInput, CollectionInfo>>,
-    update_collections: Option<Handler<UpdateInput, UpdateOutcome>>,
+    update_collection: Option<Handler<UpdateInput, UpdateOutcome>>,
     update_all: Option<Handler<UpdateAllInput, UpdateOutcome>>,
     put_document: Option<Handler<PutInput, PutOutcome>>,
     delete_document: Option<Handler<DeleteDocumentInput, DeleteDocumentOutcome>>,
@@ -65,7 +65,7 @@ pub(crate) struct Received {
     pub(crate) delete_collection: Vec<DeleteCollectionInput>,
     pub(crate) list_collections: Vec<()>,
     pub(crate) change_collection: Vec<ChangeCollectionInput>,
-    pub(crate) update_collections: Vec<UpdateInput>,
+    pub(crate) update_collection: Vec<UpdateInput>,
     pub(crate) update_all: Vec<UpdateAllInput>,
     pub(crate) put_document: Vec<PutInput>,
     pub(crate) delete_document: Vec<DeleteDocumentInput>,
@@ -132,8 +132,8 @@ impl TestOperations {
         CollectionInfo
     );
     setter!(
-        on_update_collections,
-        update_collections,
+        on_update_collection,
+        update_collection,
         UpdateInput,
         UpdateOutcome
     );
@@ -254,15 +254,12 @@ impl Operations for TestOperations {
         .await
     }
 
-    async fn update_collections(
-        &self,
-        input: UpdateInput,
-    ) -> Result<UpdateOutcome, OperationError> {
+    async fn update_collection(&self, input: UpdateInput) -> Result<UpdateOutcome, OperationError> {
         self.answer(
-            &self.update_collections,
-            "update_collections",
+            &self.update_collection,
+            "update_collection",
             input,
-            |r, i| r.update_collections.push(i),
+            |r, i| r.update_collection.push(i),
         )
         .await
     }
