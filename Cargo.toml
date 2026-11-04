@@ -96,6 +96,12 @@ reqwest = { version = "0.12.28", default-features = false, features = ["json", "
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# The SHA-256 of a document's body, which `index` keeps to tell whether a
+# document changed. lancedb's dependencies already build both sha2 0.10 and
+# 0.11, so this adds no crate to the build; 0.11 is the latest. Pure Rust: no C
+# and no build script. Its inline assembly is only for loongarch64 and RISC-V,
+# which none of mdya's release targets are.
+sha2 = "0.11.1"
 tempfile = "3.27.0"
 # Measures the width of the terminal that stderr is, so that the one-line
 # progress display fills the line without wrapping. It uses the rustix and
