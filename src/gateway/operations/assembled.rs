@@ -5,25 +5,28 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 
-use crate::collection::{CollectionChange, CollectionError, CollectionInfo};
+use crate::collection::{CollectionChange, CollectionInfo};
 use crate::config::SettingName;
-use crate::embedding::EmbeddingSettings;
+use crate::embedding::{EmbeddingError, EmbeddingSettings};
 use crate::index::{
     DimensionCheck, DimensionResult, IndexError, IndexStatus, ModelStatus, StatusScope,
 };
 use crate::ingest::{Ingest, IngestError, PutInstruction, UpdateInstruction, UpdateReport};
 use crate::query::{Hit, SearchMode, SearchRequest, SearchUnit};
-use crate::types::{CollectionName, CollectionType, Key, Progress, ProgressSink, TypeAttributes};
+use crate::types::{
+    BoxError, CollectionName, CollectionType, Key, Progress, ProgressSink, TypeAttributes,
+};
 
 use super::super::write_lock::WriteLockGuard;
 use super::{
     ChangeCollectionInput, ChangeSettingInput, CollectionEntry, CollectionList,
     CreateCollectionInput, DeleteCollectionInput, DeleteCollectionOutcome, DeleteDocumentInput,
     DeleteDocumentOutcome, DocumentText, ErrorContext, GatewayProgressSink, GetDocumentInput,
-    IndexEmbeddingModel, OperationError, OperationParts, Operations, OptimizeInput, PutInput,
-    PutOutcome, RebuildInput, RebuildOutcome, SearchHit, SearchInput, SearchModeName, SearchOutput,
-    SearchUnitName, SettingChangeOutcome, SettingsOutput, StatusOutput, UpdateAllInput,
-    UpdateInput, UpdateOutcome,
+    IndexEmbeddingModel, MODEL_CACHE_DIR_FIX, OperationError, OperationParts, Operations,
+    OptimizeInput, OutputPart, PutInput, PutOutcome, RebuildInput, RebuildOutcome, SearchHit,
+    SearchInput, SearchModeName, SearchOutput, SearchUnitName, SettingChangeOutcome,
+    SettingsOutput, StatusOutput, UpdateAllInput, UpdateInput, UpdateOutcome,
+    model_cache_dir_undetermined,
 };
 
 #[cfg(test)]
@@ -417,24 +420,24 @@ impl AssembledOperations {
             }
         }
         if let DimensionResult::Unavailable(error) = &status.compared_dimension {
-            tracing::warn!(cause = error_chain(error).as_str(), "{DIMENSION_UNCHECKED}");
+            // A `fix` of `None` adds no field to the warning.
+            let fix = model_cache_dir_undetermined(error).then(|| MODEL_CACHE_DIR_FIX.join(" "));
+            tracing::warn!(
+                cause = error_chain(error).as_str(),
+                fix = fix.as_deref(),
+                "{DIMENSION_UNCHECKED}"
+            );
         }
         None
     }
 }
 
 /// The error for a stored collection whose type has no ingest
-/// implementation: the collection information cannot be read.
+/// implementation.
 fn unknown_type(collection: &CollectionInfo) -> OperationError {
-    OperationError::Collection {
-        context: ErrorContext::collection(&collection.name),
-        source: CollectionError::CannotRead {
-            source: format!(
-                "the collection type \"{}\" is unknown",
-                collection.collection_type.0
-            )
-            .into(),
-        },
+    OperationError::UnknownCollectionType {
+        collection: collection.name.clone(),
+        collection_type: collection.collection_type.clone(),
     }
 }
 
@@ -540,9 +543,22 @@ const TRUNCATED_CHUNKS: &str = "some chunks are longer than the embedding model'
 /// Said when the configured embedding model's dimension could not be
 /// checked: the warning logged after a write operation, with the reason in
 /// its `cause` field, and the start of the status warning, followed by the
-/// reason.
+/// reason. When the embedding model cache directory could not be
+/// determined, the warning has the fix in its `fix` field, and the status
+/// warning ends with it.
 const DIMENSION_UNCHECKED: &str =
     "the dimension of the configured embedding model could not be checked";
+
+/// The status warning for a dimension that could not be checked because of
+/// `error`.
+fn dimension_unchecked_warning(error: &EmbeddingError) -> String {
+    let warning = format!("{DIMENSION_UNCHECKED}: {}", error_chain(error));
+    if !model_cache_dir_undetermined(error) {
+        return warning;
+    }
+    let end = if warning.ends_with('.') { "" } else { "." };
+    format!("{warning}{end} {}", MODEL_CACHE_DIR_FIX.join(" "))
+}
 
 /// `error` and its causes, joined by `: `.
 fn error_chain(error: &dyn std::error::Error) -> String {
@@ -572,10 +588,7 @@ impl From<ModelStatus> for IndexEmbeddingModel {
 fn status_output(status: IndexStatus, collection_count: u64) -> StatusOutput {
     let (configured_embedding_dimension, warnings) = match status.compared_dimension {
         DimensionResult::Known(dimension) => (Some(dimension as u64), Vec::new()),
-        DimensionResult::Unavailable(error) => (
-            None,
-            vec![format!("{DIMENSION_UNCHECKED}: {}", error_chain(&error))],
-        ),
+        DimensionResult::Unavailable(error) => (None, vec![dimension_unchecked_warning(&error)]),
         DimensionResult::NotChecked => (None, Vec::new()),
     };
     StatusOutput {
@@ -798,6 +811,8 @@ impl Operations for AssembledOperations {
                 .search(request)
                 .await
                 .map_err(|source| OperationError::Query {
+                    // No key: `error_report` tells a search from getting a
+                    // document by it.
                     context: ErrorContext::default(),
                     source,
                 })?;
@@ -826,6 +841,7 @@ impl Operations for AssembledOperations {
             .get_document(&input.collection, &input.key, input.range)
             .await
             .map_err(|source| OperationError::Query {
+                // The key tells `error_report` this is not a search.
                 context: ErrorContext::document(&input.collection, &input.key),
                 source,
             })?;
@@ -834,6 +850,7 @@ impl Operations for AssembledOperations {
             && size_bytes > limit_bytes
         {
             return Err(OperationError::OutputTooLarge {
+                part: OutputPart::of(input.range),
                 size_bytes,
                 limit_bytes,
             });
@@ -902,9 +919,12 @@ impl Operations for AssembledOperations {
         }
         // The setting stays changed when the settings cannot be read now.
         let settings = config.current().await.map_err(OperationError::Config)?;
+        let model_cache_dir = Arc::clone(&self.parts.model_cache_dir);
         let embedding = (self.parts.create_embedding)(EmbeddingSettings {
             model: settings.embedding_model,
-            model_cache_dir: Arc::clone(&self.parts.model_cache_dir),
+            model_cache_dir: Arc::new(move || {
+                model_cache_dir().map_err(|error| -> BoxError { Box::new(error) })
+            }),
             hf_token: self.parts.hf_token.clone(),
             ollama_endpoint: settings.embedding_ollama_endpoint,
         });

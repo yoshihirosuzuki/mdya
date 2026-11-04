@@ -16,10 +16,10 @@ use crate::config::{Config, ConfigError, SettingChange, SettingName};
 use crate::embedding::{Embedding, EmbeddingSettings};
 use crate::index::{Index, IndexError, IndexStatus};
 use crate::ingest::{Ingest, IngestError, UpdateReport};
+use crate::path::MakePathAbsoluteError;
 use crate::query::{ChunkRangeRequest, Query, QueryError, SearchMode, SearchUnit};
 use crate::types::{
-    BoxError, CollectionName, CollectionType, DirLookup, DocumentOutcome, Key, ProgressSink,
-    TypeAttributes,
+    CollectionName, CollectionType, DirLookup, DocumentOutcome, Key, ProgressSink, TypeAttributes,
 };
 
 use super::write_lock::{WriteLock, WriteLockError};
@@ -93,8 +93,10 @@ pub(crate) struct OperationParts {
     /// Creates the `embedding` for a newly set embedding model.
     pub(crate) create_embedding: Arc<dyn Fn(EmbeddingSettings) -> Arc<dyn Embedding> + Send + Sync>,
     /// Passed on in the [`EmbeddingSettings`] for a newly set embedding
-    /// model.
-    pub(crate) model_cache_dir: Arc<dyn Fn() -> Result<PathBuf, BoxError> + Send + Sync>,
+    /// model, with its error boxed, where [`model_cache_dir_undetermined`]
+    /// finds it.
+    pub(crate) model_cache_dir:
+        Arc<dyn Fn() -> Result<PathBuf, ModelCacheDirUndetermined> + Send + Sync>,
     pub(crate) hf_token: Option<String>,
     /// Passed to the ingest implementations to make the places in
     /// type-specific attributes absolute.
@@ -102,6 +104,34 @@ pub(crate) struct OperationParts {
     /// How many documents to process at once (1 to 1024).
     pub(crate) parallelism: usize,
     pub(crate) write_lock: Arc<dyn WriteLock>,
+}
+
+/// The embedding model cache directory (`--model-cache-dir`) could not be
+/// made absolute. Kept here, where the operations can find it in a cause
+/// chain, as `error_report` uses the operations and not the other way round.
+#[derive(Debug, thiserror::Error)]
+#[error("the embedding model cache directory cannot be determined")]
+pub(crate) struct ModelCacheDirUndetermined {
+    #[source]
+    pub(crate) source: MakePathAbsoluteError,
+}
+
+/// How to fix an embedding model cache directory that could not be
+/// determined, one sentence a line. Added to the warning about a dimension
+/// that could not be checked and to the explanation of an unusable embedding
+/// model. The command line is to add them to its message after the embedding
+/// model setting is changed, too.
+pub(crate) const MODEL_CACHE_DIR_FIX: [&str; 3] = [
+    "Give an absolute path for the embedding model cache directory with --model-cache-dir, then run the operation again.",
+    "If the working directory cannot be read, you can also move to a working directory that mdya can read, and run the operation again.",
+    "For the MCP server, start it again after either of these.",
+];
+
+/// Whether the cause chain from `error` has the embedding model cache
+/// directory that could not be determined.
+pub(crate) fn model_cache_dir_undetermined(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| error.source())
+        .any(|error| error.is::<ModelCacheDirUndetermined>())
 }
 
 /// Receives progress, and also when index maintenance starts. Passed to the
@@ -515,7 +545,18 @@ pub(crate) enum OperationError {
     #[error("the write lock was not taken")]
     WriteLock(#[source] WriteLockError),
     #[error("the output is too large")]
-    OutputTooLarge { size_bytes: u64, limit_bytes: u64 },
+    OutputTooLarge {
+        part: OutputPart,
+        size_bytes: u64,
+        limit_bytes: u64,
+    },
+    /// The collection's stored type has no ingest implementation in this
+    /// version of mdya.
+    #[error("the collection type is unknown")]
+    UnknownCollectionType {
+        collection: CollectionName,
+        collection_type: CollectionType,
+    },
     #[error("the document content cannot be read")]
     ContentUnreadable { source: std::io::Error },
     #[error("the collection component failed")]
@@ -549,6 +590,30 @@ pub(crate) enum OperationError {
         context: ErrorContext,
         source: IngestError,
     },
+}
+
+/// What [`OperationError::OutputTooLarge`] found too large.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputPart {
+    /// The document's whole body.
+    Body,
+    /// One chunk.
+    Chunk,
+    /// A range of chunks, with its end given.
+    ChunkRange,
+}
+
+impl OutputPart {
+    /// What the range asks for.
+    pub(crate) fn of(range: ChunkRangeRequest) -> Self {
+        match (range.start, range.end) {
+            // An end without a start is not a valid range; it is taken as
+            // the body, which is what is asked for without a start.
+            (None, _) => Self::Body,
+            (Some(_), None) => Self::Chunk,
+            (Some(_), Some(_)) => Self::ChunkRange,
+        }
+    }
 }
 
 /// The collection name and key passed to the component function that failed,
@@ -845,5 +910,73 @@ mod tests {
         };
 
         assert_eq!(outcome.anomalies(), [OutcomeAnomaly::StatusUnreadable]);
+    }
+
+    fn range(start: Option<usize>, end: Option<usize>) -> ChunkRangeRequest {
+        ChunkRangeRequest { start, end }
+    }
+
+    #[test]
+    fn a_range_without_a_start_asks_for_the_body() {
+        assert_eq!(OutputPart::of(range(None, None)), OutputPart::Body);
+    }
+
+    #[test]
+    fn a_range_with_only_an_end_is_taken_as_the_body() {
+        assert_eq!(OutputPart::of(range(None, Some(3))), OutputPart::Body);
+    }
+
+    #[test]
+    fn a_range_with_only_a_start_asks_for_a_chunk() {
+        assert_eq!(OutputPart::of(range(Some(2), None)), OutputPart::Chunk);
+    }
+
+    #[test]
+    fn a_range_with_a_start_and_an_end_asks_for_a_chunk_range() {
+        assert_eq!(
+            OutputPart::of(range(Some(2), Some(3))),
+            OutputPart::ChunkRange
+        );
+    }
+
+    fn cache_dir_undetermined() -> ModelCacheDirUndetermined {
+        ModelCacheDirUndetermined {
+            source: MakePathAbsoluteError::HomeDirUnknown,
+        }
+    }
+
+    #[test]
+    fn a_model_cache_directory_deep_in_the_cause_chain_is_found() {
+        let error = crate::embedding::EmbeddingError::ModelUnavailable {
+            source: Box::new(cache_dir_undetermined()),
+        };
+
+        assert!(model_cache_dir_undetermined(&error));
+    }
+
+    #[test]
+    fn a_path_that_could_not_be_made_absolute_alone_is_not_the_model_cache_directory() {
+        let error = crate::embedding::EmbeddingError::ModelUnavailable {
+            source: Box::new(MakePathAbsoluteError::HomeDirUnknown),
+        };
+
+        assert!(!model_cache_dir_undetermined(&error));
+    }
+
+    #[test]
+    fn a_cause_chain_without_a_directory_has_no_model_cache_directory() {
+        let error = crate::embedding::EmbeddingError::ModelUnavailable {
+            source: "Ollama is not running".into(),
+        };
+
+        assert!(!model_cache_dir_undetermined(&error));
+    }
+
+    #[test]
+    fn a_model_cache_directory_that_cannot_be_determined_says_so() {
+        assert_eq!(
+            cache_dir_undetermined().to_string(),
+            "the embedding model cache directory cannot be determined"
+        );
     }
 }

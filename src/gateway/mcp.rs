@@ -25,8 +25,13 @@ pub(crate) struct McpServerParts {
     pub(crate) error_report: Arc<dyn ErrorReport>,
 }
 
-/// Runs the MCP server over the given reader and writer. Returns when the
-/// client closes the connection, after the tool calls in progress end.
+/// Runs the MCP server over the given reader and writer. Once the exchange
+/// started, it returns `Ok`, after the tool calls in progress end, when the
+/// client closes the connection or the reader cannot be read. A failure to
+/// write after the exchange started either lets it go on or ends it in the
+/// same way. Returns [`McpError::Transport`] when the exchange could not be
+/// started, including when the client closed the connection before it
+/// started.
 pub(crate) async fn serve_stdio<R, W>(
     parts: McpServerParts,
     reader: R,
@@ -58,8 +63,9 @@ impl McpHttpListener {
         todo!()
     }
 
-    /// Runs the MCP server (HTTP). Returns only when it fails; otherwise it
-    /// runs until the process ends. A test stops it by aborting its task.
+    /// Runs the MCP server (HTTP) until the process ends. A failure in
+    /// accepting a connection or in the exchange with one MCP client does
+    /// not stop it and is not returned. A test stops it by aborting its task.
     pub(crate) async fn serve(self, parts: McpServerParts) -> Result<(), McpError> {
         let _ = parts;
         todo!()
@@ -71,18 +77,57 @@ impl McpHttpListener {
 pub(crate) enum McpError {
     /// `host` and `port` are what `listen_http` received. `source` says why:
     /// the name did not resolve (including to nothing), or listening failed.
-    #[error("cannot listen on {host}:{port}")]
+    #[error("cannot listen on {}", socket_address(.host, *.port))]
     AddressUnavailable {
         host: String,
         port: u16,
         source: std::io::Error,
     },
-    /// Reading or writing stdio, the initialization exchange, or the HTTP
-    /// server failed.
-    #[error("the MCP connection failed")]
+    /// The MCP server (stdio) could not start the exchange with the MCP
+    /// client: for example, the client closed stdin or sent something other
+    /// than a request first, or the reply could not be written to stdout. Not
+    /// returned for a failure after the exchange started, nor by the MCP
+    /// server (HTTP), which keeps running.
+    #[error("the connection with the MCP client cannot be started")]
     Transport { source: BoxError },
     /// A tool's input does not fit its input schema. `input` is the name of
     /// the input; `detail` says what is wrong.
     #[error("the tool input {input} is not valid: {detail}")]
     InvalidToolInput { input: String, detail: String },
+}
+
+/// `host` and `port` as one address, with an IPv6 address (which `host`
+/// holds without brackets) in brackets: `127.0.0.1:8000`, `[::1]:8000`.
+pub(crate) fn socket_address(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        return format!("[{host}]:{port}");
+    }
+    format!("{host}:{port}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::McpError;
+
+    fn unavailable(host: &str) -> McpError {
+        McpError::AddressUnavailable {
+            host: host.to_owned(),
+            port: 8000,
+            source: io::Error::new(io::ErrorKind::AddrInUse, "address in use"),
+        }
+    }
+
+    #[test]
+    fn an_unavailable_address_is_shown_with_only_an_ipv6_host_in_brackets() {
+        assert_eq!(
+            unavailable("::1").to_string(),
+            "cannot listen on [::1]:8000"
+        );
+        assert_eq!(
+            unavailable("127.0.0.1").to_string(),
+            "cannot listen on 127.0.0.1:8000"
+        );
+    }
 }
