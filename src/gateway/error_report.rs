@@ -179,7 +179,8 @@ impl Report {
 }
 
 /// Lays out the explanation: the message, the causes numbered from the
-/// nearest, and the fix, one line each.
+/// nearest, and the fix, with each cause and each line of the fix
+/// starting on its own line.
 fn lay_out(message: &str, causes: &[String], fix: &[String], color: bool) -> String {
     let heading = |text: &str, paint: Color| {
         if color {
