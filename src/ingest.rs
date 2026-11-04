@@ -127,7 +127,8 @@ pub struct IngestItems {
     pub unreadable_without_key: Vec<(String, BoxError)>,
     /// `None` when no documents are to be deleted. Otherwise, the key prefixes
     /// of the directories that could not be read; documents under them are
-    /// kept.
+    /// kept. A key is under a directory when it begins with the directory and
+    /// `/`, so a directory in this list has no trailing `/`.
     pub delete_except_unreadable_dirs: Option<Vec<String>>,
     /// The places that could not be read while walking the source.
     pub unreadable_places: u64,

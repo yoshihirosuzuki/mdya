@@ -1,7 +1,7 @@
 //! The `index` component: keeps the documents and chunks that search reads,
 //! with their embedding vectors and full-text search indexes.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -30,6 +30,7 @@ use lancedb::expr::{DfExpr, col, lit};
 use lancedb::index::scalar::{BTreeIndexBuilder, FtsIndexBuilder};
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::table::{CompactionOptions, Duration as TimeDelta, OptimizeAction, OptimizeOptions};
 use sha2::{Digest, Sha256};
 
 use crate::embedding::{Embedding, EmbeddingError};
@@ -154,7 +155,9 @@ pub trait Index: Send + Sync {
     ) -> Result<DocumentOutcome, IndexError>;
     /// Deletes the documents of the collection whose key is neither in `keep`
     /// nor under one of `unreadable_dirs` (key prefixes), and returns how many
-    /// it deleted.
+    /// it deleted. A key is under a directory when it begins with the
+    /// directory and `/`, so a directory in `unreadable_dirs` has no trailing
+    /// `/`.
     async fn delete_others(
         &self,
         collection: &CollectionName,
@@ -188,8 +191,8 @@ pub trait Index: Send + Sync {
         parallelism: usize,
         progress: &dyn ProgressSink,
     ) -> Result<u64, IndexError>;
-    /// The tables `query` reads, pinned to the latest version. `None` when the
-    /// index has no documents yet.
+    /// The tables `query` reads, pinned to the latest version. `None` until
+    /// both tables and their full-text search indexes exist.
     async fn tables_for_query(&self) -> Result<Option<QueryTables>, IndexError>;
     /// Compacts the tables, cleans up old versions, and indexes new rows.
     async fn maintain(&self) -> Result<(), IndexError>;
@@ -390,10 +393,59 @@ enum LanceCall {
     PlaceDictionary,
     /// Reading the full-text search dictionary configuration.
     ReadDictionary,
-    /// Reading a document's rows.
+    /// Reading a document's rows, or the rows of many documents.
     ReadRows(TableName),
-    /// Replacing or deleting a document's rows.
+    /// Replacing or deleting a document's rows, or deleting the rows of many
+    /// documents.
     WriteRows(TableName),
+    /// One step of maintaining a table.
+    Optimize(TableName, MaintenanceStep),
+}
+
+/// How many days of old table versions maintenance keeps.
+const KEEP_VERSIONS_DAYS: i64 = 7;
+
+/// The steps of maintaining a table, in the order they are taken. They are
+/// what LanceDB's `OptimizeAction::All` does, with the time to keep old
+/// versions given rather than left to LanceDB, so that a newer LanceDB does
+/// not change it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaintenanceStep {
+    /// Merging small files.
+    Compact,
+    /// Deleting the versions older than `older_than`; the latest version is
+    /// kept however old it is.
+    Prune { older_than: TimeDelta },
+    /// Adding new rows to the indexes, and training an index that has enough
+    /// rows.
+    Index,
+}
+
+impl MaintenanceStep {
+    fn all() -> [Self; 3] {
+        [
+            Self::Compact,
+            Self::Prune {
+                older_than: TimeDelta::days(KEEP_VERSIONS_DAYS),
+            },
+            Self::Index,
+        ]
+    }
+
+    fn action(self) -> OptimizeAction {
+        match self {
+            Self::Compact => OptimizeAction::Compact {
+                options: CompactionOptions::default(),
+                remap_options: None,
+            },
+            Self::Prune { older_than } => OptimizeAction::Prune {
+                older_than: Some(older_than),
+                delete_unverified: None,
+                error_if_tagged_old_versions: None,
+            },
+            Self::Index => OptimizeAction::Index(OptimizeOptions::default()),
+        }
+    }
 }
 
 /// Points in the component's work where the unit tests observe it and make
@@ -515,7 +567,17 @@ struct LanceDbIndex {
     /// The lock makes concurrent first writes read it once; a failed or
     /// panicking read leaves it unread, and the next write reads it again.
     dictionary_read: tokio::sync::Mutex<bool>,
+    /// Always [`KEY_BATCH_LEN`]; a field so that the unit tests can make the
+    /// batches small.
+    key_batch_len: usize,
 }
+
+/// The number of keys `delete_others` deletes in one commit of each table. A
+/// deletion writes its condition, with every key in it, into the transaction
+/// record of the commit, so the keys are split for the condition and the
+/// record of one commit to hold at most this many keys, however many
+/// documents are deleted at once.
+const KEY_BATCH_LEN: usize = 1000;
 
 /// The tables to write a document to, and the embedding model of their
 /// vector columns.
@@ -596,13 +658,204 @@ impl LanceDbIndex {
             embedding,
             hooks,
             dictionary_read: tokio::sync::Mutex::new(false),
+            key_batch_len: KEY_BATCH_LEN,
         }
+    }
+
+    /// Deletes the collection's documents other than `keep` and those under
+    /// `unreadable_dirs`. The keys come from both tables, so that a key with
+    /// chunk rows but no document row, left by a registration that stopped
+    /// partway, is deleted too. Only the keys to delete go into the
+    /// deletions' conditions, which LanceDB keeps in each version's
+    /// transaction record; with no key to delete, nothing is written.
+    async fn delete_other_documents(
+        &self,
+        collection: &CollectionName,
+        keep: &HashSet<Key>,
+        unreadable_dirs: &[String],
+    ) -> Result<u64, PartialDelete> {
+        let stopped = |deleted| move |error| PartialDelete { deleted, error };
+        let Some(tables) = self.store.tables_to_read().await.map_err(stopped(0))? else {
+            return Ok(0);
+        };
+        let mut keys = BTreeSet::new();
+        for (table, name) in [
+            (&tables.chunk, TableName::Chunk),
+            (&tables.document, TableName::Document),
+        ] {
+            let read = self.read_keys(table, name, collection, &mut keys).await;
+            read.map_err(stopped(0))?;
+        }
+        keys.retain(|key| !keep.contains(key) && !in_any_dir(key, unreadable_dirs));
+        let keys: Vec<Key> = keys.into_iter().collect();
+        let mut deleted = 0;
+        for batch in keys.chunks(self.key_batch_len) {
+            let rows = keys_filter(collection, batch);
+            let chunk_rows = self.delete_rows(&tables.chunk, TableName::Chunk, &rows);
+            chunk_rows.await.map_err(stopped(deleted))?;
+            let document_rows = self.delete_rows(&tables.document, TableName::Document, &rows);
+            deleted += document_rows.await.map_err(stopped(deleted))?;
+        }
+        Ok(deleted)
+    }
+
+    /// Adds the keys of the collection's rows in `table`, the table `name`, to
+    /// `keys`. The rows are read a batch at a time and not held: the chunk
+    /// table has a document's key once for each of its chunks.
+    async fn read_keys(
+        &self,
+        table: &lancedb::Table,
+        name: TableName,
+        collection: &CollectionName,
+        keys: &mut BTreeSet<Key>,
+    ) -> Result<(), IndexError> {
+        self.hooks
+            .before(LanceCall::ReadRows(name))
+            .await
+            .map_err(read_error)?;
+        let query = table.query().only_if_expr(collection_filter(collection));
+        let query = query.select(Select::columns(&["key"]));
+        let rows = query.execute().await;
+        let mut rows = rows.map_err(|error| read_error(error.into()))?;
+        while let Some(batch) = rows
+            .try_next()
+            .await
+            .map_err(|error| read_error(error.into()))?
+        {
+            let values = string_column(&batch, "key").map_err(read_error)?;
+            keys.extend(values.iter().flatten().map(|key| Key(key.to_owned())));
+        }
+        Ok(())
+    }
+
+    /// Deletes the document's rows, the chunk rows first.
+    /// `IndexError::DocumentNotFound` when the document table has no row for
+    /// it, even if the chunk table has.
+    async fn delete_one_document(
+        &self,
+        collection: &CollectionName,
+        key: &Key,
+    ) -> Result<(), IndexError> {
+        let Some(tables) = self.store.tables_to_read().await? else {
+            return Err(IndexError::DocumentNotFound);
+        };
+        if !self
+            .document_row_exists(&tables.document, collection, key)
+            .await?
+        {
+            return Err(IndexError::DocumentNotFound);
+        }
+        let rows = document_filter(collection, key);
+        self.delete_rows(&tables.chunk, TableName::Chunk, &rows)
+            .await?;
+        self.delete_rows(&tables.document, TableName::Document, &rows)
+            .await?;
+        Ok(())
+    }
+
+    /// Whether the document has a row in the document table. A key with chunk
+    /// rows only is not a document.
+    async fn document_exists(
+        &self,
+        collection: &CollectionName,
+        key: &Key,
+    ) -> Result<bool, IndexError> {
+        let Some(tables) = self.store.tables_to_read().await? else {
+            return Ok(false);
+        };
+        self.document_row_exists(&tables.document, collection, key)
+            .await
+    }
+
+    async fn document_row_exists(
+        &self,
+        document_table: &lancedb::Table,
+        collection: &CollectionName,
+        key: &Key,
+    ) -> Result<bool, IndexError> {
+        self.hooks
+            .before(LanceCall::ReadRows(TableName::Document))
+            .await
+            .map_err(read_error)?;
+        let query = document_table.query();
+        let query = query.only_if_expr(document_filter(collection, key));
+        let query = query.select(Select::columns(&["key"])).limit(1);
+        let rows = query.execute().await;
+        let mut rows = rows.map_err(|error| read_error(error.into()))?;
+        while let Some(batch) = rows
+            .try_next()
+            .await
+            .map_err(|error| read_error(error.into()))?
+        {
+            if batch.num_rows() > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The number of rows of each collection in the document table, read
+    /// once.
+    async fn count_documents(&self) -> Result<BTreeMap<CollectionName, u64>, IndexError> {
+        let mut counts = BTreeMap::new();
+        let Some(tables) = self.store.tables_to_read().await? else {
+            return Ok(counts);
+        };
+        self.hooks
+            .before(LanceCall::ReadRows(TableName::Document))
+            .await
+            .map_err(read_error)?;
+        let query = tables
+            .document
+            .query()
+            .select(Select::columns(&["collection"]));
+        let rows = query.execute().await;
+        let mut rows = rows.map_err(|error| read_error(error.into()))?;
+        while let Some(batch) = rows
+            .try_next()
+            .await
+            .map_err(|error| read_error(error.into()))?
+        {
+            let names = string_column(&batch, "collection").map_err(read_error)?;
+            for name in names.iter().flatten() {
+                *counts.entry(CollectionName(name.to_owned())).or_insert(0) += 1;
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Maintains both tables, each with the steps of [`MaintenanceStep`] in
+    /// order. Nothing is done before the tables exist.
+    async fn maintain_tables(&self) -> Result<(), IndexError> {
+        let Some(tables) = self.store.tables_to_read().await? else {
+            return Ok(());
+        };
+        for (table, name) in [
+            (&tables.chunk, TableName::Chunk),
+            (&tables.document, TableName::Document),
+        ] {
+            for step in MaintenanceStep::all() {
+                self.hooks
+                    .before(LanceCall::Optimize(name, step))
+                    .await
+                    .map_err(write_error)?;
+                let optimized = table.optimize(step.action()).await;
+                optimized.map_err(|error| write_error(error.into()))?;
+            }
+        }
+        Ok(())
     }
 
     /// Discards the held connection and tables after an error reading or
     /// writing the index, so that the next call opens LanceDB again.
     async fn discard_after<T>(&self, result: &Result<T, IndexError>) {
-        if let Err(IndexError::CannotRead { .. } | IndexError::CannotWrite { .. }) = result {
+        if let Err(error) = result {
+            self.discard_after_error(error).await;
+        }
+    }
+
+    async fn discard_after_error(&self, error: &IndexError) {
+        if let IndexError::CannotRead { .. } | IndexError::CannotWrite { .. } = error {
             self.store.discard().await;
         }
     }
@@ -716,7 +969,12 @@ impl LanceDbIndex {
             .before(LanceCall::ReadRows(TableName::Document))
             .await?;
         let columns = ["time", "hash", "chunk_ranges"];
-        let batches = read_rows(table, document_filter(document), &columns).await?;
+        let batches = read_rows(
+            table,
+            document_filter(&document.collection, &document.key),
+            &columns,
+        )
+        .await?;
         let mut versions = Vec::new();
         for batch in &batches {
             versions.extend(StoredVersion::from_rows(batch)?);
@@ -780,9 +1038,13 @@ impl LanceDbIndex {
             .await
             .map_err(read_error)?;
         let columns = ["chunk_index", "range_start", "range_end", "text"];
-        read_rows(table, document_filter(document), &columns)
-            .await
-            .map_err(read_error)
+        read_rows(
+            table,
+            document_filter(&document.collection, &document.key),
+            &columns,
+        )
+        .await
+        .map_err(read_error)
     }
 
     /// Writes the document. Makes the embedding vectors and builds the rows
@@ -802,18 +1064,19 @@ impl LanceDbIndex {
         let document_row = document_row.await.map_err(write_error)?;
         drop(pace);
         let (chunk_table, document_table) = (&prepared.tables.chunk, &prepared.tables.document);
+        let rows = document_filter(&document.collection, &document.key);
         let delete_first = new_version.delete_first;
         let delete_chunks_first =
             matches!(delete_first, DeleteFirst::ChunkRows | DeleteFirst::AllRows);
         // Writing no chunk rows deletes them anyway.
         if delete_chunks_first && new_rows.chunk_rows.num_rows() > 0 {
-            self.delete_rows(chunk_table, TableName::Chunk, document)
+            self.delete_rows(chunk_table, TableName::Chunk, &rows)
                 .await?;
         }
         self.replace_chunks(chunk_table, document, new_rows.chunk_rows)
             .await?;
         if delete_first == DeleteFirst::AllRows {
-            self.delete_rows(document_table, TableName::Document, document)
+            self.delete_rows(document_table, TableName::Document, &rows)
                 .await?;
         }
         self.replace_document(document_table, document_row).await
@@ -863,8 +1126,11 @@ impl LanceDbIndex {
         document: &DocumentToRegister,
         rows: RecordBatch,
     ) -> Result<(), IndexError> {
+        let document_rows = document_filter(&document.collection, &document.key);
         if rows.num_rows() == 0 {
-            return self.delete_rows(table, TableName::Chunk, document).await;
+            self.delete_rows(table, TableName::Chunk, &document_rows)
+                .await?;
+            return Ok(());
         }
         self.hooks
             .before(LanceCall::WriteRows(TableName::Chunk))
@@ -874,26 +1140,27 @@ impl LanceDbIndex {
         merge
             .when_matched_update_all(None)
             .when_not_matched_insert_all()
-            .when_not_matched_by_source_delete_expr(document_filter(document));
+            .when_not_matched_by_source_delete_expr(document_rows);
         let merged = merge.execute(reader(rows)).await;
         merged.map_err(|error| write_error(error.into()))?;
         Ok(())
     }
 
-    /// Deletes the document's rows in `table`, the table `name`.
+    /// Deletes the rows of `table`, the table `name`, that `filter` picks, and
+    /// returns how many it deleted.
     async fn delete_rows(
         &self,
         table: &lancedb::Table,
         name: TableName,
-        document: &DocumentToRegister,
-    ) -> Result<(), IndexError> {
+        filter: &DfExpr,
+    ) -> Result<u64, IndexError> {
         self.hooks
             .before(LanceCall::WriteRows(name))
             .await
             .map_err(write_error)?;
-        let deleted = table.delete(&document_filter(document)).await;
-        deleted.map_err(|error| write_error(error.into()))?;
-        Ok(())
+        let deleted = table.delete(filter).await;
+        let deleted = deleted.map_err(|error| write_error(error.into()))?;
+        Ok(deleted.num_deleted_rows)
     }
 
     /// Replaces the document's row in the document table with `row`.
@@ -952,31 +1219,42 @@ impl Index for LanceDbIndex {
 
     async fn delete_others(
         &self,
-        _collection: &CollectionName,
-        _keep: &HashSet<Key>,
-        _unreadable_dirs: &[String],
+        collection: &CollectionName,
+        keep: &HashSet<Key>,
+        unreadable_dirs: &[String],
     ) -> Result<u64, PartialDelete> {
-        todo!()
+        let result = self.delete_other_documents(collection, keep, unreadable_dirs);
+        let result = result.await;
+        if let Err(stopped) = &result {
+            self.discard_after_error(&stopped.error).await;
+        }
+        result
     }
 
     async fn delete_document(
         &self,
-        _collection: &CollectionName,
-        _key: &Key,
+        collection: &CollectionName,
+        key: &Key,
     ) -> Result<(), IndexError> {
-        todo!()
+        let result = self.delete_one_document(collection, key).await;
+        self.discard_after(&result).await;
+        result
     }
 
     async fn has_document(
         &self,
-        _collection: &CollectionName,
-        _key: &Key,
+        collection: &CollectionName,
+        key: &Key,
     ) -> Result<bool, IndexError> {
-        todo!()
+        let result = self.document_exists(collection, key).await;
+        self.discard_after(&result).await;
+        result
     }
 
     async fn document_counts(&self) -> Result<BTreeMap<CollectionName, u64>, IndexError> {
-        todo!()
+        let result = self.count_documents().await;
+        self.discard_after(&result).await;
+        result
     }
 
     async fn status(
@@ -998,11 +1276,15 @@ impl Index for LanceDbIndex {
     }
 
     async fn tables_for_query(&self) -> Result<Option<QueryTables>, IndexError> {
-        todo!()
+        let result = self.store.pinned_tables().await;
+        self.discard_after(&result).await;
+        result
     }
 
     async fn maintain(&self) -> Result<(), IndexError> {
-        todo!()
+        let result = self.maintain_tables().await;
+        self.discard_after(&result).await;
+        result
     }
 
     async fn check_ingestable(&self) -> Result<(), IndexError> {
@@ -1108,17 +1390,8 @@ impl Store {
     /// The connection, for a function that only reads. `None` when there is
     /// no LanceDB directory yet: nothing is created, and the next call looks
     /// again, since another process may create the index meanwhile.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "its callers, the other functions of Index, are still todo"
-        )
-    )]
     async fn connection_to_read(&self) -> Result<Option<lancedb::Connection>, IndexError> {
-        let lancedb_dir = self.data_dir.join(LANCEDB_DIR);
-        let exists = tokio::fs::try_exists(&lancedb_dir).await;
-        if !exists.map_err(|error| read_error(error.into()))? {
+        if !self.lancedb_dir_exists().await? {
             return Ok(None);
         }
         let mut held = self.held.lock().await;
@@ -1128,6 +1401,75 @@ impl Store {
         let connection = self.connect().await.map_err(read_error)?;
         held.connection = Some(connection.clone());
         Ok(Some(connection))
+    }
+
+    /// The tables, for a function that reads them or that has nothing to
+    /// write without them. `None` when there is no LanceDB directory yet or a
+    /// table is missing: nothing is created, and the next call looks again.
+    /// Tables whose creation stopped partway are returned but not held, so
+    /// that [`Self::tables_to_write`] still finishes them.
+    async fn tables_to_read(&self) -> Result<Option<Tables>, IndexError> {
+        let mut held = self.held.lock().await;
+        if let Some(tables) = &held.tables {
+            return Ok(Some(tables.clone()));
+        }
+        if !self.lancedb_dir_exists().await? {
+            return Ok(None);
+        }
+        // Taken out until the tables are opened and their indexes checked, so
+        // that a failure or a panic on the way leaves nothing held. The lock is
+        // kept until then, so that what another call discards meanwhile is not
+        // put back.
+        let taken = std::mem::take(&mut *held);
+        let connection = match taken.connection {
+            Some(connection) => connection,
+            None => self.connect().await.map_err(read_error)?,
+        };
+        let tables = self.open_tables(&connection).await?;
+        let finished = match &tables {
+            Some(tables) => Self::has_all_indexes(tables).await?,
+            None => false,
+        };
+        *held = Held {
+            connection: Some(connection),
+            tables: tables.clone().filter(|_| finished),
+        };
+        Ok(tables)
+    }
+
+    async fn lancedb_dir_exists(&self) -> Result<bool, IndexError> {
+        let exists = tokio::fs::try_exists(self.data_dir.join(LANCEDB_DIR)).await;
+        exists.map_err(|error| read_error(error.into()))
+    }
+
+    /// The two tables, newly opened and each pinned to its latest version,
+    /// for `query`. `None` when there is no LanceDB directory yet, a table is
+    /// missing, or a pinned table lacks its full-text search index: `query`
+    /// cannot search a table without it, so the index counts as created only
+    /// once both tables have it.
+    async fn pinned_tables(&self) -> Result<Option<QueryTables>, IndexError> {
+        let Some(connection) = self.connection_to_read().await? else {
+            return Ok(None);
+        };
+        let Some(tables) = self.open_tables(&connection).await? else {
+            return Ok(None);
+        };
+        for (table, name) in [
+            (&tables.document, TableName::Document),
+            (&tables.chunk, TableName::Chunk),
+        ] {
+            let version = table.version().await;
+            let version = version.map_err(|error| read_error(error.into()))?;
+            let pinned = table.checkout(version).await;
+            pinned.map_err(|error| read_error(error.into()))?;
+            if !Self::has_full_text_index(table, name).await? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(QueryTables {
+            document: tables.document,
+            chunk: tables.chunk,
+        }))
     }
 
     /// Drops what is held, so that the next call opens LanceDB again. Called
@@ -1200,6 +1542,65 @@ impl Store {
         Ok(Some(table))
     }
 
+    /// Opens both tables, creating nothing; `None` when either is missing.
+    async fn open_tables(
+        &self,
+        connection: &lancedb::Connection,
+    ) -> Result<Option<Tables>, IndexError> {
+        let chunk = self.open_table(connection, TableName::Chunk).await?;
+        let document = self.open_table(connection, TableName::Document).await?;
+        Ok(chunk
+            .zip(document)
+            .map(|(chunk, document)| Tables { document, chunk }))
+    }
+
+    /// Whether both tables have all their indexes.
+    async fn has_all_indexes(tables: &Tables) -> Result<bool, IndexError> {
+        let chunk = Self::missing_indexes(&tables.chunk, TableName::Chunk).await?;
+        let document = Self::missing_indexes(&tables.document, TableName::Document).await?;
+        Ok(chunk.is_empty() && document.is_empty())
+    }
+
+    /// Whether the table has an index on its full-text search column. Reads
+    /// only the list of indexes: unlike a vector column, the full-text search
+    /// column is never missing from the table.
+    async fn has_full_text_index(
+        table: &lancedb::Table,
+        name: TableName,
+    ) -> Result<bool, IndexError> {
+        let existing = table.list_indices().await;
+        let existing = existing.map_err(|error| read_error(error.into()))?;
+        let mut full_text = name
+            .indexed_columns()
+            .into_iter()
+            .filter_map(|(column, kind)| matches!(kind, IndexKind::FullText).then_some(column));
+        Ok(full_text.all(|column| existing.iter().any(|index| index.columns == [column])))
+    }
+
+    /// The table's indexed columns that lack their index, with the kind of
+    /// index and the column. A table lacks its vector column only partway
+    /// through a rebuild of the vector columns, which indexes the new column
+    /// itself, so a column that is not there does not count.
+    async fn missing_indexes(
+        table: &lancedb::Table,
+        name: TableName,
+    ) -> Result<Vec<(&'static str, IndexKind, Field)>, IndexError> {
+        let schema = table.schema().await;
+        let schema = schema.map_err(|error| read_error(error.into()))?;
+        let existing = table.list_indices().await;
+        let existing = existing.map_err(|error| read_error(error.into()))?;
+        let mut missing = Vec::new();
+        for (column, kind) in name.indexed_columns() {
+            let Ok(field) = schema.field_with_name(column) else {
+                continue;
+            };
+            if !existing.iter().any(|index| index.columns == [column]) {
+                missing.push((column, kind, field.clone()));
+            }
+        }
+        Ok(missing)
+    }
+
     /// Opens a table; `None` when it does not exist.
     async fn open_table(
         &self,
@@ -1240,20 +1641,8 @@ impl Store {
         table: &lancedb::Table,
         name: TableName,
     ) -> Result<(), IndexError> {
-        let schema = table.schema().await;
-        let schema = schema.map_err(|error| read_error(error.into()))?;
-        let existing = table.list_indices().await;
-        let existing = existing.map_err(|error| read_error(error.into()))?;
-        for (column, kind) in name.indexed_columns() {
-            // A table lacks its vector column only partway through a rebuild
-            // of the vector columns, which indexes the new column itself.
-            let Ok(field) = schema.field_with_name(column) else {
-                continue;
-            };
-            if existing.iter().any(|index| index.columns == [column]) {
-                continue;
-            }
-            let index = kind.index(field).map_err(read_error)?;
+        for (column, kind, field) in Self::missing_indexes(table, name).await? {
+            let index = kind.index(&field).map_err(read_error)?;
             self.hooks
                 .before(LanceCall::CreateIndex(name))
                 .await
@@ -1605,12 +1994,33 @@ impl TimeMicros {
     }
 }
 
-// ---------------------------------------------------------------- a document's rows
+// ---------------------------------------------------------------- the rows of documents
 
 /// The condition that picks a document's rows in either table.
-fn document_filter(document: &DocumentToRegister) -> DfExpr {
-    let collection = col("collection").eq(lit(document.collection.0.clone()));
-    collection.and(col("key").eq(lit(document.key.0.clone())))
+fn document_filter(collection: &CollectionName, key: &Key) -> DfExpr {
+    collection_filter(collection).and(col("key").eq(lit(key.0.clone())))
+}
+
+/// The condition that picks a collection's rows in either table.
+fn collection_filter(collection: &CollectionName) -> DfExpr {
+    col("collection").eq(lit(collection.0.clone()))
+}
+
+/// Whether `key` is in one of `dirs`: it begins with the directory and `/`.
+fn in_any_dir(key: &Key, dirs: &[String]) -> bool {
+    let under = |dir: &String| {
+        key.0
+            .strip_prefix(dir.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    dirs.iter().any(under)
+}
+
+/// The condition that picks the rows of the documents with `keys` in the
+/// collection.
+fn keys_filter(collection: &CollectionName, keys: &[Key]) -> DfExpr {
+    let keys = keys.iter().map(|key| lit(key.0.clone())).collect();
+    collection_filter(collection).and(col("key").in_list(keys, false))
 }
 
 async fn read_rows(
