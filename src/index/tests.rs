@@ -148,10 +148,12 @@ enum PaceEvent {
     Yielded,
 }
 
-/// What the hooks do at a planned call into LanceDB, instead of letting it go
-/// ahead.
+/// What the hooks do at a planned call into LanceDB.
 #[derive(Clone, Copy, Debug)]
 enum Plan {
+    /// Let the call go ahead, so that a later plan for the same call is used
+    /// at a later call.
+    Allow,
     Fail,
     Panic,
 }
@@ -202,7 +204,7 @@ impl Hooks for TestHooks {
         match self.take_plan(call) {
             Some(Plan::Fail) => Err(format!("planned failure of {call:?}").into()),
             Some(Plan::Panic) => panic!("planned panic in {call:?}"),
-            None => Ok(()),
+            Some(Plan::Allow) | None => Ok(()),
         }
     }
 
@@ -1068,10 +1070,34 @@ fn sha256_hex(body: &str) -> String {
         .collect()
 }
 
-/// The tables in `data_dir`, opened apart from the component under test.
+/// The tables in `data_dir`, opened apart from the component under test. The
+/// indexes they lack are created first: to see which indexes a table has, use
+/// [`tables_as_they_are`].
 async fn open_tables(data_dir: &Path) -> Tables {
     let store = Store::new(data_dir.to_path_buf(), Arc::new(TestHooks::default()));
     store.tables_to_write(None).await.unwrap().unwrap()
+}
+
+/// The tables in `data_dir` as they are, opened with LanceDB alone, so that
+/// nothing they lack is created.
+async fn tables_as_they_are(data_dir: &Path) -> Tables {
+    let uri = data_dir.join(LANCEDB_DIR);
+    let connection = lancedb::connect(uri.to_str().unwrap());
+    let connection = connection.execute().await.unwrap();
+    let document = connection.open_table(TableName::Document.as_str());
+    let chunk = connection.open_table(TableName::Chunk.as_str());
+    Tables {
+        document: document.execute().await.unwrap(),
+        chunk: chunk.execute().await.unwrap(),
+    }
+}
+
+/// Drops the index on `column` of `table`, so that the table lacks it as
+/// tables whose creation stopped partway do.
+async fn drop_index_on(table: &lancedb::Table, column: &str) {
+    let existing = table.list_indices().await.unwrap();
+    let on_column = existing.iter().find(|config| config.columns == [column]);
+    table.drop_index(&on_column.unwrap().name).await.unwrap();
 }
 
 async fn all_rows(table: &lancedb::Table) -> Vec<RecordBatch> {
@@ -2205,7 +2231,7 @@ async fn registering_after_creating_the_tables_stopped_partway_finishes_them() {
 
     assert!(matches!(stopped, Err(IndexError::CannotWrite { .. })));
     assert_eq!(outcome, DocumentOutcome::Added);
-    let tables = open_tables(data_dir.path()).await;
+    let tables = tables_as_they_are(data_dir.path()).await;
     assert_eq!(indexed_columns(&tables.document).await.len(), 4);
     assert_eq!(indexed_columns(&tables.chunk).await.len(), 4);
 }
@@ -2462,5 +2488,879 @@ async fn registering_a_long_body_computes_in_slices_and_yields_between_them() {
             }
             PaceEvent::Yielded => last = None,
         }
+    }
+}
+
+// ---------------------------------------------------------------- reading and deleting documents: helpers
+
+fn name(value: &str) -> CollectionName {
+    CollectionName(value.to_owned())
+}
+
+fn key(value: &str) -> Key {
+    Key(value.to_owned())
+}
+
+fn keys(values: &[&str]) -> HashSet<Key> {
+    values.iter().map(|value| key(value)).collect()
+}
+
+fn document_in(collection: &str, key: &str) -> DocumentToRegister {
+    DocumentToRegister {
+        collection: name(collection),
+        ..document(key, ASCII_BODY)
+    }
+}
+
+/// Registers each document, one after another.
+async fn register_all(index: &LanceDbIndex, documents: &[DocumentToRegister]) {
+    for document in documents {
+        register(index, document).await.unwrap();
+    }
+}
+
+/// Deletes the document row of `key` in `collection`, leaving its chunk rows,
+/// as a registration that stopped partway does.
+async fn leave_only_chunk_rows(data_dir: &Path, collection: &str, key: &str) {
+    let table = open_tables(data_dir).await.document;
+    let row = col("collection")
+        .eq(lit(collection))
+        .and(col("key").eq(lit(key)));
+    table.delete(&row).await.unwrap();
+}
+
+async fn versions(table: &lancedb::Table) -> Vec<u64> {
+    let listed = table.list_versions().await.unwrap();
+    listed.iter().map(|version| version.version).collect()
+}
+
+/// The keys in `data_dir`, as (collection, key) pairs, from the document rows
+/// and from the chunk rows.
+async fn keys_in(data_dir: &Path) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let documents = document_rows(data_dir).await;
+    let documents = documents
+        .into_iter()
+        .map(|row| (row.collection, row.key))
+        .collect();
+    let mut chunks: Vec<_> = chunk_rows(data_dir)
+        .await
+        .into_iter()
+        .map(|row| (row.collection, row.key))
+        .collect();
+    chunks.dedup();
+    (documents, chunks)
+}
+
+fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
+    values
+        .iter()
+        .map(|(collection, key)| ((*collection).to_owned(), (*key).to_owned()))
+        .collect()
+}
+
+/// The calls into LanceDB that wrote or deleted rows, in order.
+fn writes(hooks: &TestHooks) -> Vec<LanceCall> {
+    let calls = hooks.calls();
+    let write = |call: &LanceCall| matches!(call, LanceCall::WriteRows(_));
+    calls.into_iter().filter(write).collect()
+}
+
+// ---------------------------------------------------------------- reading and deleting documents
+
+#[tokio::test]
+async fn functions_that_find_no_lancedb_directory_answer_without_creating_it() {
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+
+    let found = index.has_document(&name(COLLECTION), &key("a.md")).await;
+    let counts = index.document_counts().await;
+    let tables = index.tables_for_query().await;
+    let deleted = index
+        .delete_others(&name(COLLECTION), &HashSet::new(), &[])
+        .await;
+    let deleted_one = index.delete_document(&name(COLLECTION), &key("a.md")).await;
+    let maintained = index.maintain().await;
+
+    assert!(!found.unwrap());
+    assert!(counts.unwrap().is_empty());
+    assert!(tables.unwrap().is_none());
+    assert_eq!(deleted.unwrap(), 0);
+    assert!(matches!(deleted_one, Err(IndexError::DocumentNotFound)));
+    maintained.unwrap();
+    assert!(!data_dir.path().join("lancedb").exists());
+    assert_eq!(hooks.count(LanceCall::Connect), 0);
+}
+
+#[tokio::test]
+async fn a_document_another_component_registers_later_is_found() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let (data_dir, reader) = index_with(embedding.clone(), &Arc::new(TestHooks::default()));
+    let writer = index_in(data_dir.path(), embedding, &Arc::new(TestHooks::default()));
+    let before = reader.has_document(&name(COLLECTION), &key("a.md")).await;
+
+    register(&writer, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    let after = reader.has_document(&name(COLLECTION), &key("a.md")).await;
+    // The reader now holds the tables, and still reads what is written later.
+    register(&writer, &document("b.md", ASCII_BODY))
+        .await
+        .unwrap();
+    let later = reader.has_document(&name(COLLECTION), &key("b.md")).await;
+
+    assert_eq!(
+        (before.unwrap(), after.unwrap(), later.unwrap()),
+        (false, true, true)
+    );
+}
+
+#[tokio::test]
+async fn tables_another_component_creates_after_a_read_are_found() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let (data_dir, reader) = index_with(embedding.clone(), &Arc::new(TestHooks::default()));
+    std::fs::create_dir(data_dir.path().join("lancedb")).unwrap();
+    let writer = index_in(data_dir.path(), embedding, &Arc::new(TestHooks::default()));
+    let before = reader.has_document(&name(COLLECTION), &key("a.md")).await;
+
+    register(&writer, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    let after = reader.has_document(&name(COLLECTION), &key("a.md")).await;
+
+    assert_eq!((before.unwrap(), after.unwrap()), (false, true));
+}
+
+#[tokio::test]
+async fn has_document_answers_for_the_key_in_the_collection_only() {
+    prepare_full_text_search().await;
+    let (data_dir, index) =
+        index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
+    // Each name is both a collection name and, with ".md", a key.
+    let special = ["it's", "100%", "a_b", r"back\slash", "日本語"];
+    let special_key = |special: &str| format!("{special}.md");
+    let mut documents: Vec<_> = special
+        .iter()
+        .map(|special| document_in(special, &special_key(special)))
+        .collect();
+    documents.push(document_in("aXb", "aXb.md"));
+    documents.push(document_in("other", "elsewhere.md"));
+    documents.push(document_in("it's", "chunks-only.md"));
+    register_all(&index, &documents).await;
+    leave_only_chunk_rows(data_dir.path(), "it's", "chunks-only.md").await;
+
+    for registered in special {
+        let (collection, key) = (name(registered), key(&special_key(registered)));
+        let found = index.has_document(&collection, &key).await;
+        assert!(found.unwrap(), "{registered}");
+    }
+    let absent = [
+        ("it's", "missing.md"),
+        ("it's", "elsewhere.md"),
+        ("it's", "chunks-only.md"),
+        // As patterns, these would match "100%" and "aXb".
+        ("1%", "1%.md"),
+        ("aX_", "aX_.md"),
+    ];
+    for (collection, absent) in absent {
+        let found = index.has_document(&name(collection), &key(absent)).await;
+        assert!(!found.unwrap(), "{collection} {absent}");
+    }
+}
+
+#[tokio::test]
+async fn document_counts_counts_document_rows_of_each_collection() {
+    prepare_full_text_search().await;
+    let (data_dir, index) =
+        index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
+    let documents = [
+        document_in("a", "1.md"),
+        document_in("a", "2.md"),
+        document_in("a", "chunks-only.md"),
+        document_in("b", "1.md"),
+        document_in("emptied", "1.md"),
+    ];
+    register_all(&index, &documents).await;
+    leave_only_chunk_rows(data_dir.path(), "a", "chunks-only.md").await;
+    let emptied = index.delete_document(&name("emptied"), &key("1.md")).await;
+    emptied.unwrap();
+
+    let counts = index.document_counts().await.unwrap();
+
+    assert_eq!(counts, BTreeMap::from([(name("a"), 2), (name("b"), 1)]));
+}
+
+#[tokio::test]
+async fn delete_document_deletes_the_rows_of_that_document_in_both_tables() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_with(embedding.clone(), &hooks);
+    let kept = document("b.md", MIXED_BODY);
+    register_all(&index, &[document("a.md", ASCII_BODY), kept.clone()]).await;
+    let written = writes(&hooks).len();
+
+    index
+        .delete_document(&name(COLLECTION), &key("a.md"))
+        .await
+        .unwrap();
+
+    assert_index_holds(data_dir.path(), &[&kept], &embedding).await;
+    let deletions = &writes(&hooks)[written..];
+    let order = [
+        LanceCall::WriteRows(TableName::Chunk),
+        LanceCall::WriteRows(TableName::Document),
+    ];
+    assert_eq!(deletions, order);
+}
+
+#[tokio::test]
+async fn delete_document_of_a_missing_or_chunk_only_key_is_document_not_found() {
+    prepare_full_text_search().await;
+    let (data_dir, index) =
+        index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
+    register(&index, &document("chunks-only.md", ASCII_BODY))
+        .await
+        .unwrap();
+    leave_only_chunk_rows(data_dir.path(), COLLECTION, "chunks-only.md").await;
+
+    let missing = index
+        .delete_document(&name(COLLECTION), &key("missing.md"))
+        .await;
+    let chunks_only = index
+        .delete_document(&name(COLLECTION), &key("chunks-only.md"))
+        .await;
+
+    assert!(matches!(missing, Err(IndexError::DocumentNotFound)));
+    assert!(matches!(chunks_only, Err(IndexError::DocumentNotFound)));
+    assert_eq!(
+        keys_in(data_dir.path()).await.1,
+        pairs(&[(COLLECTION, "chunks-only.md")])
+    );
+}
+
+#[tokio::test]
+async fn tables_whose_creation_stopped_partway_are_read_but_left_to_be_finished() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let (data_dir, writer) = index_with(embedding.clone(), &Arc::new(TestHooks::default()));
+    register(&writer, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    drop_index_on(&tables_as_they_are(data_dir.path()).await.document, "key").await;
+    let index = index_in(data_dir.path(), embedding, &Arc::new(TestHooks::default()));
+
+    let found = index.has_document(&name(COLLECTION), &key("a.md")).await;
+    let tables = tables_as_they_are(data_dir.path()).await;
+    let indexes_after_reading = indexed_columns(&tables.document).await.len();
+    let outcome = register(&index, &document("a.md", ASCII_BODY)).await;
+
+    assert!(found.unwrap());
+    assert_eq!(indexes_after_reading, 3);
+    assert_eq!(outcome.unwrap(), DocumentOutcome::Unchanged);
+    let tables = tables_as_they_are(data_dir.path()).await;
+    assert_eq!(indexed_columns(&tables.document).await.len(), 4);
+}
+
+#[tokio::test]
+async fn first_reads_at_once_open_the_tables_once() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let (data_dir, writer) = index_with(embedding.clone(), &Arc::new(TestHooks::default()));
+    register(&writer, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    let hooks = Arc::new(TestHooks::default());
+    let index = index_in(data_dir.path(), embedding, &hooks);
+    let (collection, key) = (name(COLLECTION), key("a.md"));
+
+    let reads = (0..8).map(|_| index.has_document(&collection, &key));
+    let found = futures::future::join_all(reads).await;
+
+    assert!(found.into_iter().all(|found| found.unwrap()));
+    assert_eq!(hooks.count(LanceCall::Connect), 1);
+    assert_eq!(hooks.count(LanceCall::OpenTable(TableName::Chunk)), 1);
+    assert_eq!(hooks.count(LanceCall::OpenTable(TableName::Document)), 1);
+}
+
+#[tokio::test]
+async fn after_a_panic_while_opening_the_tables_to_read_the_next_call_connects_again() {
+    prepare_full_text_search().await;
+    let (data_dir, writer) = store_with(&Arc::new(TestHooks::default()));
+    writer.tables_to_write(Some(&model(8))).await.unwrap();
+    let hooks = Arc::new(TestHooks::default());
+    let store = Arc::new(Store::new(data_dir.path().to_path_buf(), hooks.clone()));
+    hooks.plan(LanceCall::OpenTable(TableName::Chunk), Plan::Panic);
+
+    let panicked = tokio::spawn({
+        let store = store.clone();
+        async move { store.tables_to_read().await.map(|_| ()) }
+    })
+    .await;
+    let after = store.tables_to_read().await;
+
+    assert!(panicked.unwrap_err().is_panic());
+    assert!(after.unwrap().is_some());
+    assert_eq!(hooks.count(LanceCall::Connect), 2);
+}
+
+#[tokio::test]
+async fn delete_others_deletes_the_keys_neither_kept_nor_in_an_unreadable_directory() {
+    prepare_full_text_search().await;
+    let (data_dir, index) =
+        index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
+    let in_c = [
+        "it's.md",
+        "100%.md",
+        "a_b.md",
+        r"back\slash.md",
+        "日本語.md",
+        "docs/a.md",
+        "docs/sub/b.md",
+        "docs2/c.md",
+        "docs",
+    ];
+    let mut documents: Vec<_> = in_c.iter().map(|key| document_in("c", key)).collect();
+    documents.push(document_in("other", "100%.md"));
+    register_all(&index, &documents).await;
+
+    let kept = keys(&["it's.md", "日本語.md"]);
+    let deleted = index
+        .delete_others(&name("c"), &kept, &["docs".to_owned()])
+        .await;
+
+    assert_eq!(deleted.unwrap(), 5);
+    let mut left = pairs(&[
+        ("c", "docs/a.md"),
+        ("c", "docs/sub/b.md"),
+        ("c", "it's.md"),
+        ("c", "日本語.md"),
+        ("other", "100%.md"),
+    ]);
+    left.sort();
+    assert_eq!(keys_in(data_dir.path()).await, (left.clone(), left));
+}
+
+#[tokio::test]
+async fn an_unreadable_directory_with_wildcards_keeps_only_the_keys_in_it() {
+    prepare_full_text_search().await;
+    let (data_dir, index) =
+        index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
+    let in_c = ["a%_b/1.md", "aX_b/2.md", "a%Xb/3.md", "abcd/4.md"];
+    let documents: Vec<_> = in_c.iter().map(|key| document_in("c", key)).collect();
+    register_all(&index, &documents).await;
+
+    let deleted = index
+        .delete_others(&name("c"), &HashSet::new(), &["a%_b".to_owned()])
+        .await;
+
+    assert_eq!(deleted.unwrap(), 3);
+    let left = pairs(&[("c", "a%_b/1.md")]);
+    assert_eq!(keys_in(data_dir.path()).await, (left.clone(), left));
+}
+
+#[tokio::test]
+async fn delete_others_without_keys_or_directories_deletes_the_whole_collection() {
+    prepare_full_text_search().await;
+    let (data_dir, index) =
+        index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
+    let documents = [
+        document_in("c", "1.md"),
+        document_in("c", "2.md"),
+        document_in("other", "1.md"),
+    ];
+    register_all(&index, &documents).await;
+
+    let deleted = index.delete_others(&name("c"), &HashSet::new(), &[]).await;
+
+    assert_eq!(deleted.unwrap(), 2);
+    let left = pairs(&[("other", "1.md")]);
+    assert_eq!(keys_in(data_dir.path()).await, (left.clone(), left));
+}
+
+#[tokio::test]
+async fn chunk_only_keys_are_deleted_without_being_counted() {
+    prepare_full_text_search().await;
+    let (data_dir, index) =
+        index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
+    register_all(
+        &index,
+        &[document("a.md", ASCII_BODY), document("b.md", ASCII_BODY)],
+    )
+    .await;
+    leave_only_chunk_rows(data_dir.path(), COLLECTION, "b.md").await;
+
+    let deleted = index
+        .delete_others(&name(COLLECTION), &keys(&["a.md"]), &[])
+        .await;
+
+    assert_eq!(deleted.unwrap(), 0);
+    let left = pairs(&[(COLLECTION, "a.md")]);
+    assert_eq!(keys_in(data_dir.path()).await, (left.clone(), left));
+}
+
+#[tokio::test]
+async fn a_document_without_chunk_rows_is_deleted_and_counted() {
+    prepare_full_text_search().await;
+    let (data_dir, index) =
+        index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
+    register_all(
+        &index,
+        &[document("a.md", ASCII_BODY), document("empty.md", "")],
+    )
+    .await;
+    let with_chunks = pairs(&[(COLLECTION, "a.md")]);
+    assert_eq!(keys_in(data_dir.path()).await.1, with_chunks);
+
+    let deleted = index
+        .delete_others(&name(COLLECTION), &keys(&["a.md"]), &[])
+        .await;
+
+    assert_eq!(deleted.unwrap(), 1);
+    assert_eq!(
+        keys_in(data_dir.path()).await,
+        (with_chunks.clone(), with_chunks)
+    );
+}
+
+#[tokio::test]
+async fn delete_others_with_nothing_to_delete_writes_nothing() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    register(&index, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    let tables = open_tables(data_dir.path()).await;
+    let before = (
+        versions(&tables.document).await,
+        versions(&tables.chunk).await,
+    );
+    let written = writes(&hooks).len();
+
+    let deleted = index
+        .delete_others(&name(COLLECTION), &keys(&["a.md"]), &[])
+        .await;
+
+    assert_eq!(deleted.unwrap(), 0);
+    let after = (
+        versions(&tables.document).await,
+        versions(&tables.chunk).await,
+    );
+    assert_eq!(after, before);
+    assert_eq!(writes(&hooks).len(), written);
+}
+
+#[tokio::test]
+async fn delete_others_deletes_in_batches_with_the_chunk_rows_first() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, mut index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    index.key_batch_len = 2;
+    let documents: Vec<_> = (0..5)
+        .map(|number| document(&format!("{number}.md"), ASCII_BODY))
+        .collect();
+    register_all(&index, &documents).await;
+    let written = writes(&hooks).len();
+
+    let deleted = index
+        .delete_others(&name(COLLECTION), &HashSet::new(), &[])
+        .await;
+
+    assert_eq!(deleted.unwrap(), 5);
+    let chunk_then_document = [
+        LanceCall::WriteRows(TableName::Chunk),
+        LanceCall::WriteRows(TableName::Document),
+    ];
+    assert_eq!(writes(&hooks)[written..], chunk_then_document.repeat(3));
+    assert_eq!(keys_in(data_dir.path()).await, (Vec::new(), Vec::new()));
+}
+
+#[tokio::test]
+async fn a_failure_in_the_second_batch_returns_what_the_first_batch_deleted() {
+    prepare_full_text_search().await;
+    let not_first_batch = pairs(&[
+        (COLLECTION, "2.md"),
+        (COLLECTION, "3.md"),
+        (COLLECTION, "4.md"),
+    ]);
+    // The keys are deleted in their order, two at a time: "0.md" and "1.md"
+    // first, then "2.md" and "3.md", whose deletion fails in `table`.
+    let cases = [
+        (TableName::Chunk, not_first_batch.clone()),
+        (TableName::Document, pairs(&[(COLLECTION, "4.md")])),
+    ];
+    for (table, chunk_keys_left) in cases {
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, mut index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+        index.key_batch_len = 2;
+        let documents: Vec<_> = (0..5)
+            .map(|number| document(&format!("{number}.md"), ASCII_BODY))
+            .collect();
+        register_all(&index, &documents).await;
+        hooks.plan(LanceCall::WriteRows(table), Plan::Allow);
+        hooks.plan(LanceCall::WriteRows(table), Plan::Fail);
+
+        let deleted = index
+            .delete_others(&name(COLLECTION), &HashSet::new(), &[])
+            .await;
+
+        let Err(PartialDelete { deleted, error }) = deleted else {
+            panic!("{table:?}: expected the deletion to stop, got {deleted:?}");
+        };
+        assert_eq!(deleted, 2, "{table:?}");
+        assert!(matches!(error, IndexError::CannotWrite { .. }), "{table:?}");
+        assert_eq!(
+            keys_in(data_dir.path()).await,
+            (not_first_batch.clone(), chunk_keys_left),
+            "{table:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failure_reading_the_keys_stops_before_deleting_anything() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_with(embedding.clone(), &hooks);
+    let registered = document("a.md", ASCII_BODY);
+    register(&index, &registered).await.unwrap();
+    hooks.plan(LanceCall::ReadRows(TableName::Chunk), Plan::Fail);
+
+    let deleted = index
+        .delete_others(&name(COLLECTION), &HashSet::new(), &[])
+        .await;
+
+    let Err(PartialDelete { deleted, error }) = deleted else {
+        panic!("expected the deletion to stop, got {deleted:?}");
+    };
+    assert_eq!(deleted, 0);
+    assert!(matches!(error, IndexError::CannotRead { .. }));
+    assert_index_holds(data_dir.path(), &[&registered], &embedding).await;
+    // The connection was dropped, so the next call connects again.
+    index.document_counts().await.unwrap();
+    assert_eq!(hooks.count(LanceCall::Connect), 2);
+}
+
+#[tokio::test]
+async fn deleting_different_documents_at_once_deletes_them_all() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let (data_dir, index) = index_with(embedding.clone(), &Arc::new(TestHooks::default()));
+    let collections = ["c1", "c2", "c3", "c4"];
+    let documents: Vec<_> = collections
+        .iter()
+        .flat_map(|collection| {
+            [
+                document_in(collection, "1.md"),
+                document_in(collection, "2.md"),
+            ]
+        })
+        .collect();
+    register_all(&index, &documents).await;
+    let none = HashSet::new();
+    let [c1, c2, c3, c4] = collections.map(name);
+    let first_key = key("1.md");
+
+    let (first, second, third, fourth) = tokio::join!(
+        index.delete_others(&c1, &none, &[]),
+        index.delete_others(&c2, &none, &[]),
+        index.delete_document(&c3, &first_key),
+        index.delete_document(&c4, &first_key),
+    );
+
+    assert_eq!((first.unwrap(), second.unwrap()), (2, 2));
+    third.unwrap();
+    fourth.unwrap();
+    let left = pairs(&[("c3", "2.md"), ("c4", "2.md")]);
+    assert_eq!(keys_in(data_dir.path()).await, (left.clone(), left));
+}
+
+// ---------------------------------------------------------------- the tables for `query`
+
+#[tokio::test]
+async fn tables_for_query_are_none_until_both_tables_have_their_full_text_indexes() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    std::fs::create_dir(data_dir.path().join("lancedb")).unwrap();
+    let without_tables = index.tables_for_query().await.unwrap();
+    // The first index made on the document table is its full-text search
+    // index.
+    hooks.plan(LanceCall::CreateIndex(TableName::Document), Plan::Fail);
+    register(&index, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap_err();
+
+    let without_index = index.tables_for_query().await.unwrap();
+    register(&index, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    let finished = index.tables_for_query().await.unwrap();
+
+    assert!(without_tables.is_none());
+    assert!(without_index.is_none());
+    assert!(finished.is_some());
+}
+
+#[tokio::test]
+async fn tables_for_query_are_none_while_the_chunk_table_lacks_its_full_text_index() {
+    prepare_full_text_search().await;
+    let (data_dir, index) =
+        index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
+    register(&index, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    drop_index_on(&tables_as_they_are(data_dir.path()).await.chunk, "text").await;
+
+    let tables = index.tables_for_query().await.unwrap();
+
+    assert!(tables.is_none());
+}
+
+#[tokio::test]
+async fn tables_for_query_need_only_the_full_text_indexes() {
+    prepare_full_text_search().await;
+    let (data_dir, index) =
+        index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
+    register(&index, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    let tables = tables_as_they_are(data_dir.path()).await;
+    for (table, vector) in [(&tables.document, "vectors"), (&tables.chunk, "vector")] {
+        for column in ["collection", "key", vector] {
+            drop_index_on(table, column).await;
+        }
+    }
+
+    let tables = index.tables_for_query().await.unwrap();
+
+    assert!(tables.is_some());
+}
+
+#[tokio::test]
+async fn tables_for_query_stay_at_their_version_until_called_again() {
+    prepare_full_text_search().await;
+    let (_data_dir, index) =
+        index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
+    let first = document("a.md", ASCII_BODY);
+    register(&index, &first).await.unwrap();
+    let pinned = index.tables_for_query().await.unwrap().unwrap();
+    let pinned_version = pinned.document.version().await.unwrap();
+
+    let second = document("b.md", MIXED_BODY);
+    let outcome = register(&index, &second).await;
+    let next = index.tables_for_query().await.unwrap().unwrap();
+
+    assert_eq!(outcome.unwrap(), DocumentOutcome::Added);
+    assert!(
+        index
+            .has_document(&name(COLLECTION), &key("b.md"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(pinned.document.version().await.unwrap(), pinned_version);
+    assert_eq!(pinned.document.count_rows(None).await.unwrap(), 1);
+    assert_eq!(
+        pinned.chunk.count_rows(None).await.unwrap(),
+        first.chunks.len()
+    );
+    assert_eq!(next.document.count_rows(None).await.unwrap(), 2);
+    assert_eq!(
+        next.chunk.count_rows(None).await.unwrap(),
+        first.chunks.len() + second.chunks.len()
+    );
+}
+
+// ---------------------------------------------------------------- maintenance
+
+#[tokio::test]
+async fn maintain_takes_the_three_steps_on_each_table_in_order() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    register(&index, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+
+    index.maintain().await.unwrap();
+
+    let optimize = |call: &LanceCall| matches!(call, LanceCall::Optimize(..));
+    let steps: Vec<_> = hooks.calls().into_iter().filter(optimize).collect();
+    let seven_days = MaintenanceStep::Prune {
+        older_than: TimeDelta::days(7),
+    };
+    let on = |table| {
+        [MaintenanceStep::Compact, seven_days, MaintenanceStep::Index]
+            .map(|step| LanceCall::Optimize(table, step))
+    };
+    let expected: Vec<_> = on(TableName::Chunk)
+        .into_iter()
+        .chain(on(TableName::Document))
+        .collect();
+    assert_eq!(steps, expected);
+}
+
+#[tokio::test]
+async fn maintain_keeps_the_versions_just_made() {
+    prepare_full_text_search().await;
+    let (data_dir, index) =
+        index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
+    register_all(
+        &index,
+        &[document("a.md", ASCII_BODY), document("b.md", MIXED_BODY)],
+    )
+    .await;
+    let tables = open_tables(data_dir.path()).await;
+    let before = [
+        versions(&tables.document).await,
+        versions(&tables.chunk).await,
+    ];
+
+    index.maintain().await.unwrap();
+
+    let after = [
+        versions(&tables.document).await,
+        versions(&tables.chunk).await,
+    ];
+    for (before, after) in before.iter().zip(&after) {
+        assert!(
+            before.iter().all(|version| after.contains(version)),
+            "{before:?} {after:?}"
+        );
+    }
+}
+
+#[test]
+fn the_maintenance_steps_compact_then_clean_up_versions_older_than_seven_days_then_index() {
+    let [compact, prune, indexing] = MaintenanceStep::all().map(MaintenanceStep::action);
+
+    assert!(matches!(
+        compact,
+        OptimizeAction::Compact { options, remap_options: None }
+            if options == CompactionOptions::default()
+    ));
+    assert!(matches!(
+        prune,
+        OptimizeAction::Prune {
+            older_than: Some(older_than),
+            delete_unverified: None,
+            error_if_tagged_old_versions: None,
+        } if older_than == TimeDelta::days(7)
+    ));
+    let OptimizeAction::Index(options) = indexing else {
+        panic!("the last step does not index");
+    };
+    // `OptimizeOptions` has no `PartialEq`.
+    let default = OptimizeOptions::default();
+    assert_eq!(format!("{options:?}"), format!("{default:?}"));
+}
+
+// ---------------------------------------------------------------- failures of the functions that do not create the tables
+
+/// A function of the component that opens the tables but does not create
+/// them: it reads them, or has nothing to write without them.
+#[derive(Clone, Copy, Debug)]
+enum OpensTablesOnly {
+    HasDocument,
+    DocumentCounts,
+    DeleteDocument,
+    DeleteOthers,
+    TablesForQuery,
+    Maintain,
+}
+
+impl OpensTablesOnly {
+    /// Calls the function on the document `a.md` of [`COLLECTION`], keeping
+    /// only the error. `delete_others` keeps no key, so it deletes `a.md`.
+    async fn call(self, index: &LanceDbIndex) -> Result<(), IndexError> {
+        let collection = name(COLLECTION);
+        let key = key("a.md");
+        match self {
+            Self::HasDocument => index.has_document(&collection, &key).await.map(drop),
+            Self::DocumentCounts => index.document_counts().await.map(drop),
+            Self::DeleteDocument => index.delete_document(&collection, &key).await,
+            Self::DeleteOthers => {
+                let keep = HashSet::new();
+                match index.delete_others(&collection, &keep, &[]).await {
+                    Ok(_) => Ok(()),
+                    Err(stopped) => {
+                        // It stops before it finishes deleting the one document.
+                        assert_eq!(stopped.deleted, 0);
+                        Err(stopped.error)
+                    }
+                }
+            }
+            Self::TablesForQuery => index.tables_for_query().await.map(drop),
+            Self::Maintain => index.maintain().await,
+        }
+    }
+}
+
+/// The error that a failed call into LanceDB should make.
+#[derive(Clone, Copy, Debug)]
+enum ExpectedError {
+    CannotRead,
+    CannotWrite,
+}
+
+#[tokio::test]
+async fn each_failure_is_an_error_reading_or_writing_and_the_next_call_connects_again() {
+    use ExpectedError::{CannotRead, CannotWrite};
+    use LanceCall::{Connect, OpenTable, Optimize, ReadRows, WriteRows};
+    use OpensTablesOnly::*;
+    use TableName::{Chunk, Document};
+    prepare_full_text_search().await;
+    let (compact, index_step) = (MaintenanceStep::Compact, MaintenanceStep::Index);
+    let cases = [
+        (HasDocument, Connect, CannotRead),
+        (HasDocument, OpenTable(Chunk), CannotRead),
+        (HasDocument, ReadRows(Document), CannotRead),
+        (DocumentCounts, Connect, CannotRead),
+        (DocumentCounts, OpenTable(Chunk), CannotRead),
+        (DocumentCounts, ReadRows(Document), CannotRead),
+        (DeleteDocument, Connect, CannotRead),
+        (DeleteDocument, OpenTable(Chunk), CannotRead),
+        (DeleteDocument, ReadRows(Document), CannotRead),
+        (DeleteDocument, WriteRows(Chunk), CannotWrite),
+        (DeleteDocument, WriteRows(Document), CannotWrite),
+        (DeleteOthers, Connect, CannotRead),
+        (DeleteOthers, OpenTable(Chunk), CannotRead),
+        (DeleteOthers, ReadRows(Chunk), CannotRead),
+        (DeleteOthers, ReadRows(Document), CannotRead),
+        (DeleteOthers, WriteRows(Chunk), CannotWrite),
+        (DeleteOthers, WriteRows(Document), CannotWrite),
+        (TablesForQuery, Connect, CannotRead),
+        (TablesForQuery, OpenTable(Chunk), CannotRead),
+        (TablesForQuery, OpenTable(Document), CannotRead),
+        (Maintain, Connect, CannotRead),
+        (Maintain, OpenTable(Chunk), CannotRead),
+        (Maintain, Optimize(Chunk, compact), CannotWrite),
+        (Maintain, Optimize(Document, index_step), CannotWrite),
+    ];
+    let embedding = embedding_of(MODEL_NAME, 8);
+    for (function, call, expected) in cases {
+        let (data_dir, writer) = index_with(embedding.clone(), &Arc::new(TestHooks::default()));
+        register(&writer, &document("a.md", ASCII_BODY))
+            .await
+            .unwrap();
+        let hooks = Arc::new(TestHooks::default());
+        let index = index_in(data_dir.path(), embedding.clone(), &hooks);
+        hooks.plan(call, Plan::Fail);
+
+        let first = function.call(&index).await;
+        let second = function.call(&index).await;
+
+        let case = format!("{function:?} with {call:?} failing");
+        match (expected, first) {
+            (CannotRead, Err(IndexError::CannotRead { .. }))
+            | (CannotWrite, Err(IndexError::CannotWrite { .. })) => {}
+            (_, first) => panic!("{case}: {first:?}"),
+        }
+        second.unwrap_or_else(|error| panic!("{case}, then: {error:?}"));
+        // Nothing was held after the error, so the second call connected.
+        assert_eq!(hooks.count(Connect), 2, "{case}");
     }
 }
