@@ -30,6 +30,7 @@ pub(crate) enum ReportCall {
     McpError(String),
     ExplainPanic(ExplainStyle),
     McpPanicError,
+    ExplainMemoryLimit(u64, ExplainStyle),
 }
 
 impl TestErrorReport {
@@ -63,6 +64,11 @@ impl TestErrorReport {
 
     /// The explanation the double gives for an unexpected failure.
     pub(crate) const PANIC_EXPLANATION: &'static str = "explanation of a panic";
+
+    /// The explanation the double gives for going over the memory limit.
+    pub(crate) fn memory_limit_explanation(limit_mb: u64) -> String {
+        format!("explanation of the memory limit of {limit_mb} MB")
+    }
 }
 
 impl Default for TestErrorReport {
@@ -108,6 +114,11 @@ impl ErrorReport for TestErrorReport {
             message: Self::PANIC_EXPLANATION.to_owned(),
             details: serde_json::Map::new(),
         }
+    }
+
+    fn explain_memory_limit(&self, limit_mb: u64, style: ExplainStyle) -> String {
+        self.record(ReportCall::ExplainMemoryLimit(limit_mb, style));
+        Self::memory_limit_explanation(limit_mb)
     }
 }
 
@@ -183,5 +194,22 @@ mod tests {
 
         assert_eq!(explanation, TestErrorReport::PANIC_EXPLANATION);
         assert_eq!(report.calls(), vec![ReportCall::ExplainPanic(style)]);
+    }
+
+    #[test]
+    fn explain_memory_limit_names_the_limit_and_records_the_style() {
+        let report = TestErrorReport::new();
+        let style = ExplainStyle {
+            color: true,
+            replace_controls: false,
+        };
+
+        let explanation = report.explain_memory_limit(8192, style);
+
+        assert_eq!(explanation, TestErrorReport::memory_limit_explanation(8192));
+        assert_eq!(
+            report.calls(),
+            vec![ReportCall::ExplainMemoryLimit(8192, style)]
+        );
     }
 }

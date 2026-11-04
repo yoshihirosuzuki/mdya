@@ -4,6 +4,7 @@
 )]
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::collection::{CollectionChange, CollectionError, CollectionInfo};
@@ -23,14 +24,15 @@ use crate::index::{
 use crate::ingest::{
     Ingest, IngestError, PutInstruction, UpdateInstruction, UpdateReport, UpdateStopped,
 };
+use crate::path::MakePathAbsoluteError;
 use crate::query::{
     ChunkRangeRequest, Hit, QueryError, SearchMode, SearchRequest, SearchResult, SearchUnit,
 };
 use crate::test_support::log_receiver::{LogRecord, capture_async};
 use crate::types::test_double::test_dir_lookup;
 use crate::types::{
-    CollectionName, CollectionType, DocumentOutcome, EmbeddingModel, Key, Progress, ProgressSink,
-    TypeAttributes,
+    BoxError, CollectionName, CollectionType, DocumentOutcome, EmbeddingModel, Key, Progress,
+    ProgressSink, TypeAttributes,
 };
 
 use super::super::test_double::{ProgressEvent, TestConfirmation, TestContentReader, TestProgress};
@@ -38,9 +40,10 @@ use super::super::{
     ChangeCollectionInput, ChangeSettingInput, CollectionEntry, CollectionList,
     CreateCollectionInput, DeleteCollectionInput, DeleteCollectionOutcome, DeleteDocumentInput,
     DeleteDocumentOutcome, DocumentText, ErrorContext, GetDocumentInput, IndexEmbeddingModel,
-    OperationError, OperationParts, Operations, OptimizeInput, OutcomeAnomaly, PutInput,
-    RebuildInput, SearchHit, SearchInput, SearchLimit, SearchModeName, SearchOutput,
-    SearchUnitName, SettingsOutput, StatusOutput, UpdateAllInput, UpdateInput,
+    ModelCacheDirUndetermined, OperationError, OperationParts, Operations, OptimizeInput,
+    OutcomeAnomaly, OutputPart, PutInput, RebuildInput, SearchHit, SearchInput, SearchLimit,
+    SearchModeName, SearchOutput, SearchUnitName, SettingsOutput, StatusOutput, UpdateAllInput,
+    UpdateInput, model_cache_dir_undetermined,
 };
 use super::{
     AssembledOperations, DIMENSION_UNCHECKED, DocumentCounts, MAINTENANCE_FAILED,
@@ -57,6 +60,8 @@ struct Doubles {
     query: Arc<TestQuery>,
     ingests: BTreeMap<CollectionType, Arc<TestIngest>>,
     write_lock: Arc<TestWriteLock>,
+    /// The function that returns the embedding model cache directory.
+    model_cache_dir: Arc<dyn Fn() -> Result<PathBuf, ModelCacheDirUndetermined> + Send + Sync>,
     /// What `create_embedding` was given, each time.
     created_embeddings: Arc<Mutex<Vec<CreatedEmbedding>>>,
 }
@@ -68,7 +73,29 @@ struct CreatedEmbedding {
     model: String,
     ollama_endpoint: String,
     hf_token: Option<String>,
-    model_cache_dir: std::path::PathBuf,
+    model_cache_dir: ReturnedCacheDir,
+}
+
+/// What the function for the embedding model cache directory in
+/// `EmbeddingSettings` returned.
+#[derive(Debug, PartialEq)]
+enum ReturnedCacheDir {
+    Dir(PathBuf),
+    /// An error in which `model_cache_dir_undetermined` finds that the
+    /// directory could not be determined.
+    Undetermined,
+    /// Any other error.
+    OtherError,
+}
+
+impl ReturnedCacheDir {
+    fn of(returned: Result<PathBuf, BoxError>) -> Self {
+        match returned {
+            Ok(dir) => Self::Dir(dir),
+            Err(error) if model_cache_dir_undetermined(&*error) => Self::Undetermined,
+            Err(_) => Self::OtherError,
+        }
+    }
 }
 
 impl Doubles {
@@ -84,6 +111,7 @@ impl Doubles {
                 (raw(), Arc::new(TestIngest::new().supporting(false, true))),
             ]),
             write_lock: Arc::new(TestWriteLock::new()),
+            model_cache_dir: Arc::new(|| Ok("/home/user/.mdya-models".into())),
             created_embeddings: Arc::default(),
         }
     }
@@ -118,6 +146,14 @@ impl Doubles {
         self
     }
 
+    fn model_cache_dir(
+        mut self,
+        model_cache_dir: impl Fn() -> Result<PathBuf, ModelCacheDirUndetermined> + Send + Sync + 'static,
+    ) -> Self {
+        self.model_cache_dir = Arc::new(model_cache_dir);
+        self
+    }
+
     fn operations(&self) -> AssembledOperations {
         let ingests = self
             .ingests
@@ -143,12 +179,12 @@ impl Doubles {
                         model: settings.model.clone(),
                         ollama_endpoint: settings.ollama_endpoint.clone(),
                         hf_token: settings.hf_token.clone(),
-                        model_cache_dir: (settings.model_cache_dir)().unwrap(),
+                        model_cache_dir: ReturnedCacheDir::of((settings.model_cache_dir)()),
                     });
                     Arc::new(TestEmbedding::new(&settings.model, 768)) as Arc<dyn Embedding>
                 })
             },
-            model_cache_dir: Arc::new(|| Ok("/home/user/.mdya-models".into())),
+            model_cache_dir: self.model_cache_dir.clone(),
             hf_token: Some("hf-token".to_owned()),
             dirs: test_dir_lookup(Some("/home/user"), Ok("/home/user/work")),
             parallelism: 4,
@@ -1349,7 +1385,7 @@ async fn a_document_as_large_as_the_limit_is_returned() {
 }
 
 #[tokio::test]
-async fn a_document_larger_than_the_limit_is_not_returned() {
+async fn a_chunk_larger_than_the_limit_is_not_returned() {
     let doubles = Doubles::new()
         .collections(TestCollections::with(vec![notes()]))
         .query(query_with_a_md());
@@ -1363,8 +1399,57 @@ async fn a_document_larger_than_the_limit_is_not_returned() {
     assert!(matches!(
         error,
         OperationError::OutputTooLarge {
+            part: OutputPart::Chunk,
             size_bytes: 9,
             limit_bytes: 8
+        }
+    ));
+}
+
+#[tokio::test]
+async fn a_body_larger_than_the_limit_is_said_to_be_the_body() {
+    let doubles = Doubles::new()
+        .collections(TestCollections::with(vec![notes()]))
+        .query(query_with_a_md());
+    let input = GetDocumentInput {
+        range: ChunkRangeRequest {
+            start: None,
+            end: None,
+        },
+        ..get_a_md(Some(8))
+    };
+
+    let error = doubles.operations().get_document(input).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        OperationError::OutputTooLarge {
+            part: OutputPart::Body,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn a_chunk_range_larger_than_the_limit_is_said_to_be_the_range() {
+    let doubles = Doubles::new()
+        .collections(TestCollections::with(vec![notes()]))
+        .query(query_with_a_md());
+    let input = GetDocumentInput {
+        range: ChunkRangeRequest {
+            start: Some(0),
+            end: Some(1),
+        },
+        ..get_a_md(Some(8))
+    };
+
+    let error = doubles.operations().get_document(input).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        OperationError::OutputTooLarge {
+            part: OutputPart::ChunkRange,
+            ..
         }
     ));
 }
@@ -2577,6 +2662,113 @@ async fn a_dimension_that_could_not_be_checked_after_an_update_is_warned_about()
     )));
 }
 
+/// How to fix an embedding model cache directory that could not be
+/// determined, written out in full on one line, so that a change to the
+/// constant the operations use shows here.
+const CACHE_DIR_FIX: &str = "Give an absolute path for the embedding model cache directory with \
+    --model-cache-dir, then run the operation again. If the working directory cannot be read, you \
+    can also move to a working directory that mdya can read, and run the operation again. For the \
+    MCP server, start it again after either of these.";
+
+/// The error of an embedding model whose cache directory could not be
+/// determined because the home directory is unknown.
+fn cache_dir_undetermined() -> EmbeddingError {
+    EmbeddingError::ModelUnavailable {
+        source: Box::new(ModelCacheDirUndetermined {
+            source: MakePathAbsoluteError::HomeDirUnknown,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn a_dimension_unchecked_for_a_cache_directory_after_an_update_is_warned_about_with_the_fix()
+{
+    let doubles = Doubles::new()
+        .collections(TestCollections::with(vec![notes()]))
+        .index(TestIndex::new().on_status(|_, _, _| {
+            Ok(status_with(DimensionResult::Unavailable(
+                cache_dir_undetermined(),
+            )))
+        }));
+    let progress = Arc::new(TestProgress::new());
+    let operations = doubles.operations();
+
+    let (outcome, logs) =
+        capture_async(operations.update_all(update_all_input(&progress, false))).await;
+
+    assert!(outcome.unwrap().status_error.is_none());
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].message, DIMENSION_UNCHECKED);
+    assert_eq!(field(&logs[0], "fix"), CACHE_DIR_FIX);
+}
+
+#[tokio::test]
+async fn a_dimension_unchecked_for_another_reason_is_warned_about_without_a_fix() {
+    let doubles = Doubles::new()
+        .collections(TestCollections::with(vec![notes()]))
+        .index(TestIndex::new().on_status(|_, _, _| {
+            Ok(status_with(DimensionResult::Unavailable(
+                EmbeddingError::ModelUnavailable {
+                    source: "Ollama is not running".into(),
+                },
+            )))
+        }));
+    let progress = Arc::new(TestProgress::new());
+    let operations = doubles.operations();
+
+    let (_, logs) = capture_async(operations.update_all(update_all_input(&progress, false))).await;
+
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].message, DIMENSION_UNCHECKED);
+    assert!(logs[0].fields.iter().all(|(name, _)| name != "fix"));
+}
+
+#[tokio::test]
+async fn a_status_whose_dimension_is_unchecked_for_a_cache_directory_has_the_fix_in_its_warning() {
+    let doubles = Doubles::new().index(TestIndex::new().on_status(|_, _, _| {
+        Ok(status_with(DimensionResult::Unavailable(
+            cache_dir_undetermined(),
+        )))
+    }));
+
+    let status = doubles.operations().status().await.unwrap();
+
+    assert_eq!(
+        status.warnings,
+        [format!(
+            "{DIMENSION_UNCHECKED}: the embedding model cannot be used: the embedding model cache \
+             directory cannot be determined: the home directory is unknown, so a leading `~` cannot \
+             be expanded. {CACHE_DIR_FIX}"
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_status_warning_whose_cause_ends_with_a_period_gets_no_second_one() {
+    let doubles = Doubles::new().index(TestIndex::new().on_status(|_, _, _| {
+        Ok(status_with(DimensionResult::Unavailable(
+            EmbeddingError::ModelUnavailable {
+                source: Box::new(ModelCacheDirUndetermined {
+                    source: MakePathAbsoluteError::WorkingDirUnreadable(std::io::Error::other(
+                        "the directory was removed.",
+                    )),
+                }),
+            },
+        )))
+    }));
+
+    let status = doubles.operations().status().await.unwrap();
+
+    assert_eq!(
+        status.warnings,
+        [format!(
+            "{DIMENSION_UNCHECKED}: the embedding model cannot be used: the embedding model cache \
+             directory cannot be determined: the working directory cannot be read: the directory \
+             was removed. {CACHE_DIR_FIX}"
+        )]
+    );
+}
+
 #[tokio::test]
 async fn a_collection_list_that_cannot_be_read_updates_nothing_and_still_maintains() {
     let doubles = Doubles::new().collections(TestCollections::new().on_list(|| {
@@ -2801,7 +2993,7 @@ async fn changing_the_model_reads_the_status_against_the_new_model() {
             model: "embeddinggemma".to_owned(),
             ollama_endpoint: "http://192.0.2.1:11434".to_owned(),
             hf_token: Some("hf-token".to_owned()),
-            model_cache_dir: "/home/user/.mdya-models".into(),
+            model_cache_dir: ReturnedCacheDir::Dir("/home/user/.mdya-models".into()),
         }]
     );
     assert_eq!(
@@ -2812,6 +3004,27 @@ async fn changing_the_model_reads_the_status_against_the_new_model() {
             check: DimensionCheck::OnlyIfSameName,
         }]
     );
+}
+
+#[tokio::test]
+async fn changing_the_model_passes_on_the_cache_directory_error_as_its_own_type() {
+    let doubles = Doubles::new()
+        .config(config_changing_the_model())
+        .model_cache_dir(|| {
+            Err(ModelCacheDirUndetermined {
+                source: MakePathAbsoluteError::HomeDirUnknown,
+            })
+        });
+
+    doubles
+        .operations()
+        .change_setting(set("embedding.model", "embeddinggemma"))
+        .await
+        .unwrap();
+
+    let created = doubles.created_embeddings.lock().unwrap();
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0].model_cache_dir, ReturnedCacheDir::Undetermined);
 }
 
 #[tokio::test]
@@ -3261,10 +3474,10 @@ async fn deleting_a_document_of_a_collection_of_an_unknown_type_deletes_nothing(
 fn assert_unknown_type(error: &OperationError) {
     assert!(matches!(
         error,
-        OperationError::Collection {
-            context: ErrorContext { collection: Some(collection), key: None },
-            source: CollectionError::CannotRead { .. },
-        } if *collection == name("unknown")
+        OperationError::UnknownCollectionType {
+            collection,
+            collection_type,
+        } if *collection == name("unknown") && collection_type.0 == "future"
     ));
 }
 
