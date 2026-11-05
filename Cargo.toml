@@ -154,7 +154,7 @@ indicatif = "0.18"
 # RSS polling for the runtime memory guard. Default features
 # (component / disk / network / user) are disabled to keep transitive deps to
 # `system` only — the watchdog reads its own process's RSS and nothing else.
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 # Markdown event-based parser for heading-aware chunking. Default
 # features (getopts / html) are disabled — chunking only needs the parser,
 # not the CLI or HTML escaping. Pure Rust, no `*-sys` / no `cc-rs`.
