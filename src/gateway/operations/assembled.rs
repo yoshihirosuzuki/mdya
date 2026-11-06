@@ -23,10 +23,10 @@ use super::{
     CreateCollectionInput, DeleteCollectionInput, DeleteCollectionOutcome, DeleteDocumentInput,
     DeleteDocumentOutcome, DocumentText, ErrorContext, GatewayProgressSink, GetDocumentInput,
     IndexEmbeddingModel, MODEL_CACHE_DIR_FIX, OperationError, OperationParts, Operations,
-    OptimizeInput, OutputPart, PutInput, PutOutcome, RebuildInput, RebuildOutcome, SearchHit,
-    SearchInput, SearchModeName, SearchOutput, SearchUnitName, SettingChangeOutcome,
-    SettingsOutput, StatusOutput, UpdateAllInput, UpdateInput, UpdateOutcome,
-    model_cache_dir_undetermined,
+    OptimizeInput, OutputPart, PutInput, PutOutcome, RebuildInput, RebuildOutcome, SafeInteger,
+    SafeJsonObject, SafeJsonValue, Score, SearchHit, SearchInput, SearchModeName, SearchOutput,
+    SearchUnitName, SettingChangeOutcome, SettingsOutput, StatusOutput, UpdateAllInput,
+    UpdateInput, UpdateOutcome, model_cache_dir_undetermined,
 };
 
 #[cfg(test)]
@@ -576,18 +576,18 @@ impl From<ModelStatus> for IndexEmbeddingModel {
     fn from(status: ModelStatus) -> Self {
         Self {
             model: status.model.name,
-            dimension: status.model.dimension as u64,
+            dimension: SafeInteger::from_usize(status.model.dimension),
             configured: status.same_as_compared,
-            chunk_count: status.chunk_count,
-            truncated_chunk_count: status.truncated_chunk_count,
+            chunk_count: SafeInteger::new(status.chunk_count),
+            truncated_chunk_count: SafeInteger::new(status.truncated_chunk_count),
         }
     }
 }
 
 /// The status output of `status`, with `collection_count` collections.
-fn status_output(status: IndexStatus, collection_count: u64) -> StatusOutput {
+fn status_output(status: IndexStatus, collection_count: usize) -> StatusOutput {
     let (configured_embedding_dimension, warnings) = match status.compared_dimension {
-        DimensionResult::Known(dimension) => (Some(dimension as u64), Vec::new()),
+        DimensionResult::Known(dimension) => (Some(SafeInteger::from_usize(dimension)), Vec::new()),
         DimensionResult::Unavailable(error) => (None, vec![dimension_unchecked_warning(&error)]),
         DimensionResult::NotChecked => (None, Vec::new()),
     };
@@ -596,10 +596,10 @@ fn status_output(status: IndexStatus, collection_count: u64) -> StatusOutput {
         configured_embedding_model: status.compared_model_name,
         configured_embedding_dimension,
         index_embedding_models: status.models.into_iter().map(Into::into).collect(),
-        chunks_without_embedding_count: status.chunks_without_vector,
-        collection_count,
-        document_count: status.document_count,
-        chunk_count: status.chunk_count,
+        chunks_without_embedding_count: SafeInteger::new(status.chunks_without_vector),
+        collection_count: SafeInteger::from_usize(collection_count),
+        document_count: SafeInteger::new(status.document_count),
+        chunk_count: SafeInteger::new(status.chunk_count),
         warnings,
     }
 }
@@ -625,10 +625,10 @@ impl From<Hit> for SearchHit {
         Self {
             collection: hit.collection.0,
             key: hit.key.0,
-            score: hit.score,
+            score: Score::new(hit.score),
             snippet: hit.snippet,
-            chunk_index: hit.chunk_index as u64,
-            chunk_count: hit.chunk_count as u64,
+            chunk_index: SafeInteger::from_usize(hit.chunk_index),
+            chunk_count: SafeInteger::from_usize(hit.chunk_count),
         }
     }
 }
@@ -716,11 +716,13 @@ impl Operations for AssembledOperations {
             .into_iter()
             .map(|collection| CollectionEntry {
                 // A collection without documents is not in the counts.
-                document_count: counts.get(&collection.name).copied().unwrap_or(0),
+                document_count: SafeInteger::new(
+                    counts.get(&collection.name).copied().unwrap_or(0),
+                ),
                 name: collection.name.0,
                 collection_type: collection.collection_type.0,
                 description: collection.description,
-                attributes: collection.attributes.0,
+                attributes: SafeJsonObject::new(collection.attributes.0),
             })
             .collect();
         Ok(CollectionList { collections })
@@ -827,7 +829,7 @@ impl Operations for AssembledOperations {
                 .map(|collection| collection.0)
                 .collect(),
             limit: input.limit,
-            hit_count: hits.len() as u64,
+            hit_count: SafeInteger::from_usize(hits.len()),
             hits,
             warnings: result.warnings,
         })
@@ -885,7 +887,7 @@ impl Operations for AssembledOperations {
                 context: ErrorContext::default(),
                 source,
             })?;
-        Ok(status_output(status, collections.len() as u64))
+        Ok(status_output(status, collections.len()))
     }
 
     async fn list_settings(&self) -> Result<SettingsOutput, OperationError> {
@@ -896,7 +898,11 @@ impl Operations for AssembledOperations {
             .await
             .map_err(OperationError::Config)?;
         Ok(SettingsOutput {
-            entries: settings.entries(),
+            entries: settings
+                .entries()
+                .into_iter()
+                .map(|(name, value)| (name, SafeJsonValue::new(value)))
+                .collect(),
         })
     }
 

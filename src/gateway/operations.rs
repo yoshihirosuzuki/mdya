@@ -25,6 +25,9 @@ use crate::types::{
 use super::write_lock::{WriteLock, WriteLockError};
 
 mod assembled;
+mod numbers;
+
+pub(crate) use numbers::{MAX_SAFE_INTEGER, SafeInteger, SafeJsonObject, SafeJsonValue, Score};
 #[cfg(test)]
 pub(crate) mod test_double;
 
@@ -215,22 +218,44 @@ pub(crate) struct SearchInput {
     pub(crate) unit: SearchUnit,
 }
 
-/// The search limit as the user gave it. What it can hold is up to the
-/// command line and the MCP server, which read it; the operation passes it on
-/// as a `usize`, capped at `usize::MAX`, and returns it in the result as
-/// given.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+/// The search limit as the user gave it: a whole number from 1 to
+/// [`SearchLimit::MAX`]. The operation passes it on as a `usize`, capped at
+/// `usize::MAX`, and returns it in the result as given.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub(crate) struct SearchLimit(u64);
 
 impl SearchLimit {
+    /// The largest search limit: 2^53 − 1. JSON implementations agree exactly
+    /// on the value of an integer up to it (RFC 8259, section 6), and the
+    /// result returns the limit as given.
+    pub(crate) const MAX: u64 = MAX_SAFE_INTEGER;
+
+    /// Panics when `limit` is 0 or larger than [`SearchLimit::MAX`]. The
+    /// command line and the MCP server must turn those away as errors before
+    /// they make a search limit: such a limit here is a bug in them.
+    #[expect(clippy::panic)]
     pub(crate) fn new(limit: u64) -> Self {
+        if !(1..=Self::MAX).contains(&limit) {
+            panic!("the search limit {limit} is not from 1 to 2^53 - 1");
+        }
         Self(limit)
     }
 
     /// The limit to pass to `query`.
     pub(crate) fn to_usize(&self) -> usize {
         capped(self.0, usize::MAX)
+    }
+}
+
+/// A whole number from 1 to [`SearchLimit::MAX`].
+impl JsonSchema for SearchLimit {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SearchLimit".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "integer", "minimum": 1, "maximum": SearchLimit::MAX })
     }
 }
 
@@ -278,8 +303,8 @@ pub(crate) struct CollectionEntry {
     #[serde(rename = "type")]
     pub(crate) collection_type: String,
     pub(crate) description: Option<String>,
-    pub(crate) document_count: u64,
-    pub(crate) attributes: serde_json::Map<String, serde_json::Value>,
+    pub(crate) document_count: SafeInteger,
+    pub(crate) attributes: SafeJsonObject,
 }
 
 /// The result of a search, in the JSON structure that `mdya search --json`
@@ -291,7 +316,7 @@ pub(crate) struct SearchOutput {
     pub(crate) unit: SearchUnitName,
     pub(crate) collections: Vec<String>,
     pub(crate) limit: SearchLimit,
-    pub(crate) hit_count: u64,
+    pub(crate) hit_count: SafeInteger,
     pub(crate) hits: Vec<SearchHit>,
     pub(crate) warnings: Vec<String>,
 }
@@ -315,10 +340,10 @@ pub(crate) enum SearchUnitName {
 pub(crate) struct SearchHit {
     pub(crate) collection: String,
     pub(crate) key: String,
-    pub(crate) score: f64,
+    pub(crate) score: Score,
     pub(crate) snippet: String,
-    pub(crate) chunk_index: u64,
-    pub(crate) chunk_count: u64,
+    pub(crate) chunk_index: SafeInteger,
+    pub(crate) chunk_count: SafeInteger,
 }
 
 /// The result of getting a document, in the JSON structure of the MCP tool's
@@ -337,23 +362,23 @@ pub(crate) struct StatusOutput {
     pub(crate) version: String,
     pub(crate) configured_embedding_model: String,
     /// `None` when it could not be checked.
-    pub(crate) configured_embedding_dimension: Option<u64>,
+    pub(crate) configured_embedding_dimension: Option<SafeInteger>,
     pub(crate) index_embedding_models: Vec<IndexEmbeddingModel>,
-    pub(crate) chunks_without_embedding_count: u64,
-    pub(crate) collection_count: u64,
-    pub(crate) document_count: u64,
-    pub(crate) chunk_count: u64,
+    pub(crate) chunks_without_embedding_count: SafeInteger,
+    pub(crate) collection_count: SafeInteger,
+    pub(crate) document_count: SafeInteger,
+    pub(crate) chunk_count: SafeInteger,
     pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 pub(crate) struct IndexEmbeddingModel {
     pub(crate) model: String,
-    pub(crate) dimension: u64,
+    pub(crate) dimension: SafeInteger,
     /// `None` when it could not be checked.
     pub(crate) configured: Option<bool>,
-    pub(crate) chunk_count: u64,
-    pub(crate) truncated_chunk_count: u64,
+    pub(crate) chunk_count: SafeInteger,
+    pub(crate) truncated_chunk_count: SafeInteger,
 }
 
 /// The settings and their current values, in the order the settings
@@ -361,7 +386,7 @@ pub(crate) struct IndexEmbeddingModel {
 /// setting names.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SettingsOutput {
-    pub(crate) entries: Vec<(SettingName, serde_json::Value)>,
+    pub(crate) entries: Vec<(SettingName, SafeJsonValue)>,
 }
 
 impl Serialize for SettingsOutput {
@@ -655,8 +680,41 @@ mod tests {
     }
 
     #[test]
-    fn the_largest_search_limit_is_passed_on_as_the_largest_usize() {
-        assert_eq!(SearchLimit::new(u64::MAX).to_usize(), usize::MAX);
+    fn the_largest_search_limit_is_2_to_the_53_minus_1() {
+        assert_eq!(SearchLimit::MAX, (1 << 53) - 1);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_largest_search_limit_is_passed_on_as_is_on_64_bits() {
+        assert_eq!(
+            SearchLimit::new(SearchLimit::MAX).to_usize(),
+            9_007_199_254_740_991
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "the search limit 0 is not from 1 to 2^53 - 1")]
+    fn a_search_limit_of_0_is_an_unexpected_failure() {
+        SearchLimit::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "the search limit 9007199254740992 is not from 1 to 2^53 - 1")]
+    fn a_search_limit_larger_than_2_to_the_53_minus_1_is_an_unexpected_failure() {
+        SearchLimit::new(SearchLimit::MAX + 1);
+    }
+
+    #[test]
+    fn the_schema_of_the_search_limit_is_a_whole_number_from_1_to_the_largest() {
+        let schema = schemars::schema_for!(SearchLimit);
+
+        assert_eq!(schema.get("type"), Some(&serde_json::json!("integer")));
+        assert_eq!(schema.get("minimum"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            schema.get("maximum"),
+            Some(&serde_json::json!(9_007_199_254_740_991_u64))
+        );
     }
 
     // A `u64` always fits in a 64-bit `usize`, so the cap is checked with a
@@ -673,18 +731,27 @@ mod tests {
 
     #[test]
     fn the_search_limit_is_written_as_given() {
-        let json = serde_json::to_value(SearchLimit::new(u64::MAX)).unwrap();
+        let json = serde_json::to_value(SearchLimit::new(SearchLimit::MAX)).unwrap();
 
-        assert_eq!(json, serde_json::json!(u64::MAX));
+        assert_eq!(json, serde_json::json!(9_007_199_254_740_991_u64));
     }
 
     #[test]
     fn the_settings_are_written_as_one_object_in_the_order_of_the_entries() {
         let output = SettingsOutput {
             entries: vec![
-                (SettingName::McpShowVersion, serde_json::json!(false)),
-                (SettingName::EmbeddingModel, serde_json::json!("all-minilm")),
-                (SettingName::GetCliLimitBytes, serde_json::json!(4096)),
+                (
+                    SettingName::McpShowVersion,
+                    SafeJsonValue::new(serde_json::json!(false)),
+                ),
+                (
+                    SettingName::EmbeddingModel,
+                    SafeJsonValue::new(serde_json::json!("all-minilm")),
+                ),
+                (
+                    SettingName::GetCliLimitBytes,
+                    SafeJsonValue::new(serde_json::json!(4096)),
+                ),
             ],
         };
 

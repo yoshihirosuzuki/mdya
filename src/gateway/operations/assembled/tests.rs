@@ -41,9 +41,9 @@ use super::super::{
     CreateCollectionInput, DeleteCollectionInput, DeleteCollectionOutcome, DeleteDocumentInput,
     DeleteDocumentOutcome, DocumentText, ErrorContext, GetDocumentInput, IndexEmbeddingModel,
     ModelCacheDirUndetermined, OperationError, OperationParts, Operations, OptimizeInput,
-    OutcomeAnomaly, OutputPart, PutInput, RebuildInput, SearchHit, SearchInput, SearchLimit,
-    SearchModeName, SearchOutput, SearchUnitName, SettingsOutput, StatusOutput, UpdateAllInput,
-    UpdateInput, model_cache_dir_undetermined,
+    OutcomeAnomaly, OutputPart, PutInput, RebuildInput, SafeInteger, SafeJsonObject, SafeJsonValue,
+    Score, SearchHit, SearchInput, SearchLimit, SearchModeName, SearchOutput, SearchUnitName,
+    SettingsOutput, StatusOutput, UpdateAllInput, UpdateInput, model_cache_dir_undetermined,
 };
 use super::{
     AssembledOperations, DIMENSION_UNCHECKED, DocumentCounts, MAINTENANCE_FAILED,
@@ -587,15 +587,17 @@ async fn the_collection_list_has_each_collection_with_its_document_count() {
                     name: "memos".to_owned(),
                     collection_type: "raw".to_owned(),
                     description: Some("short notes".to_owned()),
-                    document_count: 0,
-                    attributes: serde_json::Map::new(),
+                    document_count: SafeInteger::new(0),
+                    attributes: SafeJsonObject::new(serde_json::Map::new()),
                 },
                 CollectionEntry {
                     name: "notes".to_owned(),
                     collection_type: "directory".to_owned(),
                     description: None,
-                    document_count: 12,
-                    attributes: attributes(serde_json::json!({ "path": "/home/user/notes" })).0,
+                    document_count: SafeInteger::new(12),
+                    attributes: SafeJsonObject::new(
+                        attributes(serde_json::json!({ "path": "/home/user/notes" })).0
+                    ),
                 },
             ]
         }
@@ -872,7 +874,11 @@ async fn the_settings_are_the_current_entries_in_their_order() {
     assert_eq!(
         settings,
         SettingsOutput {
-            entries: TestConfig::default_settings().entries()
+            entries: TestConfig::default_settings()
+                .entries()
+                .into_iter()
+                .map(|(name, value)| (name, SafeJsonValue::new(value)))
+                .collect()
         }
     );
     assert_eq!(doubles.config.calls(), [ConfigCall::Current]);
@@ -1208,14 +1214,14 @@ async fn a_search_returns_the_hits_and_warnings_of_query_with_its_input() {
             unit: SearchUnitName::Chunk,
             collections: vec!["notes".to_owned(), "memos".to_owned()],
             limit: SearchLimit::new(5),
-            hit_count: 1,
+            hit_count: SafeInteger::new(1),
             hits: vec![SearchHit {
                 collection: "notes".to_owned(),
                 key: "a.md".to_owned(),
-                score: 0.5,
+                score: Score::new(0.5),
                 snippet: "rust".to_owned(),
-                chunk_index: 2,
-                chunk_count: 3,
+                chunk_index: SafeInteger::new(2),
+                chunk_count: SafeInteger::new(3),
             }],
             warnings: vec!["a warning".to_owned()],
         }
@@ -1241,6 +1247,26 @@ async fn a_search_returns_the_hits_and_warnings_of_query_with_its_input() {
 }
 
 #[tokio::test]
+#[should_panic(expected = "the score NaN is not finite")]
+async fn a_hit_whose_score_is_not_finite_is_an_unexpected_failure() {
+    let doubles = Doubles::new().query(TestQuery::new().on_search(|_| {
+        Ok(SearchResult {
+            hits: vec![Hit {
+                collection: name("notes"),
+                key: key("a.md"),
+                score: f64::NAN,
+                snippet: "rust".to_owned(),
+                chunk_index: 0,
+                chunk_count: 1,
+            }],
+            warnings: Vec::new(),
+        })
+    }));
+
+    let _ = doubles.operations().search(search_input(&[])).await;
+}
+
+#[tokio::test]
 async fn a_search_of_every_collection_checks_no_collection() {
     let doubles = Doubles::new();
     let input = SearchInput {
@@ -1254,7 +1280,7 @@ async fn a_search_of_every_collection_checks_no_collection() {
     assert_eq!(output.mode, SearchModeName::Fts);
     assert_eq!(output.unit, SearchUnitName::Document);
     assert!(output.collections.is_empty());
-    assert_eq!(output.hit_count, 0);
+    assert_eq!(output.hit_count, SafeInteger::new(0));
     assert_eq!(doubles.collections.calls(), []);
 }
 
@@ -1525,18 +1551,18 @@ async fn the_status_is_the_whole_index_compared_with_the_configured_model() {
         StatusOutput {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             configured_embedding_model: "all-minilm".to_owned(),
-            configured_embedding_dimension: Some(384),
+            configured_embedding_dimension: Some(SafeInteger::new(384)),
             index_embedding_models: vec![IndexEmbeddingModel {
                 model: "all-minilm".to_owned(),
-                dimension: 384,
+                dimension: SafeInteger::new(384),
                 configured: Some(true),
-                chunk_count: 30,
-                truncated_chunk_count: 2,
+                chunk_count: SafeInteger::new(30),
+                truncated_chunk_count: SafeInteger::new(2),
             }],
-            chunks_without_embedding_count: 5,
-            collection_count: 2,
-            document_count: 7,
-            chunk_count: 35,
+            chunks_without_embedding_count: SafeInteger::new(5),
+            collection_count: SafeInteger::new(2),
+            document_count: SafeInteger::new(7),
+            chunk_count: SafeInteger::new(35),
             warnings: Vec::new(),
         }
     );
@@ -1550,6 +1576,18 @@ async fn the_status_is_the_whole_index_compared_with_the_configured_model() {
     );
     assert_eq!(doubles.collections.calls(), [CollectionsCall::List]);
     assert_eq!(lock.state(), LockState::default());
+}
+
+#[tokio::test]
+#[should_panic(expected = "9007199254740992 is larger than 2^53 - 1")]
+async fn a_status_with_more_chunks_than_2_to_the_53_minus_1_is_an_unexpected_failure() {
+    let doubles = Doubles::new().index(TestIndex::new().on_status(|_, _, _| {
+        let mut status = status_with(DimensionResult::Known(384));
+        status.chunk_count = 1 << 53;
+        Ok(status)
+    }));
+
+    let _ = doubles.operations().status().await;
 }
 
 #[tokio::test]
