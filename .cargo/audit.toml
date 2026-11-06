@@ -17,23 +17,4 @@ ignore = [
     # unsafe-libyaml (unmaintained, via lindera -> serde_yaml_ng; lance uses
     # lindera for full-text search). Remove when lindera no longer depends on it.
     "RUSTSEC-2024-0449",
-
-    # zstd 0.13 and zstd-safe 7 (via arrow-ipc 58). The fixes are in zstd 0.14
-    # and zstd-safe 8, which arrow-ipc uses from 60 on, while lancedb 0.41.0
-    # requires arrow 58. Remove these when lancedb moves to an arrow release
-    # whose arrow-ipc uses zstd 0.14. RUSTSEC-2026-0391, 0398, and 0403 are
-    # vulnerabilities; the others are unsound.
-    "RUSTSEC-2026-0391",
-    "RUSTSEC-2026-0395",
-    "RUSTSEC-2026-0396",
-    "RUSTSEC-2026-0397",
-    "RUSTSEC-2026-0398",
-    "RUSTSEC-2026-0399",
-    "RUSTSEC-2026-0400",
-    "RUSTSEC-2026-0401",
-    "RUSTSEC-2026-0402",
-    "RUSTSEC-2026-0403",
-    "RUSTSEC-2026-0404",
-    "RUSTSEC-2026-0405",
-    "RUSTSEC-2026-0406",
 ]
