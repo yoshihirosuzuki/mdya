@@ -1,10 +1,11 @@
 //! The `index` component: keeps the documents and chunks that search reads,
 //! with their embedding vectors and full-text search indexes.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -12,31 +13,40 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lancedb::DistanceType;
 use lancedb::arrow::arrow_array::builder::StringBuilder;
 use lancedb::arrow::arrow_array::cast::AsArray;
-use lancedb::arrow::arrow_array::types::{TimestampMicrosecondType, UInt32Type, UInt64Type};
+use lancedb::arrow::arrow_array::types::{
+    Float32Type, TimestampMicrosecondType, UInt32Type, UInt64Type,
+};
 use lancedb::arrow::arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, BooleanArray, FixedSizeListArray, Float32Array, ListArray,
     PrimitiveArray, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray, StructArray,
     TimestampMicrosecondArray, UInt32Array, UInt64Array,
 };
-use lancedb::arrow::arrow_buffer::OffsetBuffer;
+use lancedb::arrow::arrow_buffer::{NullBuffer, OffsetBuffer};
 use lancedb::arrow::arrow_schema::{
     ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit,
+};
+use lancedb::arrow::arrow_select::take::take_record_batch;
+use lancedb::arrow::{
+    SendableRecordBatchStream, SendableRecordBatchStreamExt, SimpleRecordBatchStream,
 };
 use lancedb::expr::{DfExpr, col, lit};
 use lancedb::index::scalar::{BTreeIndexBuilder, FtsIndexBuilder};
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use lancedb::table::{CompactionOptions, Duration as TimeDelta, OptimizeAction, OptimizeOptions};
+use lancedb::table::{
+    ColumnAlteration, CompactionOptions, Duration as TimeDelta, NewColumnTransform, OptimizeAction,
+    OptimizeOptions,
+};
 use sha2::{Digest, Sha256};
 
 use crate::embedding::{Embedding, EmbeddingError};
 use crate::types::{
     BoxError, Chunk, ChunkEmbedding, CollectionName, DocumentOutcome, EmbeddingModel, Key,
-    ProgressSink, Time,
+    Progress, ProgressSink, Time,
 };
 
 #[cfg(test)]
@@ -87,10 +97,15 @@ pub struct IndexStatus {
     pub compared_dimension: DimensionResult,
     /// In the order the status operation shows them.
     pub models: Vec<ModelStatus>,
+    /// The same as `models`, for the chunks of each collection in the scope
+    /// that has chunks.
     pub collections: BTreeMap<CollectionName, Vec<ModelStatus>>,
     pub document_count: u64,
     pub chunk_count: u64,
-    /// Chunks whose vector is null (their vector column is being rebuilt).
+    /// Chunks counted as having no vector: those whose vector is null, and,
+    /// while a table lacks the vector column it reads or the two tables read
+    /// vectors of different models (partway through switching the vector
+    /// columns), every chunk.
     pub chunks_without_vector: u64,
 }
 
@@ -134,8 +149,10 @@ pub enum IndexError {
         configured_dimension: Option<usize>,
         indexed: EmbeddingModel,
     },
-    /// A rebuild of the embedding vectors was stopped before it switched over;
-    /// rebuild first. Only `register` and `check_ingestable` return it.
+    /// A rebuild of the embedding vectors stopped partway through switching
+    /// the vector columns, and a vector column is of another model than the
+    /// configured one; rebuild first. Only `register` and `check_ingestable`
+    /// return it.
     #[error("a rebuild of the embedding vectors has not finished")]
     RebuildIncomplete,
     #[error("the index cannot be read")]
@@ -184,7 +201,9 @@ pub trait Index: Send + Sync {
         compare_with: &dyn Embedding,
         check: DimensionCheck,
     ) -> Result<IndexStatus, IndexError>;
-    /// Rebuilds the embedding vectors and returns how many chunks it rebuilt.
+    /// Rebuilds the embedding vectors with the configured model, and returns
+    /// the number of chunk rows once the vector columns are rebuilt or
+    /// switched over; 0 when it did neither, or when there is no chunk row.
     async fn rebuild_embeddings(
         &self,
         include_configured_model: bool,
@@ -196,8 +215,14 @@ pub trait Index: Send + Sync {
     async fn tables_for_query(&self) -> Result<Option<QueryTables>, IndexError>;
     /// Compacts the tables, cleans up old versions, and indexes new rows.
     async fn maintain(&self) -> Result<(), IndexError>;
-    /// Whether documents can be registered now (the embedding model matches
-    /// and no rebuild is pending).
+    /// Whether documents can be registered now: the configured embedding
+    /// model is the one the vector columns were made with (by name alone when
+    /// its dimension cannot be checked), and no rebuild stopped partway
+    /// through switching the columns to another model. A switch whose columns
+    /// are all of the configured model is finished, and what a stopped
+    /// rebuild left before switching is dropped. While no vector column has a
+    /// value, it makes the vector columns for the configured model instead of
+    /// returning an error. Making them needs that model's dimension.
     async fn check_ingestable(&self) -> Result<(), IndexError>;
 }
 
@@ -395,11 +420,40 @@ enum LanceCall {
     ReadDictionary,
     /// Reading a document's rows, or the rows of many documents.
     ReadRows(TableName),
-    /// Replacing or deleting a document's rows, or deleting the rows of many
-    /// documents.
+    /// Replacing, updating some columns of, or deleting a document's rows, or
+    /// deleting the rows of many documents.
     WriteRows(TableName),
-    /// One step of maintaining a table.
+    /// One step of maintaining a table, or, before a rebuild fills the
+    /// document table, adding the chunk table's new rows to its indexes.
     Optimize(TableName, MaintenanceStep),
+    /// Adding a table's new vector columns, with their values or all null.
+    AddColumns(TableName),
+    /// Dropping a table's vector columns, those it reads or new ones.
+    DropColumns(TableName),
+    /// Giving a table's new vector columns the names of those it reads.
+    RenameColumns(TableName),
+    /// A call on the table where a rebuild keeps the chunk vectors it made.
+    RebuildTable(RebuildTableCall),
+}
+
+/// The calls on the rebuild table ([`REBUILD_TABLE`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RebuildTableCall {
+    Open,
+    Create,
+    /// Reading the vectors it keeps, or how many.
+    Read,
+    /// Adding vectors to keep.
+    Add,
+    Drop,
+}
+
+/// Where rebuilding one document's embedding vectors is, as the hooks see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentRebuild {
+    Started,
+    /// The vectors of the document's chunks are made.
+    Finished,
 }
 
 /// How many days of old table versions maintenance keeps.
@@ -461,6 +515,8 @@ trait Hooks: Send + Sync {
     fn computed(&self, computation: Computation, len: usize);
     /// Lets other async work run between two slices of a long computation.
     async fn yield_now(&self);
+    /// Reports where rebuilding a document's embedding vectors is.
+    fn document_rebuild(&self, stage: DocumentRebuild);
 }
 
 struct RealHooks;
@@ -472,6 +528,8 @@ impl Hooks for RealHooks {
     }
 
     fn computed(&self, _computation: Computation, _len: usize) {}
+
+    fn document_rebuild(&self, _stage: DocumentRebuild) {}
 
     async fn yield_now(&self) {
         tokio::task::yield_now().await;
@@ -567,17 +625,41 @@ struct LanceDbIndex {
     /// The lock makes concurrent first writes read it once; a failed or
     /// panicking read leaves it unread, and the next write reads it again.
     dictionary_read: tokio::sync::Mutex<bool>,
+    /// Makes the functions that write to the tables write one at a time.
+    writing: tokio::sync::Mutex<()>,
     /// Always [`KEY_BATCH_LEN`]; a field so that the unit tests can make the
     /// batches small.
     key_batch_len: usize,
+    /// Always [`KEPT_ROWS_PER_COMMIT`]; a field so that the unit tests can
+    /// make it small.
+    kept_rows_per_commit: usize,
 }
 
 /// The number of keys `delete_others` deletes in one commit of each table. A
 /// deletion writes its condition, with every key in it, into the transaction
 /// record of the commit, so the keys are split for the condition and the
 /// record of one commit to hold at most this many keys, however many
-/// documents are deleted at once.
+/// documents are deleted at once. A rebuild reads the chunk rows of at most
+/// this many documents at once, for the same reason.
 const KEY_BATCH_LEN: usize = 1000;
+
+/// How many chunk rows a rebuild reads at most at once when it gathers the
+/// document table's vectors, unless one document has more. Each row holds
+/// the chunk's text and vector, so this bounds what is held, whatever the
+/// size of the documents.
+const CHUNKS_PER_READ: usize = 4096;
+
+/// The table where a rebuild keeps the chunk vectors it makes, while it
+/// rebuilds, so that a rebuild that stopped goes on from them rather than
+/// making them again. Its rows are the vectors of the chunk table's rows in
+/// their order, from the first, with the version of the chunk table they
+/// were made for; its vector column names the model.
+const REBUILD_TABLE: &str = "chunk_embedding_rebuild";
+
+/// How many chunk vectors a rebuild keeps in [`REBUILD_TABLE`] at least, in
+/// one commit. A rebuild that stops partway makes again at most the vectors
+/// it had not kept yet.
+const KEPT_ROWS_PER_COMMIT: usize = 1000;
 
 /// The tables to write a document to, and the embedding model of their
 /// vector columns.
@@ -658,7 +740,9 @@ impl LanceDbIndex {
             embedding,
             hooks,
             dictionary_read: tokio::sync::Mutex::new(false),
+            writing: tokio::sync::Mutex::new(()),
             key_batch_len: KEY_BATCH_LEN,
+            kept_rows_per_commit: KEPT_ROWS_PER_COMMIT,
         }
     }
 
@@ -679,10 +763,7 @@ impl LanceDbIndex {
             return Ok(0);
         };
         let mut keys = BTreeSet::new();
-        for (table, name) in [
-            (&tables.chunk, TableName::Chunk),
-            (&tables.document, TableName::Document),
-        ] {
+        for (table, name) in tables.each() {
             let read = self.read_keys(table, name, collection, &mut keys).await;
             read.map_err(stopped(0))?;
         }
@@ -780,35 +861,31 @@ impl LanceDbIndex {
         let query = document_table.query();
         let query = query.only_if_expr(document_filter(collection, key));
         let query = query.select(Select::columns(&["key"])).limit(1);
-        let rows = query.execute().await;
-        let mut rows = rows.map_err(|error| read_error(error.into()))?;
-        while let Some(batch) = rows
-            .try_next()
-            .await
-            .map_err(|error| read_error(error.into()))?
-        {
-            if batch.num_rows() > 0 {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        any_row(query).await.map_err(read_error)
     }
 
     /// The number of rows of each collection in the document table, read
     /// once.
     async fn count_documents(&self) -> Result<BTreeMap<CollectionName, u64>, IndexError> {
-        let mut counts = BTreeMap::new();
         let Some(tables) = self.store.tables_to_read().await? else {
-            return Ok(counts);
+            return Ok(BTreeMap::new());
         };
+        self.count_document_rows(&tables.document, None).await
+    }
+
+    /// The number of rows of each collection in the document table that
+    /// `filter` picks, or in all of it.
+    async fn count_document_rows(
+        &self,
+        table: &lancedb::Table,
+        filter: Option<DfExpr>,
+    ) -> Result<BTreeMap<CollectionName, u64>, IndexError> {
+        let mut counts = BTreeMap::new();
         self.hooks
             .before(LanceCall::ReadRows(TableName::Document))
             .await
             .map_err(read_error)?;
-        let query = tables
-            .document
-            .query()
-            .select(Select::columns(&["collection"]));
+        let query = filtered(table.query(), filter).select(Select::columns(&["collection"]));
         let rows = query.execute().await;
         let mut rows = rows.map_err(|error| read_error(error.into()))?;
         while let Some(batch) = rows
@@ -830,10 +907,7 @@ impl LanceDbIndex {
         let Some(tables) = self.store.tables_to_read().await? else {
             return Ok(());
         };
-        for (table, name) in [
-            (&tables.chunk, TableName::Chunk),
-            (&tables.document, TableName::Document),
-        ] {
+        for (table, name) in tables.each() {
             for step in MaintenanceStep::all() {
                 self.hooks
                     .before(LanceCall::Optimize(name, step))
@@ -843,6 +917,1028 @@ impl LanceDbIndex {
                 optimized.map_err(|error| write_error(error.into()))?;
             }
         }
+        Ok(())
+    }
+
+    /// The state of the index in `scope`, compared with the model of
+    /// `compare_with`. The tables are opened anew and pinned to their latest
+    /// versions, so that the state of a table's vector columns and its counts
+    /// come from one version of it, whatever another process writes
+    /// meanwhile. Making no embedding vectors, it asks `compare_with` for its
+    /// model only when `check` says to.
+    async fn index_status(
+        &self,
+        scope: &StatusScope,
+        compare_with: &dyn Embedding,
+        check: DimensionCheck,
+    ) -> Result<IndexStatus, IndexError> {
+        let counts = match self.store.pinned().await? {
+            Some(tables) => self.count_for_status(&tables, scope).await?,
+            None => Counts::default(),
+        };
+        let compared_name = compare_with.model_name();
+        let checks = match check {
+            DimensionCheck::Always => true,
+            DimensionCheck::OnlyIfSameName => counts
+                .model
+                .as_ref()
+                .is_some_and(|model| model.name == compared_name),
+            DimensionCheck::Never => false,
+        };
+        let dimension = match checks {
+            true => match compare_with.model().await {
+                Ok(model) => DimensionResult::Known(model.dimension),
+                Err(error) => DimensionResult::Unavailable(error),
+            },
+            false => DimensionResult::NotChecked,
+        };
+        Ok(counts.into_status(compared_name, dimension))
+    }
+
+    /// Counts the chunks and documents of `scope` in the tables.
+    async fn count_for_status(
+        &self,
+        tables: &Tables,
+        scope: &StatusScope,
+    ) -> Result<Counts, IndexError> {
+        let filter = match scope {
+            StatusScope::All => None,
+            StatusScope::Collections(names) if names.is_empty() => return Ok(Counts::default()),
+            StatusScope::Collections(names) => Some(collections_filter(names)),
+        };
+        let columns = Columns::read(tables).await?;
+        // Partway through switching the vector columns, a table lacks the
+        // column it reads, or the two tables' columns name different models,
+        // and no chunk counts as having a vector.
+        let model = columns
+            .chunk
+            .read
+            .filter(|model| columns.document.read.as_ref() == Some(model));
+        let chunks = self.count_chunks(&tables.chunk, filter.clone(), model.is_some());
+        let chunks = chunks.await?;
+        let documents = self.count_document_rows(&tables.document, filter).await?;
+        let with_vector = chunks
+            .values()
+            .map(|counts| counts.with_vector)
+            .sum::<u64>();
+        Ok(Counts {
+            model: model.filter(|_| with_vector > 0),
+            documents: documents.values().sum(),
+            chunks,
+        })
+    }
+
+    /// The chunk rows that `filter` picks, or all of them, counted by
+    /// collection. With `with_vectors`, the chunks with a vector and those
+    /// whose vector does not cover the whole chunk are counted too, from
+    /// `covers_whole`: it is null exactly when `vector` is, and reading it
+    /// is much cheaper than reading the vectors.
+    async fn count_chunks(
+        &self,
+        table: &lancedb::Table,
+        filter: Option<DfExpr>,
+        with_vectors: bool,
+    ) -> Result<BTreeMap<CollectionName, ChunkCounts>, IndexError> {
+        self.hooks
+            .before(LanceCall::ReadRows(TableName::Chunk))
+            .await
+            .map_err(read_error)?;
+        let columns: &[&str] = match with_vectors {
+            true => &["collection", "covers_whole"],
+            false => &["collection"],
+        };
+        let query = filtered(table.query(), filter).select(Select::columns(columns));
+        let rows = query.execute().await;
+        let mut rows = rows.map_err(|error| read_error(error.into()))?;
+        let mut counts: BTreeMap<CollectionName, ChunkCounts> = BTreeMap::new();
+        while let Some(batch) = rows
+            .try_next()
+            .await
+            .map_err(|error| read_error(error.into()))?
+        {
+            let names = string_column(&batch, "collection").map_err(read_error)?;
+            let covers = match with_vectors {
+                true => Some(boolean_column(&batch, "covers_whole").map_err(read_error)?),
+                false => None,
+            };
+            for row in 0..batch.num_rows() {
+                let name = CollectionName(names.value(row).to_owned());
+                let counted = counts.entry(name).or_default();
+                counted.chunks += 1;
+                if let Some(covers) = covers.filter(|covers| covers.is_valid(row)) {
+                    counted.with_vector += 1;
+                    counted.truncated += u64::from(!covers.value(row));
+                }
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Whether documents can be registered now, as [`Self::check_columns`]
+    /// decides. While no vector column of either table has a value, the
+    /// vector columns are made for the configured model instead, as no
+    /// vector could be mixed with another model's.
+    async fn check_tables_ingestable(&self) -> Result<(), IndexError> {
+        let Some(tables) = self.store.tables_to_read().await? else {
+            return Ok(());
+        };
+        let columns = Columns::read(&tables).await?;
+        let configured = self.embedding.model().await;
+        let ready = !columns.mid_switch()
+            && columns
+                .read_model()
+                .is_some_and(|model| self.is_configured(&configured, model));
+        if !ready && !self.has_vectors(&tables, &columns).await? {
+            // Making the columns needs the configured model's dimension, as
+            // creating the tables does.
+            let model = configured.map_err(IndexError::Embedding)?;
+            return self
+                .make_columns_without_values(&tables, columns, &model)
+                .await;
+        }
+        let checked = self.check_columns(&tables, columns, &configured).await;
+        checked.map(|_| ())
+    }
+
+    /// Checks, before documents are written, that the vector columns hold
+    /// vectors of the configured model only, and returns that model:
+    ///
+    /// - Partway through switching the vector columns (see
+    ///   [`Columns::mid_switch`]), the switch is finished and the rebuild
+    ///   table dropped when every vector column is of the configured model;
+    ///   otherwise the rebuild has not finished.
+    /// - Otherwise, the model the tables read must be the configured one, and
+    ///   what a stopped rebuild left (new vector columns, the rebuild table)
+    ///   is dropped: the rows written next have no value in the new columns,
+    ///   so a rebuild could not go on with them.
+    ///
+    /// When the state of the columns makes it return an error (a rebuild has
+    /// not finished, the model differs), nothing is written.
+    async fn check_columns(
+        &self,
+        tables: &Tables,
+        mut columns: Columns,
+        configured: &Result<EmbeddingModel, EmbeddingError>,
+    ) -> Result<EmbeddingModel, IndexError> {
+        if columns.mid_switch() {
+            if !columns.can_finish_switch(|model| self.is_configured(configured, model)) {
+                return Err(IndexError::RebuildIncomplete);
+            }
+            self.finish_switch(tables, &mut columns).await?;
+            if self.open_rebuild_table().await?.is_some() {
+                self.drop_rebuild_table().await?;
+            }
+            let model = columns.read_model().cloned();
+            return model.ok_or(IndexError::RebuildIncomplete);
+        }
+        let Some(model) = columns.read_model().cloned() else {
+            return Err(IndexError::RebuildIncomplete);
+        };
+        if !self.is_configured(configured, &model) {
+            return Err(self.model_mismatch(configured, model));
+        }
+        let left = self.open_rebuild_table().await?;
+        self.drop_leftovers(tables, &mut columns, left).await?;
+        Ok(model)
+    }
+
+    /// Makes both tables' vector columns for `model`, while no vector column
+    /// has a value: no embedding vector is made. What a stopped rebuild left
+    /// is dropped first.
+    async fn make_columns_without_values(
+        &self,
+        tables: &Tables,
+        mut columns: Columns,
+        model: &EmbeddingModel,
+    ) -> Result<(), IndexError> {
+        let left = self.open_rebuild_table().await?;
+        self.drop_leftovers(tables, &mut columns, left).await?;
+        let mut remade = Vec::new();
+        for (table, name) in tables.each() {
+            if columns.of(name).read.as_ref() == Some(model) {
+                continue;
+            }
+            self.add_null_columns(table, name, model).await?;
+            self.index_new_vector_column(table, name, model).await?;
+            remade.push((table, name));
+        }
+        for (table, name) in remade {
+            let has_read = columns.of(name).read.is_some();
+            self.switch_to_new_columns(table, name, has_read).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether any vector column of either table, read or new, has a value.
+    async fn has_vectors(&self, tables: &Tables, columns: &Columns) -> Result<bool, IndexError> {
+        for (table, name) in tables.each() {
+            let present = columns.of(name);
+            let vector_columns = [
+                present.read.is_some().then_some(name.vector_column()),
+                present.new.is_some().then_some(name.new_vector_column()),
+            ];
+            for column in vector_columns.into_iter().flatten() {
+                self.hooks
+                    .before(LanceCall::ReadRows(name))
+                    .await
+                    .map_err(read_error)?;
+                let query = table.query().only_if_expr(col(column).is_not_null());
+                let query = query.select(Select::columns(&["key"])).limit(1);
+                if any_row(query).await.map_err(read_error)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Rebuilds the embedding vectors with the configured model, and returns
+    /// the number of chunk rows once the vector columns are rebuilt or
+    /// switched over; 0 when nothing was rebuilt.
+    ///
+    /// A table is rebuilt in four steps: its new vector columns are added
+    /// with their values in one commit (1 for the chunk table, made by the
+    /// model; 2 for the document table, gathered from the chunk table's
+    /// vectors), they are indexed (3), and the columns read are dropped and
+    /// the new ones take their names (4). Step 3 is taken on both tables
+    /// before step 4 on either, so that a switch that stopped is finished by
+    /// dropping and renaming alone.
+    ///
+    /// What another model left (new columns, the rebuild table) is dropped
+    /// first. Then, without `include_configured_model`, each table goes on
+    /// from where it is ([`Remaining`]), and nothing is rebuilt when both
+    /// tables read the configured model, beyond finishing a switch and
+    /// dropping what is left. With it, a switch is finished, what is left
+    /// dropped, and both tables rebuilt from the start.
+    async fn rebuild(
+        &self,
+        include_configured_model: bool,
+        parallelism: usize,
+        progress: &dyn ProgressSink,
+    ) -> Result<u64, IndexError> {
+        let Some(tables) = self.store.tables_to_read().await? else {
+            return Ok(0);
+        };
+        let model = self.embedding.model().await;
+        let model = model.map_err(IndexError::Embedding)?;
+        let mut columns = Columns::read(&tables).await?;
+        let mut kept = self.open_rebuild_table().await?;
+        self.drop_other_models(&tables, &mut columns, &mut kept, &model)
+            .await?;
+        let remaining = match include_configured_model {
+            true => [Remaining::Fill; 2],
+            false => [
+                Remaining::of(&columns.chunk, &model),
+                Remaining::of(&columns.document, &model),
+            ],
+        };
+        let read_by_both = columns.read_model() == Some(&model);
+        if include_configured_model || read_by_both {
+            self.finish_switch(&tables, &mut columns).await?;
+            self.drop_leftovers(&tables, &mut columns, kept.take())
+                .await?;
+            if !include_configured_model {
+                return Ok(0);
+            }
+        }
+        let rebuilding = Rebuilding {
+            tables: &tables,
+            columns: &columns,
+            model: &model,
+            remaining,
+        };
+        self.rebuild_remaining(&rebuilding, kept, parallelism, progress)
+            .await
+    }
+
+    /// Takes the steps `rebuilding` has left, and drops the rebuild table.
+    async fn rebuild_remaining(
+        &self,
+        rebuilding: &Rebuilding<'_>,
+        kept: Option<lancedb::Table>,
+        parallelism: usize,
+        progress: &dyn ProgressSink,
+    ) -> Result<u64, IndexError> {
+        let Rebuilding { tables, model, .. } = rebuilding;
+        let total = self.count_rows(&tables.chunk, TableName::Chunk).await?;
+        let [chunk, document] = rebuilding.remaining;
+        if chunk == Remaining::Fill {
+            let filled =
+                self.fill_chunk_vectors(&tables.chunk, model, kept, total, parallelism, progress);
+            filled.await?;
+        } else {
+            Tally::new(progress, count_of(total), count_of(total));
+        }
+        if document == Remaining::Fill {
+            // The chunk table's vectors to gather: those made for it in this
+            // rebuild, unless it already read the model's.
+            let source = match chunk {
+                Remaining::Nothing => TableName::Chunk.vector_column(),
+                Remaining::Switch | Remaining::Fill => TableName::Chunk.new_vector_column(),
+            };
+            self.fill_document_vectors(tables, model, source).await?;
+        }
+        let rebuilt = || {
+            tables
+                .each()
+                .into_iter()
+                .filter(|(_, name)| rebuilding.remaining_of(*name) != Remaining::Nothing)
+        };
+        for (table, name) in rebuilt() {
+            self.index_new_vector_column(table, name, model).await?;
+        }
+        for (table, name) in rebuilt() {
+            let has_read = rebuilding.columns.of(name).read.is_some();
+            self.switch_to_new_columns(table, name, has_read).await?;
+        }
+        self.drop_rebuild_table().await?;
+        Ok(count_of(total))
+    }
+
+    /// Drops the new vector columns of the tables, and the rebuild table
+    /// `kept`, whose model is not `model`: a rebuild with another model left
+    /// them.
+    async fn drop_other_models(
+        &self,
+        tables: &Tables,
+        columns: &mut Columns,
+        kept: &mut Option<lancedb::Table>,
+        model: &EmbeddingModel,
+    ) -> Result<(), IndexError> {
+        for (table, name) in tables.each() {
+            let present = columns.of_mut(name);
+            if present.new.as_ref().is_some_and(|new| new != model) {
+                self.drop_columns(table, name, name.new_vector_columns())
+                    .await?;
+                present.new = None;
+            }
+        }
+        if let Some(table) = kept {
+            let kept_model = self.kept_model(table).await?;
+            if kept_model != *model {
+                self.drop_rebuild_table().await?;
+                *kept = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finishes switching the vector columns when they are partway through
+    /// it ([`Columns::mid_switch`]): each table with new vector columns
+    /// switches to them, as step 4 of a rebuild does. Their indexes are made
+    /// first if a table lacks one.
+    async fn finish_switch(
+        &self,
+        tables: &Tables,
+        columns: &mut Columns,
+    ) -> Result<(), IndexError> {
+        if !columns.mid_switch() {
+            return Ok(());
+        }
+        for (table, name) in tables.each() {
+            if let Some(new) = columns.of(name).new.clone() {
+                self.index_new_vector_column(table, name, &new).await?;
+            }
+        }
+        for (table, name) in tables.each() {
+            let present = columns.of_mut(name);
+            if let Some(new) = present.new.take() {
+                self.switch_to_new_columns(table, name, present.read.is_some())
+                    .await?;
+                present.read = Some(new);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops what a stopped rebuild left: the new vector columns, and the
+    /// rebuild table `kept`, if any.
+    async fn drop_leftovers(
+        &self,
+        tables: &Tables,
+        columns: &mut Columns,
+        kept: Option<lancedb::Table>,
+    ) -> Result<(), IndexError> {
+        for (table, name) in tables.each() {
+            if columns.of_mut(name).new.take().is_some() {
+                self.drop_columns(table, name, name.new_vector_columns())
+                    .await?;
+            }
+        }
+        if kept.is_some() {
+            self.drop_rebuild_table().await?;
+        }
+        Ok(())
+    }
+
+    /// Step 1 of a rebuild: adds the chunk table's new vector columns with
+    /// their values, in one commit. The values are streamed into the
+    /// addition as they are made: the rows are read in order, and the
+    /// vectors of each document's rows (consecutive rows of the same
+    /// document) made, up to `parallelism` documents at a time (one when it
+    /// is 0). The vectors are kept in the rebuild table as they are made,
+    /// and those kept for this version of the chunk table are streamed in
+    /// rather than made again. `total` is the number of chunk rows.
+    async fn fill_chunk_vectors(
+        &self,
+        table: &lancedb::Table,
+        model: &EmbeddingModel,
+        kept: Option<lancedb::Table>,
+        total: usize,
+        parallelism: usize,
+        progress: &dyn ProgressSink,
+    ) -> Result<(), IndexError> {
+        let version = table.version().await;
+        let version = version.map_err(|error| read_error(error.into()))?;
+        let kept = self.kept_for(kept, model, version).await?;
+        let tally = Tally::new(progress, count_of(kept.rows), count_of(total));
+        if total == 0 {
+            return self.add_null_columns(table, TableName::Chunk, model).await;
+        }
+        let filling = Filling {
+            table,
+            model,
+            kept: &kept,
+            version,
+            parallelism,
+            tally: &tally,
+        };
+        let adding = self.add_streamed_columns(table, TableName::Chunk, model, |values| {
+            self.stream_chunk_vectors(&filling, values)
+        });
+        adding.await
+    }
+
+    /// The rebuild table to keep the chunk vectors in, with how many it
+    /// keeps: `kept` when it holds vectors for `version` of the chunk table,
+    /// or none; otherwise a new one, after dropping `kept`.
+    async fn kept_for(
+        &self,
+        kept: Option<lancedb::Table>,
+        model: &EmbeddingModel,
+        version: u64,
+    ) -> Result<Kept, IndexError> {
+        if let Some(table) = kept {
+            let rows = self.kept_rows(&table).await?;
+            let made_for = self.kept_version(&table).await?;
+            if made_for.is_none_or(|made_for| made_for == version) {
+                return Ok(Kept { table, rows });
+            }
+            self.drop_rebuild_table().await?;
+        }
+        let table = self.create_rebuild_table(model).await?;
+        Ok(Kept { table, rows: 0 })
+    }
+
+    /// Streams the values of the chunk table's new vector columns into
+    /// `values`, in the order of its rows: first those the rebuild table
+    /// keeps, then those it makes, keeping them in the rebuild table as it
+    /// goes. Returns when `values` is closed, as when adding the columns
+    /// failed; what was made is kept all the same.
+    async fn stream_chunk_vectors(
+        &self,
+        filling: &Filling<'_>,
+        values: tokio::sync::mpsc::Sender<RecordBatch>,
+    ) -> Result<(), IndexError> {
+        let schema = TableName::Chunk.new_columns_schema(filling.model);
+        let schema = schema.map_err(write_error)?;
+        if filling.kept.rows > 0 {
+            self.hooks
+                .before(LanceCall::RebuildTable(RebuildTableCall::Read))
+                .await
+                .map_err(read_error)?;
+            let columns = TableName::Chunk.new_vector_columns();
+            let query = filling.kept.table.query().select(Select::columns(columns));
+            let rows = query.execute().await;
+            let mut rows = rows.map_err(|error| read_error(error.into()))?;
+            while let Some(batch) = rows
+                .try_next()
+                .await
+                .map_err(|error| read_error(error.into()))?
+            {
+                let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec());
+                let batch = batch.map_err(|error| read_error(error.into()))?;
+                if values.send(batch).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        let mut to_keep = ToKeep::default();
+        let streamed = self.stream_made_chunk_vectors(filling, &values, &mut to_keep);
+        let streamed = streamed.await;
+        let kept = self.keep(filling, to_keep.take()).await;
+        streamed.and(kept)
+    }
+
+    /// Makes the vectors of the chunk rows after those the rebuild table
+    /// keeps, streams them into `values`, and keeps them every
+    /// [`Self::kept_rows_per_commit`] rows or more.
+    async fn stream_made_chunk_vectors(
+        &self,
+        filling: &Filling<'_>,
+        values: &tokio::sync::mpsc::Sender<RecordBatch>,
+        to_keep: &mut ToKeep,
+    ) -> Result<(), IndexError> {
+        self.hooks
+            .before(LanceCall::ReadRows(TableName::Chunk))
+            .await
+            .map_err(read_error)?;
+        let columns = ["collection", "key", "text"];
+        let query = filling.table.query().select(Select::columns(&columns));
+        let rows = query.execute().await;
+        let rows = rows.map_err(|error| read_error(error.into()))?;
+        let documents = documents_in_chunk_rows(rows, filling.kept.rows);
+        let made = documents.map(|texts| async move {
+            let texts = texts?;
+            self.make_document_vectors(&texts, filling.model, filling.tally)
+                .await
+        });
+        let made = made.buffered(filling.parallelism.max(1));
+        futures::pin_mut!(made);
+        while let Some(made) = made.next().await {
+            let mut pace = Pace::new(self.hooks.as_ref(), Computation::Build);
+            let batch = chunk_vector_columns(filling.model, &made?, &mut pace).await;
+            let batch = batch.map_err(write_error)?;
+            drop(pace);
+            to_keep.push(batch.clone());
+            if to_keep.rows >= self.kept_rows_per_commit {
+                self.keep(filling, to_keep.take()).await?;
+            }
+            if values.send(batch).await.is_err() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Makes the vectors of one document's chunk texts, as many at a time as
+    /// `embedding` takes, adding each call's chunks to `tally`.
+    async fn make_document_vectors(
+        &self,
+        texts: &[String],
+        model: &EmbeddingModel,
+        tally: &Tally<'_>,
+    ) -> Result<Vec<ChunkEmbedding>, IndexError> {
+        self.hooks.document_rebuild(DocumentRebuild::Started);
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let made = self.embed_texts(&texts, |made| {
+            let mismatched = made
+                .iter()
+                .find(|embedding| embedding.vector.len() != model.dimension);
+            if let Some(mismatched) = mismatched {
+                return Err(dimension_changed(model, mismatched.vector.len()));
+            }
+            tally.add(count_of(made.len()));
+            Ok(())
+        });
+        let made = made.await?;
+        self.hooks.document_rebuild(DocumentRebuild::Finished);
+        Ok(made)
+    }
+
+    /// Adds `batches` of chunk vectors to the rebuild table, in one commit.
+    async fn keep(
+        &self,
+        filling: &Filling<'_>,
+        batches: Vec<RecordBatch>,
+    ) -> Result<(), IndexError> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let schema = rebuild_table_schema(filling.model).map_err(write_error)?;
+        let mut rows = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let versions = UInt64Array::from(vec![filling.version; batch.num_rows()]);
+            let mut columns: Vec<ArrayRef> = vec![Arc::new(versions)];
+            columns.extend(batch.columns().iter().cloned());
+            let row = RecordBatch::try_new(schema.clone(), columns);
+            rows.push(row.map_err(|error| write_error(error.into()))?);
+        }
+        self.hooks
+            .before(LanceCall::RebuildTable(RebuildTableCall::Add))
+            .await
+            .map_err(write_error)?;
+        let added = filling.kept.table.add(rows).execute().await;
+        added.map_err(|error| write_error(error.into()))?;
+        Ok(())
+    }
+
+    /// Step 2 of a rebuild: adds the document table's new vector column with
+    /// its values, in one commit. A document's value is the vectors of its
+    /// chunk rows in the chunk table's column `source`, in chunk order; null
+    /// for a document without chunks, and for one whose chunk rows disagree
+    /// with its row, as when registering it stopped between the two tables.
+    /// No embedding vector is made. The chunk table's rows that are not in
+    /// its indexes yet are added to them first, since the chunk rows are
+    /// read a few documents at a time.
+    async fn fill_document_vectors(
+        &self,
+        tables: &Tables,
+        model: &EmbeddingModel,
+        source: &'static str,
+    ) -> Result<(), IndexError> {
+        let step = MaintenanceStep::Index;
+        self.hooks
+            .before(LanceCall::Optimize(TableName::Chunk, step))
+            .await
+            .map_err(write_error)?;
+        let indexed = tables.chunk.optimize(step.action()).await;
+        indexed.map_err(|error| write_error(error.into()))?;
+        let documents = self.count_rows(&tables.document, TableName::Document);
+        if documents.await? == 0 {
+            let table = &tables.document;
+            return self
+                .add_null_columns(table, TableName::Document, model)
+                .await;
+        }
+        let adding =
+            self.add_streamed_columns(&tables.document, TableName::Document, model, |values| {
+                self.stream_document_vectors(tables, model, source, values)
+            });
+        adding.await
+    }
+
+    /// Streams the values of the document table's new vector column into
+    /// `values`, in the order of its rows, reading the chunk rows of up to
+    /// [`Self::key_batch_len`] documents of one collection at a time. Returns
+    /// when `values` is closed.
+    async fn stream_document_vectors(
+        &self,
+        tables: &Tables,
+        model: &EmbeddingModel,
+        source: &'static str,
+        values: tokio::sync::mpsc::Sender<RecordBatch>,
+    ) -> Result<(), IndexError> {
+        self.hooks
+            .before(LanceCall::ReadRows(TableName::Document))
+            .await
+            .map_err(read_error)?;
+        let columns = ["collection", "key", "body", "chunk_ranges"];
+        let query = tables.document.query().select(Select::columns(&columns));
+        let rows = query.execute().await;
+        let mut rows = rows.map_err(|error| read_error(error.into()))?;
+        while let Some(batch) = rows
+            .try_next()
+            .await
+            .map_err(|error| read_error(error.into()))?
+        {
+            let runs = collection_runs(&batch, self.key_batch_len).map_err(read_error)?;
+            for run in runs {
+                let gathered = self.gather_document_vectors(tables, model, source, &batch, run);
+                let gathered = gathered.await?;
+                if values.send(gathered).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The values of the document table's new vector column for the rows
+    /// `run` of `documents`, all of one collection.
+    async fn gather_document_vectors(
+        &self,
+        tables: &Tables,
+        model: &EmbeddingModel,
+        source: &'static str,
+        documents: &RecordBatch,
+        run: Range<usize>,
+    ) -> Result<RecordBatch, IndexError> {
+        let names = string_column(documents, "collection").map_err(read_error)?;
+        let keys = string_column(documents, "key").map_err(read_error)?;
+        let bodies = string_column(documents, "body").map_err(read_error)?;
+        let ranges = column(documents, "chunk_ranges").map_err(read_error)?;
+        let ranges = ranges.as_list_opt::<i32>();
+        let ranges = ranges.ok_or_else(|| read_error(unexpected_type("chunk_ranges")))?;
+        let collection = CollectionName(names.value(run.start).to_owned());
+        let run_keys: Vec<Key> = run
+            .clone()
+            .map(|row| Key(keys.value(row).to_owned()))
+            .collect();
+        self.hooks
+            .before(LanceCall::ReadRows(TableName::Chunk))
+            .await
+            .map_err(read_error)?;
+        let columns = [
+            "key",
+            "chunk_index",
+            "range_start",
+            "range_end",
+            "text",
+            source,
+        ];
+        let chunk_rows = read_rows(&tables.chunk, keys_filter(&collection, &run_keys), &columns);
+        let chunk_rows = chunk_rows.await.map_err(read_error)?;
+        let by_key = rows_by_key(&chunk_rows).map_err(read_error)?;
+        let mut gathered = GatheredVectors::default();
+        for row in run {
+            let ranges = chunk_ranges_of(&ranges.value(row)).map_err(read_error)?;
+            let found = by_key.get(keys.value(row)).map_or(&[][..], Vec::as_slice);
+            let vectors =
+                self.vectors_in_order(&chunk_rows, found, &ranges, bodies.value(row), source);
+            gathered.push(vectors.await.map_err(read_error)?);
+        }
+        gathered.into_batch(model).map_err(write_error)
+    }
+
+    /// The vectors of a document's chunk rows, at `found` in `chunk_rows`,
+    /// in chunk order; `None` when the document has no chunks, when its
+    /// chunk rows disagree with its row (whose chunk ranges and body are
+    /// `ranges` and `body`), and when a chunk row has no vector.
+    async fn vectors_in_order(
+        &self,
+        chunk_rows: &[RecordBatch],
+        found: &[(usize, u32)],
+        ranges: &[Range<u64>],
+        body: &str,
+        source: &str,
+    ) -> Result<Option<Vec<ArrayRef>>, BoxError> {
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        let mut rows = Vec::new();
+        for (position, batch) in chunk_rows.iter().enumerate() {
+            let at: Vec<u32> = found
+                .iter()
+                .filter(|(in_batch, _)| *in_batch == position)
+                .map(|(_, row)| *row)
+                .collect();
+            if !at.is_empty() {
+                rows.push(take_record_batch(batch, &UInt32Array::from(at))?);
+            }
+        }
+        let compared = compare_chunk_rows(&rows, ranges, body, self.hooks.as_ref());
+        if compared.await? != ChunkRows::Agree {
+            return Ok(None);
+        }
+        let mut ordered: Vec<Option<ArrayRef>> = vec![None; ranges.len()];
+        for batch in &rows {
+            let numbers = primitive_column::<UInt32Type>(batch, "chunk_index")?;
+            let vectors = column(batch, source)?.as_fixed_size_list_opt();
+            let vectors = vectors.ok_or_else(|| unexpected_type(source))?;
+            for row in 0..batch.num_rows() {
+                if vectors.is_null(row) {
+                    return Ok(None);
+                }
+                ordered[usize::try_from(numbers.value(row))?] = Some(vectors.value(row));
+            }
+        }
+        Ok(ordered.into_iter().collect())
+    }
+
+    /// Adds the table's new vector columns with the values streamed into the
+    /// sender that `stream` is given, in one commit. Making the values and
+    /// adding them go on together in this task: LanceDB takes the values as
+    /// they come. When making them fails, the addition is given fewer values
+    /// than the table has rows, so it fails and writes nothing, and the
+    /// error making them is returned.
+    async fn add_streamed_columns<F, Made>(
+        &self,
+        table: &lancedb::Table,
+        name: TableName,
+        model: &EmbeddingModel,
+        stream: F,
+    ) -> Result<(), IndexError>
+    where
+        F: FnOnce(tokio::sync::mpsc::Sender<RecordBatch>) -> Made,
+        Made: Future<Output = Result<(), IndexError>>,
+    {
+        let schema = name.new_columns_schema(model).map_err(write_error)?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let values = futures::stream::unfold(receiver, |mut receiver| async move {
+            let batch = receiver.recv().await?;
+            Some((Ok::<_, lancedb::Error>(batch), receiver))
+        });
+        let values: SendableRecordBatchStream =
+            Box::pin(SimpleRecordBatchStream::new(values, schema));
+        let adding = async {
+            self.hooks
+                .before(LanceCall::AddColumns(name))
+                .await
+                .map_err(write_error)?;
+            let adding = table.add_columns();
+            let adding = adding.transform(NewColumnTransform::Stream(values.into_df_stream()));
+            let added = adding.execute().await;
+            added.map_err(|error| write_error(error.into()))?;
+            Ok(())
+        };
+        let (streamed, added) = futures::future::join(stream(sender), adding).await;
+        streamed.and(added)
+    }
+
+    /// Adds the table's new vector columns for `model`, all null, in one
+    /// commit.
+    async fn add_null_columns(
+        &self,
+        table: &lancedb::Table,
+        name: TableName,
+        model: &EmbeddingModel,
+    ) -> Result<(), IndexError> {
+        self.hooks
+            .before(LanceCall::AddColumns(name))
+            .await
+            .map_err(write_error)?;
+        let schema = name.new_columns_schema(model).map_err(write_error)?;
+        let adding = table.add_columns();
+        let adding = adding.transform(NewColumnTransform::AllNulls(schema));
+        let added = adding.execute().await;
+        added.map_err(|error| write_error(error.into()))?;
+        Ok(())
+    }
+
+    async fn count_rows(
+        &self,
+        table: &lancedb::Table,
+        name: TableName,
+    ) -> Result<usize, IndexError> {
+        self.hooks
+            .before(LanceCall::ReadRows(name))
+            .await
+            .map_err(read_error)?;
+        let counted = table.count_rows(None).await;
+        counted.map_err(|error| read_error(error.into()))
+    }
+
+    /// The rebuild table; `None` when there is none.
+    async fn open_rebuild_table(&self) -> Result<Option<lancedb::Table>, IndexError> {
+        let Some(connection) = self.store.connection_to_read().await? else {
+            return Ok(None);
+        };
+        self.hooks
+            .before(LanceCall::RebuildTable(RebuildTableCall::Open))
+            .await
+            .map_err(read_error)?;
+        match connection.open_table(REBUILD_TABLE).execute().await {
+            Ok(table) => Ok(Some(table)),
+            Err(lancedb::Error::TableNotFound { .. }) => Ok(None),
+            Err(error) => Err(read_error(error.into())),
+        }
+    }
+
+    async fn create_rebuild_table(
+        &self,
+        model: &EmbeddingModel,
+    ) -> Result<lancedb::Table, IndexError> {
+        let connection = self.store.connection_to_read().await?;
+        let connection =
+            connection.ok_or_else(|| write_error("the index has no LanceDB directory".into()))?;
+        self.hooks
+            .before(LanceCall::RebuildTable(RebuildTableCall::Create))
+            .await
+            .map_err(write_error)?;
+        let schema = rebuild_table_schema(model).map_err(write_error)?;
+        let created = connection.create_empty_table(REBUILD_TABLE, schema);
+        created
+            .execute()
+            .await
+            .map_err(|error| write_error(error.into()))
+    }
+
+    /// Drops the rebuild table, if there is one.
+    async fn drop_rebuild_table(&self) -> Result<(), IndexError> {
+        let Some(connection) = self.store.connection_to_read().await? else {
+            return Ok(());
+        };
+        self.hooks
+            .before(LanceCall::RebuildTable(RebuildTableCall::Drop))
+            .await
+            .map_err(write_error)?;
+        match connection.drop_table(REBUILD_TABLE, &[]).await {
+            Ok(()) | Err(lancedb::Error::TableNotFound { .. }) => Ok(()),
+            Err(error) => Err(write_error(error.into())),
+        }
+    }
+
+    /// The model of the vectors the rebuild table keeps.
+    async fn kept_model(&self, table: &lancedb::Table) -> Result<EmbeddingModel, IndexError> {
+        let schema = table.schema().await;
+        let schema = schema.map_err(|error| read_error(error.into()))?;
+        let field = schema.field_with_name(TableName::Chunk.new_vector_column());
+        let field = field.map_err(|error| read_error(error.into()))?;
+        model_of_field(field).map_err(read_error)
+    }
+
+    async fn kept_rows(&self, table: &lancedb::Table) -> Result<usize, IndexError> {
+        self.hooks
+            .before(LanceCall::RebuildTable(RebuildTableCall::Read))
+            .await
+            .map_err(read_error)?;
+        let counted = table.count_rows(None).await;
+        counted.map_err(|error| read_error(error.into()))
+    }
+
+    /// The version of the chunk table the rebuild table's vectors were made
+    /// for; `None` when it keeps none. Its rows are only ever added for one
+    /// version, so the first row tells.
+    async fn kept_version(&self, table: &lancedb::Table) -> Result<Option<u64>, IndexError> {
+        self.hooks
+            .before(LanceCall::RebuildTable(RebuildTableCall::Read))
+            .await
+            .map_err(read_error)?;
+        let query = table
+            .query()
+            .select(Select::columns(&["chunk_version"]))
+            .limit(1);
+        let rows: Result<Vec<RecordBatch>, _> = match query.execute().await {
+            Ok(rows) => rows.try_collect().await,
+            Err(error) => Err(error),
+        };
+        let rows = rows.map_err(|error| read_error(error.into()))?;
+        let Some(batch) = rows.iter().find(|batch| batch.num_rows() > 0) else {
+            return Ok(None);
+        };
+        let versions = primitive_column::<UInt64Type>(batch, "chunk_version");
+        Ok(Some(versions.map_err(read_error)?.value(0)))
+    }
+
+    /// Creates the vector index of the table's new vector column, unless it
+    /// has one. LanceDB records the index of a column whose vectors are all
+    /// null, and trains it once maintenance finds enough vectors.
+    async fn index_new_vector_column(
+        &self,
+        table: &lancedb::Table,
+        name: TableName,
+        model: &EmbeddingModel,
+    ) -> Result<(), IndexError> {
+        let column = name.new_vector_column();
+        let existing = table.list_indices().await;
+        let existing = existing.map_err(|error| read_error(error.into()))?;
+        if existing.iter().any(|index| index.columns == [column]) {
+            return Ok(());
+        }
+        let params = VectorIndexParams::for_dimension(model.dimension);
+        self.hooks
+            .before(LanceCall::CreateIndex(name))
+            .await
+            .map_err(write_error)?;
+        let index = lancedb::index::Index::IvfPq(params.builder());
+        let creating = table.create_index(&[column], index);
+        creating
+            .execute()
+            .await
+            .map_err(|error| write_error(error.into()))
+    }
+
+    async fn drop_columns(
+        &self,
+        table: &lancedb::Table,
+        name: TableName,
+        columns: &[&str],
+    ) -> Result<(), IndexError> {
+        self.hooks
+            .before(LanceCall::DropColumns(name))
+            .await
+            .map_err(write_error)?;
+        let dropped = table.drop_columns(columns).await;
+        dropped.map_err(|error| write_error(error.into()))?;
+        Ok(())
+    }
+
+    /// Makes the table read the vectors of its new columns: drops the columns
+    /// it reads, if it `has_read` them, with their index, and gives the new
+    /// columns their names, which keeps the index of the new vector column.
+    async fn switch_to_new_columns(
+        &self,
+        table: &lancedb::Table,
+        name: TableName,
+        has_read: bool,
+    ) -> Result<(), IndexError> {
+        if has_read {
+            self.drop_columns(table, name, name.vector_columns())
+                .await?;
+        }
+        self.hooks
+            .before(LanceCall::RenameColumns(name))
+            .await
+            .map_err(write_error)?;
+        let renames: Vec<ColumnAlteration> = name
+            .new_vector_columns()
+            .iter()
+            .zip(name.vector_columns())
+            .map(|(new, read)| ColumnAlteration::new((*new).to_owned()).rename((*read).to_owned()))
+            .collect();
+        let renamed = table.alter_columns(&renames).await;
+        renamed.map_err(|error| write_error(error.into()))?;
+        Ok(())
+    }
+
+    /// Updates the columns of `rows` in the rows of `table`, the table `name`,
+    /// that have the same values in the columns that find a row, in one
+    /// commit. Rows that match none are not added.
+    async fn update_rows(
+        &self,
+        table: &lancedb::Table,
+        name: TableName,
+        rows: RecordBatch,
+    ) -> Result<(), IndexError> {
+        self.hooks
+            .before(LanceCall::WriteRows(name))
+            .await
+            .map_err(write_error)?;
+        let mut merge = table.merge_insert(name.row_columns());
+        merge.when_matched_update_all(None);
+        let merged = merge.execute(reader(rows)).await;
+        merged.map_err(|error| write_error(error.into()))?;
         Ok(())
     }
 
@@ -929,32 +2025,46 @@ impl LanceDbIndex {
         Ok(())
     }
 
-    /// The tables to write to, after checking that the configured embedding
-    /// model is the one their vector columns were made with. Creates whatever
-    /// of the tables and their indexes is missing.
+    /// The tables to write to, after checking their vector columns as
+    /// [`Self::check_columns`] does. Creates whatever of the tables and their
+    /// indexes is missing. Writes only while no other function writes.
     async fn prepare_to_write(&self) -> Result<Prepared, IndexError> {
+        let _writing = self.writing.lock().await;
         let configured = self.embedding.model().await;
         let tables = self.store.tables_to_write(configured.as_ref().ok()).await?;
         let Some(tables) = tables else {
             return Err(tables_not_created(configured));
         };
-        let VectorColumns::Ready(model) = VectorColumns::read(&tables).await? else {
-            return Err(IndexError::RebuildIncomplete);
-        };
-        let same = match &configured {
-            Ok(configured) => *configured == model,
-            // The name is checked now, and the dimension when making
-            // embedding vectors, which fails the same way as checking it.
-            Err(_) => self.embedding.model_name() == model.name,
-        };
-        if !same {
-            return Err(IndexError::ModelMismatch {
-                configured_name: self.embedding.model_name().to_owned(),
-                configured_dimension: configured.ok().map(|model| model.dimension),
-                indexed: model,
-            });
-        }
+        let columns = Columns::read(&tables).await?;
+        let model = self.check_columns(&tables, columns, &configured).await?;
         Ok(Prepared { tables, model })
+    }
+
+    /// Whether `indexed` is the configured model. When the configured model's
+    /// dimension cannot be checked, only the names are compared: the
+    /// dimension is checked when making embedding vectors, which fails the
+    /// same way as checking it.
+    fn is_configured(
+        &self,
+        configured: &Result<EmbeddingModel, EmbeddingError>,
+        indexed: &EmbeddingModel,
+    ) -> bool {
+        match configured {
+            Ok(configured) => configured == indexed,
+            Err(_) => self.embedding.model_name() == indexed.name,
+        }
+    }
+
+    fn model_mismatch(
+        &self,
+        configured: &Result<EmbeddingModel, EmbeddingError>,
+        indexed: EmbeddingModel,
+    ) -> IndexError {
+        IndexError::ModelMismatch {
+            configured_name: self.embedding.model_name().to_owned(),
+            configured_dimension: configured.as_ref().ok().map(|model| model.dimension),
+            indexed,
+        }
     }
 
     /// The versions of the document in the index, one per row: none when the
@@ -1063,6 +2173,8 @@ impl LanceDbIndex {
         let document_row = new_rows.document_row(new_version.hash, new_version.time, &mut pace);
         let document_row = document_row.await.map_err(write_error)?;
         drop(pace);
+        let _writing = self.writing.lock().await;
+        self.check_columns_again(prepared).await?;
         let (chunk_table, document_table) = (&prepared.tables.chunk, &prepared.tables.document);
         let rows = document_filter(&document.collection, &document.key);
         let delete_first = new_version.delete_first;
@@ -1095,12 +2207,8 @@ impl LanceDbIndex {
             .iter()
             .map(|chunk| chunk_text(&document.body, chunk))
             .collect();
-        let mut made = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(self.embedding.max_chunks_per_call().get()) {
-            let embeddings = self.embedding.embed_chunks(batch).await;
-            let embeddings = embeddings.map_err(IndexError::Embedding)?;
-            check_embedding_count(batch.len(), embeddings.len());
-            let mismatched = embeddings
+        self.embed_texts(&texts, |made| {
+            let mismatched = made
                 .iter()
                 .find(|embedding| embedding.vector.len() != model.dimension);
             if let Some(mismatched) = mismatched {
@@ -1110,12 +2218,32 @@ impl LanceDbIndex {
                     indexed: model.clone(),
                 });
             }
-            made.extend(embeddings);
             if let Some(progress) = progress {
-                progress.add_embedded_chunks(u64::try_from(batch.len()).unwrap_or(u64::MAX));
+                progress.add_embedded_chunks(count_of(made.len()));
             }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Makes the embedding vectors of `texts`, as many at a time as
+    /// `embedding` takes, one call after another. `made` gets the vectors of
+    /// each call before the next call is made, and an error from it stops
+    /// there.
+    async fn embed_texts(
+        &self,
+        texts: &[&str],
+        mut made: impl FnMut(&[ChunkEmbedding]) -> Result<(), IndexError>,
+    ) -> Result<Vec<ChunkEmbedding>, IndexError> {
+        let mut all = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(self.embedding.max_chunks_per_call().get()) {
+            let embeddings = self.embedding.embed_chunks(batch).await;
+            let embeddings = embeddings.map_err(IndexError::Embedding)?;
+            check_embedding_count(batch.len(), embeddings.len());
+            made(&embeddings)?;
+            all.extend(embeddings);
         }
-        Ok(made)
+        Ok(all)
     }
 
     /// Replaces the document's rows in the chunk table with `rows`, deleting
@@ -1136,7 +2264,7 @@ impl LanceDbIndex {
             .before(LanceCall::WriteRows(TableName::Chunk))
             .await
             .map_err(write_error)?;
-        let mut merge = table.merge_insert(&["collection", "key", "chunk_index"]);
+        let mut merge = table.merge_insert(TableName::Chunk.row_columns());
         merge
             .when_matched_update_all(None)
             .when_not_matched_insert_all()
@@ -1173,7 +2301,7 @@ impl LanceDbIndex {
             .before(LanceCall::WriteRows(TableName::Document))
             .await
             .map_err(write_error)?;
-        let mut merge = table.merge_insert(&["collection", "key"]);
+        let mut merge = table.merge_insert(TableName::Document.row_columns());
         merge
             .when_matched_update_all(None)
             .when_not_matched_insert_all();
@@ -1190,18 +2318,22 @@ impl LanceDbIndex {
         time: Option<TimeMicros>,
     ) -> Result<(), IndexError> {
         let row = time_row(&prepared.model, document, time).map_err(write_error)?;
-        self.hooks
-            .before(LanceCall::WriteRows(TableName::Document))
+        let _writing = self.writing.lock().await;
+        self.check_columns_again(prepared).await?;
+        self.update_rows(&prepared.tables.document, TableName::Document, row)
             .await
-            .map_err(write_error)?;
-        let mut merge = prepared
-            .tables
-            .document
-            .merge_insert(&["collection", "key"]);
-        merge.when_matched_update_all(None);
-        let merged = merge.execute(reader(row)).await;
-        merged.map_err(|error| write_error(error.into()))?;
-        Ok(())
+    }
+
+    /// Checks the vector columns again as [`Self::check_columns`] does, for
+    /// the model the rows were made for, just before writing them while no
+    /// other function of this component writes: the write lock is not held
+    /// while the vectors are made, so a rebuild may have changed the columns
+    /// since the first check.
+    async fn check_columns_again(&self, prepared: &Prepared) -> Result<(), IndexError> {
+        let columns = Columns::read(&prepared.tables).await?;
+        let made_for = Ok(prepared.model.clone());
+        let checked = self.check_columns(&prepared.tables, columns, &made_for);
+        checked.await.map(|_| ())
     }
 }
 
@@ -1223,6 +2355,7 @@ impl Index for LanceDbIndex {
         keep: &HashSet<Key>,
         unreadable_dirs: &[String],
     ) -> Result<u64, PartialDelete> {
+        let _writing = self.writing.lock().await;
         let result = self.delete_other_documents(collection, keep, unreadable_dirs);
         let result = result.await;
         if let Err(stopped) = &result {
@@ -1236,6 +2369,7 @@ impl Index for LanceDbIndex {
         collection: &CollectionName,
         key: &Key,
     ) -> Result<(), IndexError> {
+        let _writing = self.writing.lock().await;
         let result = self.delete_one_document(collection, key).await;
         self.discard_after(&result).await;
         result
@@ -1259,20 +2393,26 @@ impl Index for LanceDbIndex {
 
     async fn status(
         &self,
-        _scope: StatusScope,
-        _compare_with: &dyn Embedding,
-        _check: DimensionCheck,
+        scope: StatusScope,
+        compare_with: &dyn Embedding,
+        check: DimensionCheck,
     ) -> Result<IndexStatus, IndexError> {
-        todo!()
+        let result = self.index_status(&scope, compare_with, check).await;
+        self.discard_after(&result).await;
+        result
     }
 
     async fn rebuild_embeddings(
         &self,
-        _include_configured_model: bool,
-        _parallelism: usize,
-        _progress: &dyn ProgressSink,
+        include_configured_model: bool,
+        parallelism: usize,
+        progress: &dyn ProgressSink,
     ) -> Result<u64, IndexError> {
-        todo!()
+        let _writing = self.writing.lock().await;
+        let result = self.rebuild(include_configured_model, parallelism, progress);
+        let result = result.await;
+        self.discard_after(&result).await;
+        result
     }
 
     async fn tables_for_query(&self) -> Result<Option<QueryTables>, IndexError> {
@@ -1282,13 +2422,17 @@ impl Index for LanceDbIndex {
     }
 
     async fn maintain(&self) -> Result<(), IndexError> {
+        let _writing = self.writing.lock().await;
         let result = self.maintain_tables().await;
         self.discard_after(&result).await;
         result
     }
 
     async fn check_ingestable(&self) -> Result<(), IndexError> {
-        todo!()
+        let _writing = self.writing.lock().await;
+        let result = self.check_tables_ingestable().await;
+        self.discard_after(&result).await;
+        result
     }
 }
 
@@ -1347,6 +2491,408 @@ fn check_embedding_count(chunks: usize, vectors: usize) {
     }
 }
 
+fn count_of(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+/// The error when the embedding model makes vectors of another dimension than
+/// it said it has.
+fn dimension_changed(model: &EmbeddingModel, made: usize) -> IndexError {
+    let source = format!(
+        "the embedding model {} made vectors of {made} numbers, though its dimension is {}",
+        model.name, model.dimension
+    );
+    IndexError::Embedding(EmbeddingError::ModelUnavailable {
+        source: source.into(),
+    })
+}
+
+// ---------------------------------------------------------------- the status and rebuilds
+
+/// What `status` counts in the tables.
+#[derive(Default)]
+struct Counts {
+    /// The model of the vector columns; `None` partway through switching
+    /// them, and when no chunk counted has a vector.
+    model: Option<EmbeddingModel>,
+    documents: u64,
+    /// By collection; a collection without chunks is left out.
+    chunks: BTreeMap<CollectionName, ChunkCounts>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ChunkCounts {
+    chunks: u64,
+    with_vector: u64,
+    /// Of those with a vector, the chunks whose vector does not cover the
+    /// whole chunk.
+    truncated: u64,
+}
+
+impl Counts {
+    fn into_status(self, compared_name: &str, dimension: DimensionResult) -> IndexStatus {
+        let same_as_compared = self.model.as_ref().and_then(|model| {
+            if model.name != compared_name {
+                return Some(false);
+            }
+            match dimension {
+                DimensionResult::Known(dimension) => Some(dimension == model.dimension),
+                DimensionResult::Unavailable(_) | DimensionResult::NotChecked => None,
+            }
+        });
+        let models = |counts: &ChunkCounts| match &self.model {
+            Some(model) if counts.with_vector > 0 => vec![ModelStatus {
+                model: model.clone(),
+                same_as_compared,
+                chunk_count: counts.with_vector,
+                truncated_chunk_count: counts.truncated,
+            }],
+            _ => Vec::new(),
+        };
+        let mut total = ChunkCounts::default();
+        for counts in self.chunks.values() {
+            total.chunks += counts.chunks;
+            total.with_vector += counts.with_vector;
+            total.truncated += counts.truncated;
+        }
+        IndexStatus {
+            compared_model_name: compared_name.to_owned(),
+            compared_dimension: dimension,
+            models: models(&total),
+            collections: self
+                .chunks
+                .iter()
+                .map(|(name, counts)| (name.clone(), models(counts)))
+                .collect(),
+            document_count: self.documents,
+            chunk_count: total.chunks,
+            chunks_without_vector: total.chunks - total.with_vector,
+        }
+    }
+}
+
+/// What a rebuild has left to do with a table's vector columns, when it goes
+/// on from where the table is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Remaining {
+    /// Nothing: the table reads vectors of the model, and has no new columns.
+    Nothing,
+    /// The table has its new columns with their values: index them (step 3)
+    /// and switch to them (step 4).
+    Switch,
+    /// Add the new columns with their values (step 1 or 2), index them, and
+    /// switch to them.
+    Fill,
+}
+
+impl Remaining {
+    /// What is left for a table whose new columns, if any, are of `model`.
+    fn of(columns: &TableColumns, model: &EmbeddingModel) -> Self {
+        if columns.new.is_some() {
+            return Self::Switch;
+        }
+        match columns.read.as_ref() == Some(model) {
+            true => Self::Nothing,
+            false => Self::Fill,
+        }
+    }
+}
+
+/// A rebuild once it has decided what is left to do.
+struct Rebuilding<'a> {
+    tables: &'a Tables,
+    columns: &'a Columns,
+    model: &'a EmbeddingModel,
+    /// For the chunk table, then the document table.
+    remaining: [Remaining; 2],
+}
+
+impl Rebuilding<'_> {
+    fn remaining_of(&self, name: TableName) -> Remaining {
+        match name {
+            TableName::Chunk => self.remaining[0],
+            TableName::Document => self.remaining[1],
+        }
+    }
+}
+
+/// The rebuild table, and how many chunk vectors it keeps.
+struct Kept {
+    table: lancedb::Table,
+    rows: usize,
+}
+
+/// Step 1 of a rebuild: what it fills the chunk table's new columns with.
+struct Filling<'a> {
+    table: &'a lancedb::Table,
+    model: &'a EmbeddingModel,
+    kept: &'a Kept,
+    /// The version of the chunk table the vectors are made for.
+    version: u64,
+    parallelism: usize,
+    tally: &'a Tally<'a>,
+}
+
+/// The chunk vectors made since the rebuild table last kept them.
+#[derive(Default)]
+struct ToKeep {
+    batches: Vec<RecordBatch>,
+    rows: usize,
+}
+
+impl ToKeep {
+    fn push(&mut self, batch: RecordBatch) {
+        self.rows += batch.num_rows();
+        self.batches.push(batch);
+    }
+
+    fn take(&mut self) -> Vec<RecordBatch> {
+        self.rows = 0;
+        std::mem::take(&mut self.batches)
+    }
+}
+
+/// The columns of the rebuild table for `model`: the version of the chunk
+/// table, and the chunk table's new vector columns.
+fn rebuild_table_schema(model: &EmbeddingModel) -> Result<SchemaRef, BoxError> {
+    let new_columns = TableName::Chunk.new_columns_schema(model)?;
+    let mut fields = vec![Field::new("chunk_version", DataType::UInt64, false)];
+    fields.extend(
+        new_columns
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone()),
+    );
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// The chunk texts of each document in the chunk table's rows, read in
+/// order, after the first `skip` rows: a document's chunks are the
+/// consecutive rows with its collection name and key.
+fn documents_in_chunk_rows(
+    rows: SendableRecordBatchStream,
+    skip: usize,
+) -> impl futures::Stream<Item = Result<Vec<String>, IndexError>> {
+    let grouping = ChunkRowGrouping {
+        rows,
+        skip,
+        current: None,
+        texts: Vec::new(),
+        ready: VecDeque::new(),
+        ended: false,
+    };
+    futures::stream::unfold(grouping, |mut grouping| async move {
+        let next = grouping.next().await?;
+        Some((next, grouping))
+    })
+}
+
+struct ChunkRowGrouping {
+    rows: SendableRecordBatchStream,
+    skip: usize,
+    /// The collection name and key of the rows in `texts`.
+    current: Option<(String, String)>,
+    texts: Vec<String>,
+    ready: VecDeque<Vec<String>>,
+    ended: bool,
+}
+
+impl ChunkRowGrouping {
+    async fn next(&mut self) -> Option<Result<Vec<String>, IndexError>> {
+        loop {
+            if let Some(texts) = self.ready.pop_front() {
+                return Some(Ok(texts));
+            }
+            if self.ended {
+                return (!self.texts.is_empty()).then(|| Ok(std::mem::take(&mut self.texts)));
+            }
+            let split = match self.rows.try_next().await {
+                Ok(Some(batch)) => self.split(&batch),
+                Ok(None) => {
+                    self.ended = true;
+                    Ok(())
+                }
+                Err(error) => Err(read_error(error.into())),
+            };
+            if let Err(error) = split {
+                self.ended = true;
+                self.texts.clear();
+                return Some(Err(error));
+            }
+        }
+    }
+
+    fn split(&mut self, batch: &RecordBatch) -> Result<(), IndexError> {
+        let names = string_column(batch, "collection").map_err(read_error)?;
+        let keys = string_column(batch, "key").map_err(read_error)?;
+        let texts = string_column(batch, "text").map_err(read_error)?;
+        for row in 0..batch.num_rows() {
+            if self.skip > 0 {
+                self.skip -= 1;
+                continue;
+            }
+            let document = (names.value(row), keys.value(row));
+            let current = self.current.as_ref();
+            if current.map(|(name, key)| (name.as_str(), key.as_str())) != Some(document) {
+                if !self.texts.is_empty() {
+                    self.ready.push_back(std::mem::take(&mut self.texts));
+                }
+                self.current = Some((document.0.to_owned(), document.1.to_owned()));
+            }
+            self.texts.push(texts.value(row).to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// The values of the chunk table's new vector columns for `embeddings`,
+/// built a slice at a time.
+async fn chunk_vector_columns(
+    model: &EmbeddingModel,
+    embeddings: &[ChunkEmbedding],
+    pace: &mut Pace<'_>,
+) -> Result<RecordBatch, BoxError> {
+    let mut values = Vec::with_capacity(embeddings.len().saturating_mul(model.dimension));
+    for embedding in embeddings {
+        pace.before(size_of_val(embedding.vector.as_slice())).await;
+        values.extend_from_slice(&embedding.vector);
+    }
+    let values = Arc::new(Float32Array::from(values));
+    let size = vector_size(model.dimension)?;
+    let vectors = FixedSizeListArray::try_new(vector_item(), size, values, None)?;
+    let covers_whole = embeddings
+        .iter()
+        .map(|embedding| Some(embedding.covers_whole_chunk));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(vectors),
+        Arc::new(covers_whole.collect::<BooleanArray>()),
+    ];
+    Ok(RecordBatch::try_new(
+        TableName::Chunk.new_columns_schema(model)?,
+        columns,
+    )?)
+}
+
+/// The runs of consecutive rows of `documents` with the same collection
+/// name, each of at most `most_documents` rows whose chunks number at most
+/// [`CHUNKS_PER_READ`] together. A document with more chunks than that is a
+/// run of its own.
+fn collection_runs(
+    documents: &RecordBatch,
+    most_documents: usize,
+) -> Result<Vec<Range<usize>>, BoxError> {
+    let names = string_column(documents, "collection")?;
+    let ranges = column(documents, "chunk_ranges")?.as_list_opt::<i32>();
+    let ranges = ranges.ok_or_else(|| unexpected_type("chunk_ranges"))?;
+    let mut runs: Vec<(Range<usize>, usize)> = Vec::new();
+    for row in 0..documents.num_rows() {
+        let chunks = usize::try_from(ranges.value_length(row))?;
+        match runs.last_mut() {
+            Some((run, in_run))
+                if run.len() < most_documents
+                    && *in_run + chunks <= CHUNKS_PER_READ
+                    && names.value(run.start) == names.value(row) =>
+            {
+                run.end = row + 1;
+                *in_run += chunks;
+            }
+            _ => runs.push((row..row + 1, chunks)),
+        }
+    }
+    Ok(runs.into_iter().map(|(run, _)| run).collect())
+}
+
+/// Where each key's rows are in a list of batches: the batch and the row in
+/// it.
+type RowsByKey<'a> = HashMap<&'a str, Vec<(usize, u32)>>;
+
+/// Where each key's rows are in `chunk_rows`.
+fn rows_by_key(chunk_rows: &[RecordBatch]) -> Result<RowsByKey<'_>, BoxError> {
+    let mut found = RowsByKey::new();
+    for (position, batch) in chunk_rows.iter().enumerate() {
+        let keys = string_column(batch, "key")?;
+        for row in 0..batch.num_rows() {
+            let at = (position, u32::try_from(row)?);
+            found.entry(keys.value(row)).or_default().push(at);
+        }
+    }
+    Ok(found)
+}
+
+/// The values of the document table's new vector column, gathered one
+/// document at a time.
+#[derive(Default)]
+struct GatheredVectors {
+    values: Vec<f32>,
+    lengths: Vec<usize>,
+    valid: Vec<bool>,
+}
+
+impl GatheredVectors {
+    /// Adds a document's value: its chunks' vectors in order, or null.
+    fn push(&mut self, vectors: Option<Vec<ArrayRef>>) {
+        let vectors = vectors.unwrap_or_default();
+        self.valid.push(!vectors.is_empty());
+        self.lengths.push(vectors.len());
+        for vector in &vectors {
+            let numbers = vector.as_primitive::<Float32Type>();
+            self.values.extend_from_slice(numbers.values());
+        }
+    }
+
+    fn into_batch(self, model: &EmbeddingModel) -> Result<RecordBatch, BoxError> {
+        let values = Arc::new(Float32Array::from(self.values));
+        let size = vector_size(model.dimension)?;
+        let vectors = FixedSizeListArray::try_new(vector_item(), size, values, None)?;
+        let offsets = OffsetBuffer::from_lengths(self.lengths);
+        let nulls = NullBuffer::from(self.valid);
+        let item = vectors_item(model.dimension)?;
+        let list = ListArray::try_new(item, offsets, Arc::new(vectors), Some(nulls))?;
+        Ok(RecordBatch::try_new(
+            TableName::Document.new_columns_schema(model)?,
+            vec![Arc::new(list)],
+        )?)
+    }
+}
+
+/// The progress of a rebuild, in chunks, shared by the documents rebuilt at
+/// once.
+struct Tally<'a> {
+    progress: &'a dyn ProgressSink,
+    done: std::sync::Mutex<u64>,
+    total: u64,
+}
+
+impl<'a> Tally<'a> {
+    /// Starts at `done` of `total`, and reports that.
+    fn new(progress: &'a dyn ProgressSink, done: u64, total: u64) -> Self {
+        progress.report(Progress {
+            done,
+            total: Some(total),
+        });
+        Self {
+            progress,
+            done: std::sync::Mutex::new(done),
+            total,
+        }
+    }
+
+    /// Adds the chunks whose vectors were just made, and reports the new
+    /// count. The lock keeps the reports in the order of their counts.
+    fn add(&self, chunks: u64) {
+        self.progress.add_embedded_chunks(chunks);
+        let mut done = self
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *done = done.saturating_add(chunks);
+        self.progress.report(Progress {
+            done: *done,
+            total: Some(self.total),
+        });
+    }
+}
+
 // ---------------------------------------------------------------- the LanceDB connection
 
 /// The directory in the data directory that LanceDB keeps the index in.
@@ -1365,6 +2911,17 @@ struct Held {
 struct Tables {
     document: lancedb::Table,
     chunk: lancedb::Table,
+}
+
+impl Tables {
+    /// Each table with its name, the chunk table first, as the tables are
+    /// written.
+    fn each(&self) -> [(&lancedb::Table, TableName); 2] {
+        [
+            (&self.chunk, TableName::Chunk),
+            (&self.document, TableName::Document),
+        ]
+    }
 }
 
 /// Opens the LanceDB in the data directory when a function first needs it,
@@ -1448,20 +3005,10 @@ impl Store {
     /// cannot search a table without it, so the index counts as created only
     /// once both tables have it.
     async fn pinned_tables(&self) -> Result<Option<QueryTables>, IndexError> {
-        let Some(connection) = self.connection_to_read().await? else {
+        let Some(tables) = self.pinned().await? else {
             return Ok(None);
         };
-        let Some(tables) = self.open_tables(&connection).await? else {
-            return Ok(None);
-        };
-        for (table, name) in [
-            (&tables.document, TableName::Document),
-            (&tables.chunk, TableName::Chunk),
-        ] {
-            let version = table.version().await;
-            let version = version.map_err(|error| read_error(error.into()))?;
-            let pinned = table.checkout(version).await;
-            pinned.map_err(|error| read_error(error.into()))?;
+        for (table, name) in tables.each() {
             if !Self::has_full_text_index(table, name).await? {
                 return Ok(None);
             }
@@ -1470,6 +3017,25 @@ impl Store {
             document: tables.document,
             chunk: tables.chunk,
         }))
+    }
+
+    /// The two tables, newly opened and each pinned to its latest version;
+    /// the tables held are not pinned. `None` when there is no LanceDB
+    /// directory yet or a table is missing.
+    async fn pinned(&self) -> Result<Option<Tables>, IndexError> {
+        let Some(connection) = self.connection_to_read().await? else {
+            return Ok(None);
+        };
+        let Some(tables) = self.open_tables(&connection).await? else {
+            return Ok(None);
+        };
+        for (table, _) in tables.each() {
+            let version = table.version().await;
+            let version = version.map_err(|error| read_error(error.into()))?;
+            let pinned = table.checkout(version).await;
+            pinned.map_err(|error| read_error(error.into()))?;
+        }
+        Ok(Some(tables))
     }
 
     /// Drops what is held, so that the next call opens LanceDB again. Called
@@ -1700,6 +3266,52 @@ impl TableName {
         }
     }
 
+    /// The column that a rebuild makes the table's embedding vectors into,
+    /// before it takes the name of [`Self::vector_column`].
+    fn new_vector_column(self) -> &'static str {
+        match self {
+            Self::Document => "vectors_new",
+            Self::Chunk => "vector_new",
+        }
+    }
+
+    /// The vector column, and the column that goes with each vector, as the
+    /// table reads them.
+    fn vector_columns(self) -> &'static [&'static str] {
+        match self {
+            Self::Document => &["vectors"],
+            Self::Chunk => &["vector", "covers_whole"],
+        }
+    }
+
+    /// The columns of [`Self::vector_columns`] as a rebuild adds them, in the
+    /// same order.
+    fn new_vector_columns(self) -> &'static [&'static str] {
+        match self {
+            Self::Document => &["vectors_new"],
+            Self::Chunk => &["vector_new", "covers_whole_new"],
+        }
+    }
+
+    /// The columns whose values find a row: a document, or a document's
+    /// chunk.
+    fn row_columns(self) -> &'static [&'static str] {
+        match self {
+            Self::Document => &["collection", "key"],
+            Self::Chunk => &["collection", "key", "chunk_index"],
+        }
+    }
+
+    /// The new vector columns for `model`, as a rebuild adds them.
+    fn new_columns_schema(self, model: &EmbeddingModel) -> Result<SchemaRef, BoxError> {
+        let schema = self.schema(model)?;
+        let renamed = self.vector_columns().iter().zip(self.new_vector_columns());
+        let fields = renamed
+            .map(|(read, new)| Ok(schema.field_with_name(read)?.clone().with_name(*new)))
+            .collect::<Result<Vec<_>, BoxError>>()?;
+        Ok(Arc::new(Schema::new(fields)))
+    }
+
     /// The columns of a table made for `model`. `query` reads these columns
     /// by name, so they are part of what the component publishes.
     fn schema(self, model: &EmbeddingModel) -> Result<SchemaRef, BoxError> {
@@ -1864,45 +3476,92 @@ impl VectorIndexParams {
     }
 }
 
-/// The state of the two tables' vector columns.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum VectorColumns {
-    /// Both tables read vectors made with this model, and no rebuild is left.
-    Ready(EmbeddingModel),
-    /// A rebuild of the vector columns has not finished: a table has a new
-    /// vector column left, a table lacks its vector column, or the two tables'
-    /// vector columns name different models.
-    RebuildUnfinished,
+/// The vector columns of both tables.
+#[derive(Clone, Debug)]
+struct Columns {
+    chunk: TableColumns,
+    document: TableColumns,
 }
 
-impl VectorColumns {
+/// A table's vector columns: the one it reads, and a new one that a rebuild
+/// left, each with the model of its vectors. `None` when the table lacks it.
+#[derive(Clone, Debug)]
+struct TableColumns {
+    read: Option<EmbeddingModel>,
+    new: Option<EmbeddingModel>,
+}
+
+impl Columns {
     async fn read(tables: &Tables) -> Result<Self, IndexError> {
-        let chunk = Self::model_of(&tables.chunk, TableName::Chunk).await?;
-        let document = Self::model_of(&tables.document, TableName::Document).await?;
-        match (chunk, document) {
-            (Some(chunk), Some(document)) if chunk == document => Ok(Self::Ready(chunk)),
-            _ => Ok(Self::RebuildUnfinished),
+        Ok(Self {
+            chunk: TableColumns::read(&tables.chunk, TableName::Chunk).await?,
+            document: TableColumns::read(&tables.document, TableName::Document).await?,
+        })
+    }
+
+    /// Whether the vector columns are partway through switching: a rebuild
+    /// stopped after it began step 4 (dropping the columns read and renaming
+    /// the new ones) and before it finished it on both tables. Then a table
+    /// lacks the column it reads, the two tables read vectors of different
+    /// models, or the chunk table has switched (no new columns) while the
+    /// document table has not.
+    fn mid_switch(&self) -> bool {
+        match (&self.chunk.read, &self.document.read) {
+            (Some(chunk), Some(document)) => {
+                chunk != document || (self.chunk.new.is_none() && self.document.new.is_some())
+            }
+            _ => true,
         }
     }
 
-    /// The model of the table's vector column; `None` when the table lacks it
-    /// or has a new vector column left from a rebuild.
-    async fn model_of(
-        table: &lancedb::Table,
-        name: TableName,
-    ) -> Result<Option<EmbeddingModel>, IndexError> {
+    /// The model of the vectors both tables read; `None` when a table lacks
+    /// the column it reads or the two models differ.
+    fn read_model(&self) -> Option<&EmbeddingModel> {
+        match (&self.chunk.read, &self.document.read) {
+            (Some(chunk), Some(document)) if chunk == document => Some(chunk),
+            _ => None,
+        }
+    }
+
+    /// Whether finishing the switch would leave both tables reading vectors
+    /// of a model `wanted` accepts: every table has a vector column, and
+    /// `wanted` accepts the model of each.
+    fn can_finish_switch(&self, wanted: impl Fn(&EmbeddingModel) -> bool) -> bool {
+        [&self.chunk, &self.document].into_iter().all(|table| {
+            let mut models = table.read.iter().chain(table.new.iter()).peekable();
+            models.peek().is_some() && models.all(&wanted)
+        })
+    }
+
+    fn of(&self, name: TableName) -> &TableColumns {
+        match name {
+            TableName::Chunk => &self.chunk,
+            TableName::Document => &self.document,
+        }
+    }
+
+    fn of_mut(&mut self, name: TableName) -> &mut TableColumns {
+        match name {
+            TableName::Chunk => &mut self.chunk,
+            TableName::Document => &mut self.document,
+        }
+    }
+}
+
+impl TableColumns {
+    async fn read(table: &lancedb::Table, name: TableName) -> Result<Self, IndexError> {
         let schema = table
             .schema()
             .await
             .map_err(|error| read_error(error.into()))?;
-        let new_column = format!("{}_new", name.vector_column());
-        if schema.field_with_name(&new_column).is_ok() {
-            return Ok(None);
-        }
-        let Ok(field) = schema.field_with_name(name.vector_column()) else {
-            return Ok(None);
+        let model = |column: &str| match schema.field_with_name(column) {
+            Ok(field) => model_of_field(field).map(Some).map_err(read_error),
+            Err(_) => Ok(None),
         };
-        model_of_field(field).map(Some).map_err(read_error)
+        Ok(Self {
+            read: model(name.vector_column())?,
+            new: model(name.new_vector_column())?,
+        })
     }
 }
 
@@ -2004,6 +3663,32 @@ fn document_filter(collection: &CollectionName, key: &Key) -> DfExpr {
 /// The condition that picks a collection's rows in either table.
 fn collection_filter(collection: &CollectionName) -> DfExpr {
     col("collection").eq(lit(collection.0.clone()))
+}
+
+/// The condition that picks the rows of any of the collections in either
+/// table.
+fn collections_filter(collections: &[CollectionName]) -> DfExpr {
+    let names = collections.iter().map(|name| lit(name.0.clone()));
+    col("collection").in_list(names.collect(), false)
+}
+
+/// `query` with `filter`, if any.
+fn filtered(query: lancedb::query::Query, filter: Option<DfExpr>) -> lancedb::query::Query {
+    match filter {
+        Some(filter) => query.only_if_expr(filter),
+        None => query,
+    }
+}
+
+/// Whether `query` returns a row.
+async fn any_row(query: lancedb::query::Query) -> Result<bool, BoxError> {
+    let mut rows = query.execute().await?;
+    while let Some(batch) = rows.try_next().await? {
+        if batch.num_rows() > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `key` is in one of `dirs`: it begins with the directory and `/`.
@@ -2290,6 +3975,11 @@ fn primitive_column<'a, T: ArrowPrimitiveType>(
 
 fn string_column<'a>(rows: &'a RecordBatch, name: &str) -> Result<&'a StringArray, BoxError> {
     let values = column(rows, name)?.as_string_opt::<i32>();
+    values.ok_or_else(|| unexpected_type(name))
+}
+
+fn boolean_column<'a>(rows: &'a RecordBatch, name: &str) -> Result<&'a BooleanArray, BoxError> {
+    let values = column(rows, name)?.as_boolean_opt();
     values.ok_or_else(|| unexpected_type(name))
 }
 
