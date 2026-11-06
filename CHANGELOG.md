@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Bumped `zstd` 0.13.3 → 0.13.4 and `zstd-safe` 7.2.4 → 7.4.0 in the lockfile; no manifest change was needed. In the binary, `zstd` 0.13 reaches mdya through `arrow-ipc` 58, which `lancedb` uses. The new releases are the fixed versions for thirteen advisories, and `cargo audit` no longer reports them:
+  - Vulnerabilities: RUSTSEC-2026-0391 (`zstd`), RUSTSEC-2026-0398 and RUSTSEC-2026-0403 (`zstd-safe`).
+  - Unsoundness in `zstd-safe`: RUSTSEC-2026-0395 to 0397, 0399 to 0402, and 0404 to 0406.
+
+  Whether mdya's own code paths reach the affected functions was not analysed.
+
 ## [0.4.3] - 2026-10-31
 
 ### Changed
