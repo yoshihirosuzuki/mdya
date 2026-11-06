@@ -14,7 +14,8 @@
 //! operation at a time, `log_progress` writes logs and progress to stderr,
 //! `escape` makes control characters and the characters that change the
 //! direction of text harmless, and `error_report` turns every error into an
-//! exit code, an MCP error, and an explanation.
+//! exit code, an MCP error's code and details, and what its explanation
+//! holds.
 
 #![allow(clippy::print_stdout)]
 

@@ -1,5 +1,6 @@
-//! Decides, for every error, the command line's exit code, the MCP error, and
-//! the explanation shown to the user, in one place.
+//! Decides, for every error, the command line's exit code, the MCP error's
+//! code and details, and what the explanation shown to the user holds, in one
+//! place. Laying the explanation out is left to whatever writes it.
 
 #![cfg_attr(
     not(test),
@@ -9,7 +10,6 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use nu_ansi_term::Color;
 use serde::Serialize;
 
 use crate::collection::CollectionError;
@@ -22,7 +22,6 @@ use crate::query::QueryError;
 
 use super::cli::CliError;
 use super::entry::EntryError;
-use super::escape::Escape;
 use super::mcp::{McpError, socket_address};
 use super::operations::{
     ErrorContext, MODEL_CACHE_DIR_FIX, OperationError, OutcomeAnomaly, OutputPart,
@@ -60,18 +59,25 @@ const _: () = {
     shareable::<McpError>();
 };
 
-/// How to write an explanation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ExplainStyle {
-    pub(crate) color: bool,
-    pub(crate) replace_controls: bool,
+/// What the explanation of an error holds, not laid out: the error message,
+/// the causes of the error that the message stands for, nearest first, and
+/// how to fix it, one sentence each. The text is kept as it is, values from
+/// the user or the ingested data and causes included: whatever lays the
+/// explanation out treats all of it alike, replacing control characters and
+/// the characters that change the direction of text where its output needs
+/// that.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Explanation {
+    pub(crate) message: String,
+    pub(crate) causes: Vec<String>,
+    pub(crate) fix: Vec<String>,
 }
 
-/// The content of an MCP tool error: its `code`, `message`, and `details`.
+/// The `code` and `details` of an MCP tool error. Its `message` is the
+/// explanation, laid out by whatever writes the error.
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub(crate) struct McpErrorBody {
+pub(crate) struct McpErrorCode {
     pub(crate) code: &'static str,
-    pub(crate) message: String,
     pub(crate) details: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -85,122 +91,83 @@ pub(crate) trait ErrorReport: Send + Sync {
     /// error: 0 when there is no anomaly.
     fn outcome_exit_code(&self, anomalies: &[OutcomeAnomaly]) -> u8;
 
-    /// The explanation: the error message, the chain of causes, and how to
-    /// fix it, laid out in one fixed form, without a final line break.
-    fn explain(&self, error: &GatewayError, style: ExplainStyle) -> String;
+    /// What the explanation of the error holds. The command line shows it on
+    /// stderr, and the MCP server puts it in the error's `message`.
+    fn explanation(&self, error: &GatewayError) -> Explanation;
 
-    /// The MCP error. Its `message` is the explanation, without color and
-    /// without replacing control characters or the characters that change
-    /// the direction of text.
-    fn mcp_error(&self, error: &GatewayError) -> McpErrorBody;
+    /// The MCP error's `code` and `details`.
+    fn mcp_error(&self, error: &GatewayError) -> McpErrorCode;
 
-    /// The explanation of an unexpected failure, asking for a bug report.
-    fn explain_panic(&self, style: ExplainStyle) -> String;
+    /// What the explanation of an unexpected failure holds, asking for a bug
+    /// report.
+    fn panic_explanation(&self) -> Explanation;
 
-    /// The MCP error for a tool call that panicked (code `internal`).
-    fn mcp_panic_error(&self) -> McpErrorBody;
+    /// The MCP error's `code` and `details` for a tool call that panicked
+    /// (code `internal`).
+    fn mcp_panic_error(&self) -> McpErrorCode;
 
-    /// The explanation of going over the memory limit of `limit_mb` MB, which
-    /// the assembly gives the watchdog to write.
-    fn explain_memory_limit(&self, limit_mb: u64, style: ExplainStyle) -> String;
+    /// What the explanation of going over the memory limit of `limit_mb` MB
+    /// holds, for the watchdog to write.
+    fn memory_limit_explanation(&self, limit_mb: u64) -> Explanation;
 }
 
-/// Creates the real one. It replaces control characters and the characters
-/// that change the direction of text with `escape`.
-pub(crate) fn error_report(escape: Arc<dyn Escape>) -> Arc<dyn ErrorReport> {
-    Arc::new(Report { escape })
+/// Creates the real one.
+pub(crate) fn error_report() -> Arc<dyn ErrorReport> {
+    Arc::new(Report)
 }
 
-struct Report {
-    escape: Arc<dyn Escape>,
-}
+struct Report;
 
 impl ErrorReport for Report {
     fn exit_code(&self, error: &GatewayError) -> u8 {
-        shown(error, &|value| value.to_owned()).exit_code
+        shown(error).exit_code
     }
 
     fn outcome_exit_code(&self, anomalies: &[OutcomeAnomaly]) -> u8 {
         if anomalies.is_empty() { 0 } else { 1 }
     }
 
-    fn explain(&self, error: &GatewayError, style: ExplainStyle) -> String {
-        let value = |text: &str| self.text(text, style);
-        let shown = shown(error, &value);
-        let causes: Vec<String> = causes(shown.causes_of)
-            .map(|cause| self.text(&cause.to_string(), style))
-            .collect();
-        lay_out(&shown.message, &causes, &shown.fix, style.color)
+    fn explanation(&self, error: &GatewayError) -> Explanation {
+        let shown = shown(error);
+        Explanation {
+            causes: causes(shown.causes_of)
+                .map(|cause| cause.to_string())
+                .collect(),
+            message: shown.message,
+            fix: shown.fix,
+        }
     }
 
-    fn mcp_error(&self, error: &GatewayError) -> McpErrorBody {
-        let shown = shown(error, &|value| value.to_owned());
-        let causes: Vec<String> = causes(shown.causes_of)
-            .map(|cause| cause.to_string())
-            .collect();
-        McpErrorBody {
+    fn mcp_error(&self, error: &GatewayError) -> McpErrorCode {
+        let shown = shown(error);
+        McpErrorCode {
             code: shown.code,
-            message: lay_out(&shown.message, &causes, &shown.fix, false),
             details: shown.details,
         }
     }
 
-    fn explain_panic(&self, style: ExplainStyle) -> String {
-        lay_out(PANIC_MESSAGE, &[], &[PANIC_FIX.to_owned()], style.color)
+    fn panic_explanation(&self) -> Explanation {
+        Explanation {
+            message: PANIC_MESSAGE.to_owned(),
+            causes: Vec::new(),
+            fix: vec![PANIC_FIX.to_owned()],
+        }
     }
 
-    fn mcp_panic_error(&self) -> McpErrorBody {
-        McpErrorBody {
+    fn mcp_panic_error(&self) -> McpErrorCode {
+        McpErrorCode {
             code: INTERNAL,
-            message: lay_out(PANIC_MESSAGE, &[], &[PANIC_FIX.to_owned()], false),
             details: serde_json::Map::new(),
         }
     }
 
-    fn explain_memory_limit(&self, limit_mb: u64, style: ExplainStyle) -> String {
-        lay_out(
-            &format!("mdya's memory usage went over the limit of {limit_mb} MB"),
-            &[],
-            &[MEMORY_LIMIT_FIX.to_owned()],
-            style.color,
-        )
-    }
-}
-
-impl Report {
-    /// `text` from the user or the ingested data, replaced if `style` says
-    /// so.
-    fn text(&self, text: &str, style: ExplainStyle) -> String {
-        if style.replace_controls {
-            return self.escape.replace_controls(text).into_owned();
-        }
-        text.to_owned()
-    }
-}
-
-/// Lays out the explanation: the message, the causes numbered from the
-/// nearest, and the fix, with each cause and each line of the fix
-/// starting on its own line.
-fn lay_out(message: &str, causes: &[String], fix: &[String], color: bool) -> String {
-    let heading = |text: &str, paint: Color| {
-        if color {
-            paint.paint(text).to_string()
-        } else {
-            text.to_owned()
-        }
-    };
-    let mut explanation = format!("{} {message}", heading("Error:", Color::Red));
-    if !causes.is_empty() {
-        explanation.push_str(&format!("\n\n{}", heading("Caused by:", Color::Yellow)));
-        for (number, cause) in causes.iter().enumerate() {
-            explanation.push_str(&format!("\n    {number}: {cause}"));
+    fn memory_limit_explanation(&self, limit_mb: u64) -> Explanation {
+        Explanation {
+            message: format!("mdya's memory usage went over the limit of {limit_mb} MB"),
+            causes: Vec::new(),
+            fix: vec![MEMORY_LIMIT_FIX.to_owned()],
         }
     }
-    explanation.push_str(&format!("\n\n{}", heading("How to fix:", Color::Green)));
-    for line in fix {
-        explanation.push_str(&format!("\n    {line}"));
-    }
-    explanation
 }
 
 /// The causes of `error`: its source, the source's source, and so on.
@@ -260,32 +227,27 @@ impl<'a> Shown<'a> {
     }
 }
 
-/// Turns user or ingested text into what the explanation shows.
-type Value<'v> = dyn Fn(&str) -> String + 'v;
-
 /// The one place that maps every error to what is shown.
-fn shown<'a>(error: &'a GatewayError, value: &Value<'_>) -> Shown<'a> {
+fn shown(error: &GatewayError) -> Shown<'_> {
     match error {
-        GatewayError::Operation(error) => operation(error, value),
-        GatewayError::Entry(error) => entry(error, value),
-        GatewayError::Cli(error) => cli(error, value),
-        GatewayError::Mcp(error) => mcp(error, value),
+        GatewayError::Operation(error) => operation(error),
+        GatewayError::Entry(error) => entry(error),
+        GatewayError::Cli(error) => cli(error),
+        GatewayError::Mcp(error) => mcp(error),
     }
 }
 
-fn operation<'a>(error: &'a OperationError, value: &Value<'_>) -> Shown<'a> {
+fn operation(error: &OperationError) -> Shown<'_> {
     match error {
         OperationError::CollectionNotFound { collection } => {
-            collection_not_found(Some(&collection.0), value)
+            collection_not_found(Some(&collection.0))
         }
         OperationError::UpdateNotSupported { collection } => {
-            update_not_supported(Some(&collection.0), value)
+            update_not_supported(Some(&collection.0))
         }
-        OperationError::PutNotSupported { collection } => {
-            put_not_supported(Some(&collection.0), value)
-        }
+        OperationError::PutNotSupported { collection } => put_not_supported(Some(&collection.0)),
         OperationError::DocumentNotFound { collection, key } => {
-            document_not_found(Some(&collection.0), Some(&key.0), value)
+            document_not_found(Some(&collection.0), Some(&key.0))
         }
         OperationError::WriteLock(error) => write_lock(error),
         OperationError::OutputTooLarge {
@@ -314,8 +276,7 @@ fn operation<'a>(error: &'a OperationError, value: &Value<'_>) -> Shown<'a> {
             1,
             format!(
                 "this version of mdya does not know the collection type \"{}\" of the collection \"{}\"",
-                value(&collection_type.0),
-                value(&collection.0)
+                collection_type.0, collection.0
             ),
             &[UNKNOWN_TYPE_FIX],
         ),
@@ -325,29 +286,28 @@ fn operation<'a>(error: &'a OperationError, value: &Value<'_>) -> Shown<'a> {
             &[CONTENT_UNREADABLE_FIX],
         )
         .causes_of(error),
-        OperationError::Collection { context, source } => collection(context, source, value),
-        OperationError::Index { context, source } => index(context, source, ReadFor::Other, value),
-        OperationError::Query { context, source } => query(context, source, value),
+        OperationError::Collection { context, source } => collection(context, source),
+        OperationError::Index { context, source } => index(context, source, ReadFor::Other),
+        OperationError::Query { context, source } => query(context, source),
         OperationError::Ingest { context, source }
         | OperationError::UpdateStopped {
             context, source, ..
-        } => ingest(context, source, value),
-        OperationError::Config(error) => config(error, value),
+        } => ingest(context, source),
+        OperationError::Config(error) => config(error),
     }
 }
 
-fn entry<'a>(error: &'a EntryError, value: &Value<'_>) -> Shown<'a> {
+fn entry(error: &EntryError) -> Shown<'_> {
     match error {
         EntryError::InvalidLogLevel(level) => Shown::new(
             2,
             format!(
                 "the log level \"{}\" is not valid: {}",
-                value(&level.value),
-                value(&level.detail)
+                level.value, level.detail
             ),
             &[LOG_LEVEL_FIX],
         ),
-        EntryError::Config(error) => config(error, value),
+        EntryError::Config(error) => config(error),
         EntryError::DataDirUndetermined(_) => Shown::new(
             1,
             "the settings and index directory cannot be determined".to_owned(),
@@ -357,11 +317,11 @@ fn entry<'a>(error: &'a EntryError, value: &Value<'_>) -> Shown<'a> {
     }
 }
 
-fn cli<'a>(error: &'a CliError, value: &Value<'_>) -> Shown<'a> {
+fn cli(error: &CliError) -> Shown<'_> {
     match error {
         CliError::Usage { detail } => Shown::new(
             2,
-            format!("the arguments are not valid: {}", value(detail)),
+            format!("the arguments are not valid: {detail}"),
             &[USAGE_FIX],
         ),
         CliError::NothingToChange => Shown::new(
@@ -370,14 +330,14 @@ fn cli<'a>(error: &'a CliError, value: &Value<'_>) -> Shown<'a> {
             &[NOTHING_TO_CHANGE_FIX],
         ),
         CliError::UnsupportedFileType { value: file_type } => {
-            unsupported_file_type(Some(file_type), value)
+            unsupported_file_type(Some(file_type))
         }
         CliError::Collection { name, source } => {
             let context = ErrorContext {
                 collection: Some(name.clone()),
                 key: None,
             };
-            collection(&context, source, value)
+            collection(&context, source)
         }
         CliError::Ingest {
             collection_type,
@@ -388,15 +348,15 @@ fn cli<'a>(error: &'a CliError, value: &Value<'_>) -> Shown<'a> {
                     2,
                     format!(
                         "the type-specific attributes are missing or unexpected for the collection type {}",
-                        value(&collection_type.0)
+                        collection_type.0
                     ),
                     &[ATTRIBUTES_FIX],
                 );
             }
-            ingest(&ErrorContext::default(), source, value)
+            ingest(&ErrorContext::default(), source)
         }
-        CliError::Query(error) => query(&ErrorContext::default(), error, value),
-        CliError::Config(error) => config(error, value),
+        CliError::Query(error) => query(&ErrorContext::default(), error),
+        CliError::Config(error) => config(error),
         CliError::ConfirmationUnavailable => Shown::new(
             2,
             "a confirmation is needed, but there is no terminal to ask in and --yes was not given"
@@ -406,11 +366,11 @@ fn cli<'a>(error: &'a CliError, value: &Value<'_>) -> Shown<'a> {
     }
 }
 
-fn mcp<'a>(error: &'a McpError, value: &Value<'_>) -> Shown<'a> {
+fn mcp(error: &McpError) -> Shown<'_> {
     match error {
         McpError::AddressUnavailable { host, port, .. } => Shown::new(
             1,
-            format!("cannot listen on {}", socket_address(&value(host), *port)),
+            format!("cannot listen on {}", socket_address(host, *port)),
             &[ADDRESS_FIX],
         )
         .causes_of(error),
@@ -422,39 +382,28 @@ fn mcp<'a>(error: &'a McpError, value: &Value<'_>) -> Shown<'a> {
         .causes_of(error),
         McpError::InvalidToolInput { input, detail } => Shown::new(
             2,
-            format!(
-                "the tool input {} is not valid: {}",
-                value(input),
-                value(detail)
-            ),
+            format!("the tool input {input} is not valid: {detail}"),
             &[],
         )
-        .with_fix(format!(
-            "Fix the input {} and call the tool again.",
-            value(input)
-        ))
+        .with_fix(format!("Fix the input {input} and call the tool again."))
         .invalid_input(input),
     }
 }
 
 /// The collection error, with the context only borrowed for the names.
-fn collection<'a>(
-    context: &ErrorContext,
-    error: &'a CollectionError,
-    value: &Value<'_>,
-) -> Shown<'a> {
+fn collection<'a>(context: &ErrorContext, error: &'a CollectionError) -> Shown<'a> {
     let name = context.collection.as_ref().map(|name| name.0.as_str());
     match error {
-        CollectionError::NameInvalid => name_invalid(name, value),
+        CollectionError::NameInvalid => name_invalid(name),
         CollectionError::AlreadyExists => Shown::new(
             1,
             match name {
-                Some(name) => format!("a collection named \"{}\" already exists", value(name)),
+                Some(name) => format!("a collection named \"{name}\" already exists"),
                 None => "a collection already exists".to_owned(),
             },
             &[ALREADY_EXISTS_FIX],
         ),
-        CollectionError::NotFound => collection_not_found(name, value),
+        CollectionError::NotFound => collection_not_found(name),
         CollectionError::CannotRead { .. } => Shown::new(
             1,
             "the collection information cannot be read".to_owned(),
@@ -467,7 +416,7 @@ fn collection<'a>(
             &[WRITE_FIX],
         )
         .causes_of(error),
-        CollectionError::Index(error) => index(context, error, ReadFor::Other, value),
+        CollectionError::Index(error) => index(context, error, ReadFor::Other),
     }
 }
 
@@ -480,17 +429,11 @@ enum ReadFor {
     Other,
 }
 
-fn index<'a>(
-    context: &ErrorContext,
-    error: &'a IndexError,
-    read: ReadFor,
-    value: &Value<'_>,
-) -> Shown<'a> {
+fn index<'a>(context: &ErrorContext, error: &'a IndexError, read: ReadFor) -> Shown<'a> {
     match error {
         IndexError::DocumentNotFound => document_not_found(
             context.collection.as_ref().map(|name| name.0.as_str()),
             context.key.as_ref().map(|key| key.0.as_str()),
-            value,
         ),
         IndexError::Embedding(error) => embedding(error),
         IndexError::ModelMismatch {
@@ -499,15 +442,14 @@ fn index<'a>(
             indexed,
         } => {
             let configured = match configured_dimension {
-                Some(dimension) => format!("{} ({dimension} dimensions)", value(configured_name)),
-                None => value(configured_name),
+                Some(dimension) => format!("{configured_name} ({dimension} dimensions)"),
+                None => configured_name.clone(),
             };
             Shown::new(
                 1,
                 format!(
                     "the configured embedding model {configured} differs from the one the index's embeddings were made with, {} ({} dimensions)",
-                    value(&indexed.name),
-                    indexed.dimension
+                    indexed.name, indexed.dimension
                 ),
                 &[REBUILD_FIX],
             )
@@ -533,7 +475,7 @@ fn index_unreadable<'a>(read: ReadFor) -> Shown<'a> {
     }
 }
 
-fn query<'a>(context: &ErrorContext, error: &'a QueryError, value: &Value<'_>) -> Shown<'a> {
+fn query<'a>(context: &ErrorContext, error: &'a QueryError) -> Shown<'a> {
     // A search has no key in its context; getting a document has one.
     let read = if context.key.is_none() {
         ReadFor::Search
@@ -557,7 +499,6 @@ fn query<'a>(context: &ErrorContext, error: &'a QueryError, value: &Value<'_>) -
         QueryError::DocumentNotFound => document_not_found(
             context.collection.as_ref().map(|name| name.0.as_str()),
             context.key.as_ref().map(|key| key.0.as_str()),
-            value,
         ),
         QueryError::ChunkNotFound => Shown::new(
             1,
@@ -566,7 +507,7 @@ fn query<'a>(context: &ErrorContext, error: &'a QueryError, value: &Value<'_>) -
         )
         .invalid_input("chunk_index"),
         QueryError::Embedding(error) => embedding(error),
-        QueryError::Index(error) => index(context, error, read, value),
+        QueryError::Index(error) => index(context, error, read),
         QueryError::CannotRead { .. } => index_unreadable(read).causes_of(error),
     }
 }
@@ -591,7 +532,7 @@ fn embedding(error: &EmbeddingError) -> Shown<'_> {
     }
 }
 
-fn ingest<'a>(context: &ErrorContext, error: &'a IngestError, value: &Value<'_>) -> Shown<'a> {
+fn ingest<'a>(context: &ErrorContext, error: &'a IngestError) -> Shown<'a> {
     let name = context.collection.as_ref().map(|name| name.0.as_str());
     match error {
         IngestError::AttributesMissingOrExtra => Shown::new(
@@ -611,9 +552,9 @@ fn ingest<'a>(context: &ErrorContext, error: &'a IngestError, value: &Value<'_>)
             "the location does not fit the collection type".to_owned(),
             &[LOCATION_TYPE_FIX],
         ),
-        IngestError::UpdateNotSupported => update_not_supported(name, value),
-        IngestError::PutNotSupported => put_not_supported(name, value),
-        IngestError::UnsupportedFileType => unsupported_file_type(None, value),
+        IngestError::UpdateNotSupported => update_not_supported(name),
+        IngestError::PutNotSupported => put_not_supported(name),
+        IngestError::UnsupportedFileType => unsupported_file_type(None),
         IngestError::CannotExtract(format) => match format {
             FormatError::CannotExtract { .. } => Shown::new(
                 1,
@@ -628,15 +569,15 @@ fn ingest<'a>(context: &ErrorContext, error: &'a IngestError, value: &Value<'_>)
             &SOURCE_UNREADABLE_FIX,
         )
         .causes_of(error),
-        IngestError::Index(error) => index(context, error, ReadFor::Other, value),
+        IngestError::Index(error) => index(context, error, ReadFor::Other),
     }
 }
 
-fn config<'a>(error: &'a ConfigError, value: &Value<'_>) -> Shown<'a> {
+fn config(error: &ConfigError) -> Shown<'_> {
     match error {
         ConfigError::UnknownName { name } => Shown::new(
             2,
-            format!("there is no setting named \"{}\"", value(name)),
+            format!("there is no setting named \"{name}\""),
             &[UNKNOWN_SETTING_FIX],
         ),
         ConfigError::InvalidValue { name, accepted } => Shown::new(
@@ -672,11 +613,11 @@ fn write_lock(error: &WriteLockError) -> Shown<'_> {
     }
 }
 
-fn collection_not_found<'a>(name: Option<&str>, value: &Value<'_>) -> Shown<'a> {
+fn collection_not_found<'a>(name: Option<&str>) -> Shown<'a> {
     let shown = Shown::new(
         1,
         match name {
-            Some(name) => format!("the collection \"{}\" does not exist", value(name)),
+            Some(name) => format!("the collection \"{name}\" does not exist"),
             None => "the collection does not exist".to_owned(),
         },
         &[COLLECTION_NOT_FOUND_FIX],
@@ -688,67 +629,60 @@ fn collection_not_found<'a>(name: Option<&str>, value: &Value<'_>) -> Shown<'a> 
     }
 }
 
-fn name_invalid<'a>(name: Option<&str>, value: &Value<'_>) -> Shown<'a> {
+fn name_invalid<'a>(name: Option<&str>) -> Shown<'a> {
     Shown::new(
         2,
         match name {
-            Some(name) => format!(
-                "the collection name \"{}\" does not follow the naming rules",
-                value(name)
-            ),
+            Some(name) => {
+                format!("the collection name \"{name}\" does not follow the naming rules")
+            }
             None => "the collection name does not follow the naming rules".to_owned(),
         },
         &[NAME_RULES_FIX],
     )
 }
 
-fn update_not_supported<'a>(name: Option<&str>, value: &Value<'_>) -> Shown<'a> {
+fn update_not_supported<'a>(name: Option<&str>) -> Shown<'a> {
     Shown::new(
         1,
         format!(
             "the collection {}is of a type that cannot be updated",
-            quoted_name(name, value)
+            quoted_name(name)
         ),
         &[UPDATE_NOT_SUPPORTED_FIX],
     )
 }
 
-fn put_not_supported<'a>(name: Option<&str>, value: &Value<'_>) -> Shown<'a> {
+fn put_not_supported<'a>(name: Option<&str>) -> Shown<'a> {
     Shown::new(
         1,
         format!(
             "the collection {}is of a type that does not take document content",
-            quoted_name(name, value)
+            quoted_name(name)
         ),
         &[PUT_NOT_SUPPORTED_FIX],
     )
 }
 
 /// `"name" ` for a name, nothing without one.
-fn quoted_name(name: Option<&str>, value: &Value<'_>) -> String {
-    name.map(|name| format!("\"{}\" ", value(name)))
-        .unwrap_or_default()
+fn quoted_name(name: Option<&str>) -> String {
+    name.map(|name| format!("\"{name}\" ")).unwrap_or_default()
 }
 
-fn unsupported_file_type<'a>(file_type: Option<&str>, value: &Value<'_>) -> Shown<'a> {
+fn unsupported_file_type<'a>(file_type: Option<&str>) -> Shown<'a> {
     Shown::new(
         2,
         match file_type {
-            Some(file_type) => format!("the file type \"{}\" is not supported", value(file_type)),
+            Some(file_type) => format!("the file type \"{file_type}\" is not supported"),
             None => "the file type is not supported".to_owned(),
         },
         &[FILE_TYPE_FIX],
     )
 }
 
-fn document_not_found<'a>(
-    collection: Option<&str>,
-    key: Option<&str>,
-    value: &Value<'_>,
-) -> Shown<'a> {
-    let document = key.map(|key| format!(" \"{}\"", value(key)));
-    let in_collection =
-        collection.map(|collection| format!(" in the collection \"{}\"", value(collection)));
+fn document_not_found<'a>(collection: Option<&str>, key: Option<&str>) -> Shown<'a> {
+    let document = key.map(|key| format!(" \"{key}\""));
+    let in_collection = collection.map(|collection| format!(" in the collection \"{collection}\""));
     let message = format!(
         "the document{} does not exist{}",
         document.unwrap_or_default(),

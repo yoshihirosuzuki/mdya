@@ -15,32 +15,16 @@ use crate::types::{CollectionName, CollectionType, EmbeddingModel, Key};
 
 use super::super::cli::CliError;
 use super::super::entry::EntryError;
-use super::super::escape::test_double::TestEscape;
 use super::super::log_progress::InvalidLogLevel;
 use super::super::mcp::McpError;
 use super::super::operations::{
     ErrorContext, ModelCacheDirUndetermined, OperationError, OutcomeAnomaly, OutputPart,
 };
 use super::super::write_lock::WriteLockError;
-use super::{ErrorReport, ExplainStyle, GatewayError, McpErrorBody, error_report};
-
-const PLAIN: ExplainStyle = ExplainStyle {
-    color: false,
-    replace_controls: false,
-};
-
-const REPLACED: ExplainStyle = ExplainStyle {
-    color: false,
-    replace_controls: true,
-};
-
-const COLORED: ExplainStyle = ExplainStyle {
-    color: true,
-    replace_controls: false,
-};
+use super::{ErrorReport, Explanation, GatewayError, McpErrorCode, error_report};
 
 fn report() -> Arc<dyn ErrorReport> {
-    error_report(Arc::new(TestEscape::new()))
+    error_report()
 }
 
 fn name(name: &str) -> CollectionName {
@@ -69,11 +53,30 @@ fn operation(error: OperationError) -> GatewayError {
     GatewayError::Operation(error)
 }
 
-fn explained(error: &GatewayError) -> String {
-    report().explain(error, PLAIN)
+/// The explanation, written as one string in the layout of the command line's
+/// error explanation, without color, so that a test reads as the user sees
+/// it. Laying out is not this submodule's job: this only makes the tests easy
+/// to read.
+fn written(explanation: &Explanation) -> String {
+    let mut text = format!("Error: {}", explanation.message);
+    if !explanation.causes.is_empty() {
+        text.push_str("\n\nCaused by:");
+        for (number, cause) in explanation.causes.iter().enumerate() {
+            text.push_str(&format!("\n    {number}: {cause}"));
+        }
+    }
+    text.push_str("\n\nHow to fix:");
+    for line in &explanation.fix {
+        text.push_str(&format!("\n    {line}"));
+    }
+    text
 }
 
-fn mcp(error: &GatewayError) -> McpErrorBody {
+fn explained(error: &GatewayError) -> String {
+    written(&report().explanation(error))
+}
+
+fn mcp(error: &GatewayError) -> McpErrorCode {
     report().mcp_error(error)
 }
 
@@ -84,8 +87,8 @@ fn details(value: serde_json::Value) -> serde_json::Map<String, serde_json::Valu
     }
 }
 
-/// Checks the exit code, the explanation, and the MCP error code and details
-/// of `error`. The MCP message is the explanation.
+/// Checks the exit code, the explanation (written as in [`written`]), and the
+/// MCP error code and details of `error`.
 fn assert_shown(
     error: GatewayError,
     exit_code: u8,
@@ -95,11 +98,14 @@ fn assert_shown(
 ) {
     let report = report();
     assert_eq!(report.exit_code(&error), exit_code, "exit code");
-    assert_eq!(report.explain(&error, PLAIN), explanation, "explanation");
-    let body = report.mcp_error(&error);
-    assert_eq!(body.code, code, "MCP code");
-    assert_eq!(body.message, explanation, "MCP message");
-    assert_eq!(body.details, details(expected_details), "MCP details");
+    assert_eq!(
+        written(&report.explanation(&error)),
+        explanation,
+        "explanation"
+    );
+    let mcp = report.mcp_error(&error);
+    assert_eq!(mcp.code, code, "MCP code");
+    assert_eq!(mcp.details, details(expected_details), "MCP details");
 }
 
 /// Checks the exit code and the MCP error code of `error`.
@@ -128,24 +134,29 @@ fn two_causes() -> TestCause {
     }
 }
 
-// The form of the explanation.
+// What the explanation holds.
 
 #[test]
-fn an_error_without_a_cause_has_the_message_then_the_fix() {
+fn an_error_without_a_cause_has_the_message_no_causes_and_the_fix() {
     let error = operation(OperationError::WriteLock(WriteLockError::InProgress));
 
     assert_eq!(
-        explained(&error),
-        "Error: another write operation is in progress\n\
-         \n\
-         How to fix:\n    \
-         Wait until the other write operation ends, then run the operation again.\n    \
-         A write operation that stopped partway (when interrupted, for example) does not keep the next one from starting."
+        report().explanation(&error),
+        Explanation {
+            message: "another write operation is in progress".to_owned(),
+            causes: Vec::new(),
+            fix: vec![
+                "Wait until the other write operation ends, then run the operation again."
+                    .to_owned(),
+                "A write operation that stopped partway (when interrupted, for example) does not keep the next one from starting."
+                    .to_owned(),
+            ],
+        }
     );
 }
 
 #[test]
-fn an_error_with_causes_lists_them_numbered_from_the_nearest() {
+fn an_error_with_causes_holds_them_from_the_nearest() {
     let error = operation(OperationError::Index {
         context: ErrorContext::default(),
         source: IndexError::CannotWrite {
@@ -153,80 +164,33 @@ fn an_error_with_causes_lists_them_numbered_from_the_nearest() {
         },
     });
 
-    assert_eq!(
-        explained(&error),
-        "Error: the index cannot be written\n\
-         \n\
-         Caused by:\n    \
-         0: the nearest cause\n    \
-         1: its cause\n\
-         \n\
-         How to fix:\n    \
-         Fix the cause shown above (free up disk space, fix the write permissions, and so on), then run the operation again."
-    );
+    let explanation = report().explanation(&error);
+
+    assert_eq!(explanation.message, "the index cannot be written");
+    assert_eq!(explanation.causes, ["the nearest cause", "its cause"]);
     assert_codes(&error, 1, "internal");
 }
 
 #[test]
-fn the_explanation_replaces_controls_in_values_and_causes_but_not_in_its_own_lines() {
+fn the_values_and_the_causes_are_kept_as_they_are() {
     let error = operation(OperationError::Index {
         context: in_collection("no\ntes"),
         source: IndexError::CannotWrite {
-            source: "disk\nfull".into(),
+            source: "disk\u{1b}full".into(),
         },
     });
     let error_with_a_name = operation(OperationError::CollectionNotFound {
-        collection: name("no\ntes"),
+        collection: name("no\u{202e}tes"),
     });
 
-    let explanation = report().explain(&error, REPLACED);
-    let with_a_name = report().explain(&error_with_a_name, REPLACED);
+    let explanation = report().explanation(&error);
+    let with_a_name = report().explanation(&error_with_a_name);
 
-    assert!(
-        explanation.contains("    0: «disk\nfull»\n"),
-        "{explanation:?}"
+    assert_eq!(explanation.causes, ["disk\u{1b}full"]);
+    assert_eq!(
+        with_a_name.message,
+        "the collection \"no\u{202e}tes\" does not exist"
     );
-    assert!(explanation.starts_with("Error: the index cannot be written\n\nCaused by:\n"));
-    assert!(explanation.ends_with(WRITE_FIX), "{explanation:?}");
-    assert!(
-        with_a_name.starts_with("Error: the collection \"«no\ntes»\" does not exist\n"),
-        "{with_a_name:?}"
-    );
-    assert!(
-        with_a_name.ends_with(COLLECTION_NOT_FOUND_FIX),
-        "{with_a_name:?}"
-    );
-}
-
-#[test]
-fn the_mcp_message_keeps_controls_and_has_no_color() {
-    let error = operation(OperationError::CollectionNotFound {
-        collection: name("no\u{1b}tes"),
-    });
-
-    let body = mcp(&error);
-
-    assert!(
-        body.message
-            .starts_with("Error: the collection \"no\u{1b}tes\" does not exist\n")
-    );
-    assert!(!body.message.contains('«'));
-}
-
-#[test]
-fn colored_headings_are_red_yellow_and_green_and_the_rest_is_not_colored() {
-    let error = operation(OperationError::Index {
-        context: ErrorContext::default(),
-        source: IndexError::CannotWrite {
-            source: "disk full".into(),
-        },
-    });
-
-    let explanation = report().explain(&error, COLORED);
-
-    assert!(explanation.starts_with("\u{1b}[31mError:\u{1b}[0m the index cannot be written\n"));
-    assert!(explanation.contains("\n\u{1b}[33mCaused by:\u{1b}[0m\n    0: disk full\n"));
-    assert!(explanation.contains("\n\u{1b}[32mHow to fix:\u{1b}[0m\n    Fix the cause"));
 }
 
 // Exit codes of operations that ended without an error.
@@ -1036,7 +1000,7 @@ fn collection_information_that_cannot_be_read_asks_to_create_the_index_again() {
 #[test]
 fn going_over_the_memory_limit_gives_the_limit_and_the_two_settings() {
     assert_eq!(
-        report().explain_memory_limit(8192, PLAIN),
+        written(&report().memory_limit_explanation(8192)),
         "Error: mdya's memory usage went over the limit of 8192 MB\n\
          \n\
          How to fix:\n    \
@@ -1092,7 +1056,7 @@ fn another_write_operation_in_progress_exits_with_1() {
 #[test]
 fn a_panic_asks_for_a_bug_report() {
     assert_eq!(
-        report().explain_panic(PLAIN),
+        written(&report().panic_explanation()),
         "Error: an unexpected failure occurred, which is a bug in mdya\n\
          \n\
          How to fix:\n    \
@@ -1101,20 +1065,11 @@ fn a_panic_asks_for_a_bug_report() {
 }
 
 #[test]
-fn a_panic_in_an_mcp_tool_call_is_internal_with_the_same_explanation() {
-    let body = report().mcp_panic_error();
+fn a_panic_in_an_mcp_tool_call_is_internal_without_details() {
+    let mcp = report().mcp_panic_error();
 
-    assert_eq!(body.code, "internal");
-    assert_eq!(body.message, report().explain_panic(PLAIN));
-    assert!(body.details.is_empty());
-}
-
-#[test]
-fn a_colored_panic_explanation_colors_its_headings() {
-    let explanation = report().explain_panic(COLORED);
-
-    assert!(explanation.starts_with("\u{1b}[31mError:\u{1b}[0m an unexpected failure"));
-    assert!(explanation.contains("\n\u{1b}[32mHow to fix:\u{1b}[0m\n"));
+    assert_eq!(mcp.code, "internal");
+    assert!(mcp.details.is_empty());
 }
 
 // Query longer than the embedding model's context length
@@ -1322,21 +1277,6 @@ fn a_collection_of_an_unknown_type_names_the_collection_and_the_type() {
     );
 }
 
-#[test]
-fn an_unknown_collection_type_is_replaced_like_other_values() {
-    let error = operation(OperationError::UnknownCollectionType {
-        collection: name("notes"),
-        collection_type: CollectionType("fu\u{202e}ture".to_owned()),
-    });
-
-    let explanation = report().explain(&error, REPLACED);
-
-    assert!(
-        explanation.contains("\"«fu\u{202e}ture»\""),
-        "{explanation:?}"
-    );
-}
-
 // Branches for errors without the values the messages name.
 
 #[test]
@@ -1408,185 +1348,6 @@ fn an_ingest_error_found_by_the_command_line_is_shown_like_the_operations_one() 
     assert_codes(&error, 1, "internal");
 }
 
-// Replacing the characters of the values from the user or the ingested data.
-
-/// Checks that, with replacement, the explanation of `error` has `wrapped`,
-/// in order, wrapped by the test escape, and nothing else wrapped: not the
-/// headings, not the message around the values, and not mdya's own text in
-/// the fix.
-fn assert_only_wrapped(error: GatewayError, wrapped: &[&str]) {
-    let explanation = report().explain(&error, REPLACED);
-    let found: Vec<&str> = explanation
-        .split('«')
-        .skip(1)
-        .filter_map(|part| part.split('»').next())
-        .collect();
-    assert_eq!(found, wrapped, "{explanation:?}");
-    assert_eq!(
-        explanation.replace(['«', '»'], ""),
-        report().explain(&error, PLAIN)
-    );
-}
-
-#[test]
-fn the_key_and_collection_name_of_a_missing_document_are_replaced() {
-    assert_only_wrapped(
-        operation(OperationError::DocumentNotFound {
-            collection: name("notes"),
-            key: key("a.md"),
-        }),
-        &["a.md", "notes"],
-    );
-}
-
-#[test]
-fn the_name_of_a_collection_that_cannot_be_updated_is_replaced() {
-    assert_only_wrapped(
-        operation(OperationError::UpdateNotSupported {
-            collection: name("memos"),
-        }),
-        &["memos"],
-    );
-}
-
-#[test]
-fn the_name_of_an_existing_collection_is_replaced() {
-    assert_only_wrapped(
-        operation(OperationError::Collection {
-            context: in_collection("notes"),
-            source: CollectionError::AlreadyExists,
-        }),
-        &["notes"],
-    );
-}
-
-#[test]
-fn a_collection_name_against_the_rules_is_replaced() {
-    assert_only_wrapped(
-        GatewayError::Cli(CliError::Collection {
-            name: name("no tes"),
-            source: CollectionError::NameInvalid,
-        }),
-        &["no tes"],
-    );
-}
-
-#[test]
-fn the_type_and_name_of_a_collection_of_an_unknown_type_are_replaced() {
-    assert_only_wrapped(
-        operation(OperationError::UnknownCollectionType {
-            collection: name("notes"),
-            collection_type: CollectionType("future".to_owned()),
-        }),
-        &["future", "notes"],
-    );
-}
-
-#[test]
-fn the_value_and_detail_of_an_invalid_log_level_are_replaced() {
-    assert_only_wrapped(
-        GatewayError::Entry(EntryError::InvalidLogLevel(InvalidLogLevel {
-            value: "loud".to_owned(),
-            detail: "error parsing level filter".to_owned(),
-        })),
-        &["loud", "error parsing level filter"],
-    );
-}
-
-#[test]
-fn the_detail_of_invalid_arguments_is_replaced() {
-    assert_only_wrapped(
-        GatewayError::Cli(CliError::Usage {
-            detail: "unexpected argument '--fast'".to_owned(),
-        }),
-        &["unexpected argument '--fast'"],
-    );
-}
-
-#[test]
-fn the_collection_type_of_missing_attributes_is_replaced() {
-    assert_only_wrapped(
-        GatewayError::Cli(CliError::Ingest {
-            collection_type: CollectionType("directory".to_owned()),
-            source: IngestError::AttributesMissingOrExtra,
-        }),
-        &["directory"],
-    );
-}
-
-#[test]
-fn the_host_of_an_address_and_the_cause_are_replaced() {
-    assert_only_wrapped(
-        GatewayError::Mcp(McpError::AddressUnavailable {
-            host: "::1".to_owned(),
-            port: 8000,
-            source: io::Error::new(io::ErrorKind::AddrInUse, "address in use"),
-        }),
-        &["::1", "address in use"],
-    );
-}
-
-#[test]
-fn the_tool_input_and_detail_are_replaced_in_the_message_and_the_fix() {
-    assert_only_wrapped(
-        GatewayError::Mcp(McpError::InvalidToolInput {
-            input: "mode".to_owned(),
-            detail: "unknown variant `fast`".to_owned(),
-        }),
-        &["mode", "unknown variant `fast`", "mode"],
-    );
-}
-
-#[test]
-fn an_unknown_setting_name_is_replaced() {
-    assert_only_wrapped(
-        GatewayError::Cli(CliError::Config(ConfigError::UnknownName {
-            name: "embeding.model".to_owned(),
-        })),
-        &["embeding.model"],
-    );
-}
-
-#[test]
-fn the_names_of_mismatched_embedding_models_are_replaced() {
-    assert_only_wrapped(model_mismatch(Some(384)), &["all-minilm", "all-minilm"]);
-}
-
-#[test]
-fn an_unsupported_file_type_is_replaced() {
-    assert_only_wrapped(
-        GatewayError::Cli(CliError::UnsupportedFileType {
-            value: "text/html".to_owned(),
-        }),
-        &["text/html"],
-    );
-}
-
-#[test]
-fn a_cause_is_replaced_but_the_message_and_the_fix_of_its_error_are_not() {
-    assert_only_wrapped(
-        operation(OperationError::Config(ConfigError::CannotWrite {
-            source: "disk full".into(),
-        })),
-        &["disk full"],
-    );
-}
-
-#[test]
-fn the_mcp_message_keeps_controls_in_the_causes() {
-    let error = operation(OperationError::Index {
-        context: ErrorContext::default(),
-        source: IndexError::CannotWrite {
-            source: "disk\u{1b}full".into(),
-        },
-    });
-
-    let body = mcp(&error);
-
-    assert!(body.message.contains("\n    0: disk\u{1b}full\n"));
-    assert!(!body.message.contains('«'));
-}
-
 // The remaining branches.
 
 #[test]
@@ -1615,38 +1376,4 @@ fn a_collection_that_cannot_be_updated_without_a_name_is_not_named() {
             .starts_with("Error: the collection is of a type that cannot be updated\n")
     );
     assert_codes(&error, 1, "internal");
-}
-
-#[test]
-fn color_and_replacement_together_color_the_headings_and_wrap_only_the_values() {
-    let error = operation(OperationError::CollectionNotFound {
-        collection: name("notes"),
-    });
-    let style = ExplainStyle {
-        color: true,
-        replace_controls: true,
-    };
-
-    let explanation = report().explain(&error, style);
-
-    assert!(
-        explanation
-            .starts_with("\u{1b}[31mError:\u{1b}[0m the collection \"«notes»\" does not exist\n"),
-        "{explanation:?}"
-    );
-    assert!(
-        explanation.ends_with(&format!(
-            "\n\u{1b}[32mHow to fix:\u{1b}[0m\n    {}",
-            COLLECTION_NOT_FOUND_FIX.trim_start_matches("\n\nHow to fix:\n    ")
-        )),
-        "{explanation:?}"
-    );
-}
-
-#[test]
-fn a_colored_memory_limit_explanation_colors_its_headings() {
-    let explanation = report().explain_memory_limit(8192, COLORED);
-
-    assert!(explanation.starts_with("\u{1b}[31mError:\u{1b}[0m mdya's memory usage"));
-    assert!(explanation.contains("\n\u{1b}[32mHow to fix:\u{1b}[0m\n"));
 }
