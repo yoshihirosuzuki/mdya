@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -149,13 +150,23 @@ enum PaceEvent {
 }
 
 /// What the hooks do at a planned call into LanceDB.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Plan {
     /// Let the call go ahead, so that a later plan for the same call is used
     /// at a later call.
     Allow,
     Fail,
     Panic,
+    /// Hold the call until the test lets it go ahead.
+    Pause(Arc<Pause>),
+}
+
+/// A planned call held by [`Plan::Pause`]: `reached` is notified when the
+/// call is reached, and the call goes ahead once `resume` is notified.
+#[derive(Debug, Default)]
+struct Pause {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 /// Hooks that record the calls into LanceDB and the pace of long
@@ -166,6 +177,7 @@ struct TestHooks {
     calls: Mutex<Vec<LanceCall>>,
     plans: Mutex<Vec<(LanceCall, Plan)>>,
     pace: Mutex<Vec<PaceEvent>>,
+    rebuilds: Mutex<Vec<DocumentRebuild>>,
 }
 
 impl TestHooks {
@@ -190,6 +202,23 @@ impl TestHooks {
         self.pace.lock().unwrap().clone()
     }
 
+    fn rebuilds(&self) -> Vec<DocumentRebuild> {
+        self.rebuilds.lock().unwrap().clone()
+    }
+
+    /// The most documents that were being rebuilt at once.
+    fn most_rebuilt_at_once(&self) -> usize {
+        let (mut now, mut most) = (0, 0);
+        for stage in self.rebuilds() {
+            match stage {
+                DocumentRebuild::Started => now += 1,
+                DocumentRebuild::Finished => now -= 1,
+            }
+            most = most.max(now);
+        }
+        most
+    }
+
     fn take_plan(&self, call: LanceCall) -> Option<Plan> {
         let mut plans = self.plans.lock().unwrap();
         let position = plans.iter().position(|(planned, _)| *planned == call)?;
@@ -204,6 +233,11 @@ impl Hooks for TestHooks {
         match self.take_plan(call) {
             Some(Plan::Fail) => Err(format!("planned failure of {call:?}").into()),
             Some(Plan::Panic) => panic!("planned panic in {call:?}"),
+            Some(Plan::Pause(pause)) => {
+                pause.reached.notify_one();
+                pause.resume.notified().await;
+                Ok(())
+            }
             Some(Plan::Allow) | None => Ok(()),
         }
     }
@@ -218,6 +252,10 @@ impl Hooks for TestHooks {
     async fn yield_now(&self) {
         self.pace.lock().unwrap().push(PaceEvent::Yielded);
         tokio::task::yield_now().await;
+    }
+
+    fn document_rebuild(&self, stage: DocumentRebuild) {
+        self.rebuilds.lock().unwrap().push(stage);
     }
 }
 
@@ -797,6 +835,15 @@ async fn tables_another_store_finished_are_opened_not_created() {
 
 // ---------------------------------------------------------------- the state of the vector columns
 
+/// Adds the new vector columns for `model` to `table`, all null, as a
+/// rebuild adds them.
+async fn add_new_columns_for(table: &lancedb::Table, name: TableName, model: &EmbeddingModel) {
+    let schema = name.new_columns_schema(model).unwrap();
+    let adding = table.add_columns();
+    let adding = adding.transform(NewColumnTransform::AllNulls(schema));
+    adding.execute().await.unwrap();
+}
+
 #[tokio::test]
 async fn new_tables_read_vectors_made_with_the_model_they_were_created_for() {
     prepare_full_text_search().await;
@@ -807,13 +854,50 @@ async fn new_tables_read_vectors_made_with_the_model_they_were_created_for() {
         .unwrap()
         .unwrap();
 
-    let state = VectorColumns::read(&tables).await.unwrap();
+    let columns = Columns::read(&tables).await.unwrap();
 
-    assert_eq!(state, VectorColumns::Ready(model(8)));
+    assert!(!columns.mid_switch());
+    assert_eq!(columns.read_model(), Some(&model(8)));
 }
 
 #[tokio::test]
-async fn a_new_vector_column_left_in_a_table_means_a_rebuild_has_not_finished() {
+async fn new_vector_columns_left_before_switching_are_not_partway_through_switching() {
+    prepare_full_text_search().await;
+    let (_data_dir, store) = store_with(&Arc::new(TestHooks::default()));
+    let tables = store
+        .tables_to_write(Some(&model(8)))
+        .await
+        .unwrap()
+        .unwrap();
+    add_new_columns_for(&tables.chunk, TableName::Chunk, &model(4)).await;
+    add_new_columns_for(&tables.document, TableName::Document, &model(4)).await;
+
+    let columns = Columns::read(&tables).await.unwrap();
+
+    assert!(!columns.mid_switch());
+    assert_eq!(columns.read_model(), Some(&model(8)));
+    assert_eq!(columns.chunk.new, Some(model(4)));
+}
+
+#[tokio::test]
+async fn new_vector_columns_left_in_the_document_table_alone_are_partway_through_switching() {
+    prepare_full_text_search().await;
+    let (_data_dir, store) = store_with(&Arc::new(TestHooks::default()));
+    let tables = store
+        .tables_to_write(Some(&model(8)))
+        .await
+        .unwrap()
+        .unwrap();
+    add_new_columns_for(&tables.document, TableName::Document, &model(8)).await;
+
+    let columns = Columns::read(&tables).await.unwrap();
+
+    assert!(columns.mid_switch());
+    assert_eq!(columns.read_model(), Some(&model(8)));
+}
+
+#[tokio::test]
+async fn a_new_vector_column_that_names_no_model_cannot_be_read() {
     prepare_full_text_search().await;
     let (_data_dir, store) = store_with(&Arc::new(TestHooks::default()));
     let tables = store
@@ -830,13 +914,13 @@ async fn a_new_vector_column_left_in_a_table_means_a_rebuild_has_not_finished() 
         .await
         .unwrap();
 
-    let state = VectorColumns::read(&tables).await.unwrap();
+    let columns = Columns::read(&tables).await;
 
-    assert_eq!(state, VectorColumns::RebuildUnfinished);
+    assert!(matches!(columns, Err(IndexError::CannotRead { .. })));
 }
 
 #[tokio::test]
-async fn a_table_without_its_vector_column_means_a_rebuild_has_not_finished() {
+async fn a_table_without_its_vector_column_is_partway_through_switching() {
     prepare_full_text_search().await;
     let (_data_dir, store) = store_with(&Arc::new(TestHooks::default()));
     let tables = store
@@ -846,13 +930,14 @@ async fn a_table_without_its_vector_column_means_a_rebuild_has_not_finished() {
         .unwrap();
     tables.document.drop_columns(&["vectors"]).await.unwrap();
 
-    let state = VectorColumns::read(&tables).await.unwrap();
+    let columns = Columns::read(&tables).await.unwrap();
 
-    assert_eq!(state, VectorColumns::RebuildUnfinished);
+    assert!(columns.mid_switch());
+    assert_eq!(columns.read_model(), None);
 }
 
 #[tokio::test]
-async fn tables_whose_vector_columns_name_different_models_mean_a_rebuild_has_not_finished() {
+async fn tables_whose_vector_columns_name_different_models_are_partway_through_switching() {
     prepare_full_text_search().await;
     let hooks = Arc::new(TestHooks::default());
     let (_data_dir, store) = store_with(&hooks);
@@ -864,9 +949,10 @@ async fn tables_whose_vector_columns_name_different_models_mean_a_rebuild_has_no
         .await
         .unwrap()
         .unwrap();
-    let state = VectorColumns::read(&tables).await.unwrap();
+    let columns = Columns::read(&tables).await.unwrap();
 
-    assert_eq!(state, VectorColumns::RebuildUnfinished);
+    assert!(columns.mid_switch());
+    assert_eq!(columns.read_model(), None);
 }
 
 #[tokio::test]
@@ -892,6 +978,51 @@ async fn a_table_without_its_vector_column_still_gets_its_other_indexes() {
     let columns: Vec<_> = indexed.iter().map(|(column, _)| column.as_str()).collect();
     assert_eq!(columns, ["body", "collection", "key"]);
     assert_eq!(hooks.count(LanceCall::CreateIndex(TableName::Document)), 0);
+}
+
+/// Document rows with only the columns that split them into runs: each
+/// with its collection name and as many chunk ranges as given.
+fn run_rows(rows: &[(&str, usize)]) -> RecordBatch {
+    let names = StringArray::from_iter_values(rows.iter().map(|(name, _)| *name));
+    let lengths: Vec<usize> = rows.iter().map(|(_, chunks)| *chunks).collect();
+    let total: usize = lengths.iter().sum();
+    let bounds: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from(vec![0_u64; total])),
+        Arc::new(UInt64Array::from(vec![1_u64; total])),
+    ];
+    let ranges = StructArray::try_new(chunk_range_fields(), bounds, None).unwrap();
+    let offsets = OffsetBuffer::from_lengths(lengths);
+    let list = ListArray::try_new(chunk_range_item(), offsets, Arc::new(ranges), None);
+    let schema = Schema::new(vec![
+        Field::new("collection", DataType::Utf8, false),
+        Field::new("chunk_ranges", DataType::List(chunk_range_item()), false),
+    ]);
+    let columns: Vec<ArrayRef> = vec![Arc::new(names), Arc::new(list.unwrap())];
+    RecordBatch::try_new(Arc::new(schema), columns).unwrap()
+}
+
+#[test]
+fn documents_are_read_in_runs_of_one_collection_bounded_by_documents_and_chunks() {
+    let most = CHUNKS_PER_READ;
+    let rows = run_rows(&[
+        ("a", 1),
+        ("a", 1),
+        // Two documents at most.
+        ("a", 1),
+        // Another collection.
+        ("b", 1),
+        // Exactly the most chunks.
+        ("b", most - 1),
+        ("b", 1),
+        ("b", 2),
+        // More chunks than the most, alone.
+        ("b", most + 1),
+        ("b", 1),
+    ]);
+
+    let runs = collection_runs(&rows, 2).unwrap();
+
+    assert_eq!(runs, [0..2, 2..3, 3..5, 5..7, 7..8, 8..9]);
 }
 
 // ---------------------------------------------------------------- comparing rows
@@ -2027,22 +2158,108 @@ async fn without_tables_an_unavailable_model_cannot_be_used() {
 }
 
 #[tokio::test]
-async fn an_unfinished_rebuild_stops_registration() {
+async fn registering_drops_the_new_columns_a_rebuild_left_before_switching() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let (data_dir, index) = index_with(embedding.clone(), &Arc::new(TestHooks::default()));
+    let first = document("a.md", ASCII_BODY);
+    register(&index, &first).await.unwrap();
+    let tables = open_tables(data_dir.path()).await;
+    add_new_columns_for(&tables.chunk, TableName::Chunk, &model(4)).await;
+    add_new_columns_for(&tables.document, TableName::Document, &model(4)).await;
+
+    let second = document("b.md", ASCII_BODY);
+    register(&index, &second).await.unwrap();
+
+    assert_tables_read(data_dir.path(), &model(8)).await;
+    assert_index_holds(data_dir.path(), &[&first, &second], &embedding).await;
+}
+
+#[tokio::test]
+async fn registering_checks_the_vector_columns_again_just_before_writing() {
+    prepare_full_text_search().await;
+    // A new document, and a document whose time alone changed.
+    for only_the_time in [false, true] {
+        let documents = documents_to_rebuild();
+        let embedding = embedding_of(MODEL_NAME, 8);
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, index) = index_over_registered(&documents, embedding, &hooks).await;
+        let other = embedding_of(OTHER_MODEL, 16);
+        let rebuild_hooks = Arc::new(TestHooks::default());
+        let rebuilder = index_in(data_dir.path(), other.clone(), &rebuild_hooks);
+        // The rebuild stops with both tables' new columns filled, before
+        // switching.
+        rebuild_hooks.plan(LanceCall::CreateIndex(TableName::Chunk), Plan::Fail);
+        // The registration is held after its check, before reading the
+        // version.
+        let pause = Arc::new(Pause::default());
+        hooks.plan(
+            LanceCall::ReadRows(TableName::Document),
+            Plan::Pause(pause.clone()),
+        );
+        let registered_now = match only_the_time {
+            false => document("added.md", MIXED_BODY),
+            true => DocumentToRegister {
+                time: Some(base_time() + Duration::from_secs(1)),
+                ..documents[0].clone()
+            },
+        };
+
+        let registering = register(&index, &registered_now);
+        let rebuilding_meanwhile = async {
+            pause.reached.notified().await;
+            rebuild(&rebuilder, false, 1).await.unwrap_err();
+            pause.resume.notify_one();
+        };
+        let both = async { tokio::join!(registering, rebuilding_meanwhile) };
+        let both = tokio::time::timeout(Duration::from_secs(30), both).await;
+        let (registered, ()) = both.expect("the functions did not finish");
+
+        // The registration dropped what the rebuild left before writing.
+        let case = format!("only the time: {only_the_time}");
+        registered.unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_tables_read(data_dir.path(), &model(8)).await;
+        if only_the_time {
+            continue;
+        }
+        // So the rebuild makes every vector again, the added document's
+        // included.
+        let rebuilt = rebuild(&rebuilder, false, 1).await;
+        let mut all: Vec<_> = documents.iter().collect();
+        all.push(&registered_now);
+        let chunks = chunk_count(&documents) + registered_now.chunks.len() as u64;
+        assert_eq!(rebuilt.unwrap(), chunks, "{case}");
+        assert_index_holds(data_dir.path(), &all, &other).await;
+    }
+}
+
+#[tokio::test]
+async fn registering_partway_through_switching_to_another_model_is_an_unfinished_rebuild() {
     prepare_full_text_search().await;
     let (data_dir, index) =
         index_with(embedding_of(MODEL_NAME, 8), &Arc::new(TestHooks::default()));
     register(&index, &document("a.md", ASCII_BODY))
         .await
         .unwrap();
-    let new_column = Schema::new(vec![Field::new("vector_new", vector_of(4), true)]);
+    // The chunk table reads vectors of another model.
     let tables = open_tables(data_dir.path()).await;
-    let adding = tables.chunk.add_columns();
-    let adding = adding.transform(NewColumnTransform::AllNulls(Arc::new(new_column)));
-    adding.execute().await.unwrap();
+    add_new_columns_for(&tables.chunk, TableName::Chunk, &model(4)).await;
+    let switch = LanceDbIndex::new(
+        data_dir.path().to_path_buf(),
+        embedding_of(MODEL_NAME, 4),
+        Arc::new(TestHooks::default()),
+    );
+    let chunk = open_tables(data_dir.path()).await.chunk;
+    switch
+        .switch_to_new_columns(&chunk, TableName::Chunk, true)
+        .await
+        .unwrap();
+    let before = index_versions(data_dir.path()).await;
 
     let result = register(&index, &document("b.md", ASCII_BODY)).await;
 
     assert!(matches!(result, Err(IndexError::RebuildIncomplete)));
+    assert_eq!(index_versions(data_dir.path()).await, before);
 }
 
 #[tokio::test]
@@ -2462,31 +2679,59 @@ async fn registering_a_long_body_computes_in_slices_and_yields_between_them() {
 
     assert_eq!(outcome, DocumentOutcome::Changed);
     assert!(body.len() > SLICE * 2);
-    let pace = hooks.pace();
-    for computation in [Computation::Hash, Computation::Compare, Computation::Build] {
+    let computations = [Computation::Hash, Computation::Compare, Computation::Build];
+    assert_computed_in_slices(&hooks.pace(), &computations);
+}
+
+#[tokio::test]
+async fn the_rows_of_rebuilt_vectors_are_built_in_slices_with_yields_between_them() {
+    let hooks = TestHooks::default();
+    let dimension = 1024;
+    let model = model_named(OTHER_MODEL, dimension);
+    // A little over three slices of vectors.
+    let count = 3 * SLICE / (dimension * size_of::<f32>()) + 1;
+    let made = ChunkEmbedding {
+        vector: vec![0.5; dimension],
+        covers_whole_chunk: true,
+    };
+    let embeddings = vec![made; count];
+
+    let mut pace = Pace::new(&hooks, Computation::Build);
+    let rows = chunk_vector_columns(&model, &embeddings, &mut pace);
+    let rows = rows.await.unwrap();
+    drop(pace);
+
+    assert_eq!(rows.num_rows(), count);
+    assert_computed_in_slices(&hooks.pace(), &[Computation::Build]);
+}
+
+/// Checks that each of `computations` was done in more than two slices, none
+/// larger than [`SLICE`], with a yield between any two slices of the same
+/// computation.
+fn assert_computed_in_slices(pace: &[PaceEvent], computations: &[Computation]) {
+    for computation in computations {
         let slices: Vec<usize> = pace
             .iter()
             .filter_map(|event| match event {
-                PaceEvent::Computed(done, len) if *done == computation => Some(*len),
+                PaceEvent::Computed(done, len) if done == computation => Some(*len),
                 _ => None,
             })
             .collect();
         assert!(slices.len() > 2, "{computation:?}");
         assert!(slices.iter().all(|len| *len <= SLICE), "{computation:?}");
     }
-    // Two slices of the same computation always have a yield between them.
-    let mut last: Option<Computation> = None;
-    for event in &pace {
+    // The computations with a slice since the last yield.
+    let mut unyielded: Vec<Computation> = Vec::new();
+    for event in pace {
         match event {
             PaceEvent::Computed(computation, _) => {
-                assert_ne!(
-                    last,
-                    Some(*computation),
-                    "no yield after a slice of {computation:?}"
+                assert!(
+                    !unyielded.contains(computation),
+                    "no yield between two slices of {computation:?}"
                 );
-                last = Some(*computation);
+                unyielded.push(*computation);
             }
-            PaceEvent::Yielded => last = None,
+            PaceEvent::Yielded => unyielded.clear(),
         }
     }
 }
@@ -2580,6 +2825,8 @@ async fn functions_that_find_no_lancedb_directory_answer_without_creating_it() {
         .await;
     let deleted_one = index.delete_document(&name(COLLECTION), &key("a.md")).await;
     let maintained = index.maintain().await;
+    let rebuilt = rebuild(&index, true, 1).await;
+    let checked = index.check_ingestable().await;
 
     assert!(!found.unwrap());
     assert!(counts.unwrap().is_empty());
@@ -2587,6 +2834,46 @@ async fn functions_that_find_no_lancedb_directory_answer_without_creating_it() {
     assert_eq!(deleted.unwrap(), 0);
     assert!(matches!(deleted_one, Err(IndexError::DocumentNotFound)));
     maintained.unwrap();
+    assert_eq!(rebuilt.unwrap(), 0);
+    checked.unwrap();
+    assert!(!data_dir.path().join("lancedb").exists());
+    assert_eq!(hooks.count(LanceCall::Connect), 0);
+}
+
+#[tokio::test]
+async fn status_without_a_lancedb_directory_is_an_empty_index_with_the_dimension_checked_as_asked()
+{
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    let compared = embedding_of(MODEL_NAME, 16);
+
+    let mut answers = Vec::new();
+    for check in [
+        DimensionCheck::Always,
+        DimensionCheck::OnlyIfSameName,
+        DimensionCheck::Never,
+    ] {
+        let status = index.status(StatusScope::All, compared.as_ref(), check);
+        answers.push(status.await.unwrap());
+    }
+
+    let dimensions: Vec<_> = answers
+        .iter()
+        .map(|status| format!("{:?}", status.compared_dimension))
+        .collect();
+    assert_eq!(dimensions, ["Known(16)", "NotChecked", "NotChecked"]);
+    for status in &answers {
+        assert_eq!(status.compared_model_name, MODEL_NAME);
+        assert!(status.models.is_empty());
+        assert!(status.collections.is_empty());
+        let counts = (
+            status.document_count,
+            status.chunk_count,
+            status.chunks_without_vector,
+        );
+        assert_eq!(counts, (0, 0, 0));
+    }
+    assert_eq!(compared.calls(), [EmbeddingCall::Model]);
     assert!(!data_dir.path().join("lancedb").exists());
     assert_eq!(hooks.count(LanceCall::Connect), 0);
 }
@@ -3078,6 +3365,55 @@ async fn deleting_different_documents_at_once_deletes_them_all() {
     assert_eq!(keys_in(data_dir.path()).await, (left.clone(), left));
 }
 
+#[tokio::test]
+async fn registering_and_deleting_at_once_write_one_function_at_a_time() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_with(embedding.clone(), &hooks);
+    let kept = document("kept.md", ASCII_BODY);
+    let deleted = document("deleted.md", ASCII_BODY);
+    let other = document_in("papers", "other.md");
+    register_all(&index, &[kept.clone(), deleted.clone(), other.clone()]).await;
+    let added = document("added.md", MIXED_BODY);
+    // The registration holds its first write until the test lets it go.
+    let pause = Arc::new(Pause::default());
+    hooks.plan(
+        LanceCall::WriteRows(TableName::Chunk),
+        Plan::Pause(pause.clone()),
+    );
+    let writes_before = hooks.count(LanceCall::WriteRows(TableName::Chunk));
+
+    let registering = register(&index, &added);
+    let (papers, keep_none) = (name("papers"), HashSet::new());
+    let deleting_meanwhile = async {
+        pause.reached.notified().await;
+        let deleting = async {
+            tokio::join!(
+                index.delete_document(&deleted.collection, &deleted.key),
+                index.delete_others(&papers, &keep_none, &[]),
+            )
+        };
+        tokio::pin!(deleting);
+        // While the registration writes, the deletions wait.
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut deleting).await;
+        let writes = hooks.count(LanceCall::WriteRows(TableName::Chunk));
+        pause.resume.notify_one();
+        (early.is_ok(), writes, deleting.await)
+    };
+    let both = async { tokio::join!(registering, deleting_meanwhile) };
+    let both = tokio::time::timeout(Duration::from_secs(30), both).await;
+    let (registered, (finished_early, writes_while_held, (deleted_one, deleted_others))) =
+        both.expect("the functions did not finish");
+
+    assert!(!finished_early);
+    assert_eq!(writes_while_held, writes_before + 1);
+    registered.unwrap();
+    deleted_one.unwrap();
+    assert_eq!(deleted_others.unwrap(), 1);
+    assert_index_holds(data_dir.path(), &[&kept, &added], &embedding).await;
+}
+
 // ---------------------------------------------------------------- the tables for `query`
 
 #[tokio::test]
@@ -3270,11 +3606,16 @@ enum OpensTablesOnly {
     DeleteOthers,
     TablesForQuery,
     Maintain,
+    Status,
+    Rebuild,
+    CheckIngestable,
 }
 
 impl OpensTablesOnly {
     /// Calls the function on the document `a.md` of [`COLLECTION`], keeping
     /// only the error. `delete_others` keeps no key, so it deletes `a.md`.
+    /// `rebuild_embeddings` makes the vectors again with the model they
+    /// were made with.
     async fn call(self, index: &LanceDbIndex) -> Result<(), IndexError> {
         let collection = name(COLLECTION);
         let key = key("a.md");
@@ -3295,6 +3636,14 @@ impl OpensTablesOnly {
             }
             Self::TablesForQuery => index.tables_for_query().await.map(drop),
             Self::Maintain => index.maintain().await,
+            Self::Status => {
+                let compared = embedding_of(MODEL_NAME, 8);
+                let status =
+                    index.status(StatusScope::All, compared.as_ref(), DimensionCheck::Never);
+                status.await.map(drop)
+            }
+            Self::Rebuild => rebuild(index, true, 1).await.map(drop),
+            Self::CheckIngestable => index.check_ingestable().await,
         }
     }
 }
@@ -3309,7 +3658,10 @@ enum ExpectedError {
 #[tokio::test]
 async fn each_failure_is_an_error_reading_or_writing_and_the_next_call_connects_again() {
     use ExpectedError::{CannotRead, CannotWrite};
-    use LanceCall::{Connect, OpenTable, Optimize, ReadRows, WriteRows};
+    use LanceCall::{
+        AddColumns, Connect, CreateIndex, DropColumns, OpenTable, Optimize, ReadRows, RebuildTable,
+        RenameColumns, WriteRows,
+    };
     use OpensTablesOnly::*;
     use TableName::{Chunk, Document};
     prepare_full_text_search().await;
@@ -3339,6 +3691,32 @@ async fn each_failure_is_an_error_reading_or_writing_and_the_next_call_connects_
         (Maintain, OpenTable(Chunk), CannotRead),
         (Maintain, Optimize(Chunk, compact), CannotWrite),
         (Maintain, Optimize(Document, index_step), CannotWrite),
+        (Status, Connect, CannotRead),
+        (Status, OpenTable(Chunk), CannotRead),
+        (Status, OpenTable(Document), CannotRead),
+        (Status, ReadRows(Chunk), CannotRead),
+        (Status, ReadRows(Document), CannotRead),
+        (Rebuild, Connect, CannotRead),
+        (Rebuild, OpenTable(Chunk), CannotRead),
+        (Rebuild, RebuildTable(RebuildTableCall::Open), CannotRead),
+        (Rebuild, RebuildTable(RebuildTableCall::Create), CannotWrite),
+        (Rebuild, ReadRows(Chunk), CannotRead),
+        (Rebuild, AddColumns(Chunk), CannotWrite),
+        (Rebuild, RebuildTable(RebuildTableCall::Add), CannotWrite),
+        (Rebuild, Optimize(Chunk, index_step), CannotWrite),
+        (Rebuild, ReadRows(Document), CannotRead),
+        (Rebuild, AddColumns(Document), CannotWrite),
+        (Rebuild, CreateIndex(Chunk), CannotWrite),
+        (Rebuild, DropColumns(Chunk), CannotWrite),
+        (Rebuild, RenameColumns(Document), CannotWrite),
+        (Rebuild, RebuildTable(RebuildTableCall::Drop), CannotWrite),
+        (CheckIngestable, Connect, CannotRead),
+        (CheckIngestable, OpenTable(Chunk), CannotRead),
+        (
+            CheckIngestable,
+            RebuildTable(RebuildTableCall::Open),
+            CannotRead,
+        ),
     ];
     let embedding = embedding_of(MODEL_NAME, 8);
     for (function, call, expected) in cases {
@@ -3362,5 +3740,1899 @@ async fn each_failure_is_an_error_reading_or_writing_and_the_next_call_connects_
         second.unwrap_or_else(|error| panic!("{case}, then: {error:?}"));
         // Nothing was held after the error, so the second call connected.
         assert_eq!(hooks.count(Connect), 2, "{case}");
+    }
+}
+
+// ---------------------------------------------------------------- the status and rebuilds: helpers
+
+/// The name of a model other than [`MODEL_NAME`].
+const OTHER_MODEL: &str = "other-model";
+
+fn model_named(name: &str, dimension: usize) -> EmbeddingModel {
+    EmbeddingModel {
+        name: name.to_owned(),
+        dimension,
+    }
+}
+
+/// Rebuilds the embedding vectors, with the progress kept nowhere.
+async fn rebuild(
+    index: &LanceDbIndex,
+    include_configured_model: bool,
+    parallelism: usize,
+) -> Result<u64, IndexError> {
+    let progress = LoggedProgress {
+        log: Arc::default(),
+    };
+    index
+        .rebuild_embeddings(include_configured_model, parallelism, &progress)
+        .await
+}
+
+async fn status_of(
+    index: &LanceDbIndex,
+    scope: StatusScope,
+    compared: &dyn Embedding,
+    check: DimensionCheck,
+) -> IndexStatus {
+    index.status(scope, compared, check).await.unwrap()
+}
+
+fn scope_of(names: &[&str]) -> StatusScope {
+    StatusScope::Collections(names.iter().map(|value| name(value)).collect())
+}
+
+/// The result of checking a dimension, without the error.
+fn dimension_of(result: &DimensionResult) -> String {
+    match result {
+        DimensionResult::Known(dimension) => format!("Known({dimension})"),
+        DimensionResult::Unavailable(_) => "Unavailable".to_owned(),
+        DimensionResult::NotChecked => "NotChecked".to_owned(),
+    }
+}
+
+/// Documents in two collections, one of them with an empty body: three in
+/// [`COLLECTION`], then one in `papers`.
+fn documents_to_rebuild() -> Vec<DocumentToRegister> {
+    vec![
+        document("a.md", ASCII_BODY),
+        document("b.md", MIXED_BODY),
+        document("empty.md", ""),
+        document_in("papers", "c.md"),
+    ]
+}
+
+fn chunk_count(documents: &[DocumentToRegister]) -> u64 {
+    let counts = documents
+        .iter()
+        .map(|document| document.chunks.len() as u64);
+    counts.sum()
+}
+
+/// A component with `embedding` and `hooks`, over a data directory where
+/// `documents` are registered with the model [`MODEL_NAME`] of dimension 8.
+async fn index_over_registered(
+    documents: &[DocumentToRegister],
+    embedding: Arc<dyn Embedding>,
+    hooks: &Arc<TestHooks>,
+) -> (tempfile::TempDir, LanceDbIndex) {
+    let writer_hooks = Arc::new(TestHooks::default());
+    let (data_dir, writer) = index_with(embedding_of(MODEL_NAME, 8), &writer_hooks);
+    register_all(&writer, documents).await;
+    let index = index_in(data_dir.path(), embedding, hooks);
+    (data_dir, index)
+}
+
+async fn column_names(table: &lancedb::Table) -> Vec<String> {
+    let schema = table.schema().await.unwrap();
+    schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect()
+}
+
+const CHUNK_COLUMNS: [&str; 8] = [
+    "collection",
+    "key",
+    "chunk_index",
+    "range_start",
+    "range_end",
+    "text",
+    "vector",
+    "covers_whole",
+];
+const DOCUMENT_COLUMNS: [&str; 7] = [
+    "collection",
+    "key",
+    "time",
+    "hash",
+    "body",
+    "chunk_ranges",
+    "vectors",
+];
+
+/// Checks that both tables in `data_dir` read vectors of `model` and have
+/// no other vector column.
+async fn assert_tables_read(data_dir: &Path, model: &EmbeddingModel) {
+    let tables = tables_as_they_are(data_dir).await;
+    assert_eq!(column_names(&tables.chunk).await, CHUNK_COLUMNS);
+    assert_eq!(column_names(&tables.document).await, DOCUMENT_COLUMNS);
+    let columns = Columns::read(&tables).await.unwrap();
+    assert_eq!(columns.read_model(), Some(model));
+    assert!(!rebuild_table_exists(data_dir).await);
+}
+
+/// Whether the table where a rebuild keeps the vectors it made is in
+/// `data_dir`.
+async fn rebuild_table_exists(data_dir: &Path) -> bool {
+    let uri = data_dir.join(LANCEDB_DIR);
+    let connection = lancedb::connect(uri.to_str().unwrap());
+    let connection = connection.execute().await.unwrap();
+    let names = connection.table_names().execute().await.unwrap();
+    names.iter().any(|name| name == REBUILD_TABLE)
+}
+
+/// The number of rows of the rebuild table in `data_dir`.
+async fn rebuild_table_rows(data_dir: &Path) -> usize {
+    let uri = data_dir.join(LANCEDB_DIR);
+    let connection = lancedb::connect(uri.to_str().unwrap());
+    let connection = connection.execute().await.unwrap();
+    let table = connection
+        .open_table(REBUILD_TABLE)
+        .execute()
+        .await
+        .unwrap();
+    table.count_rows(None).await.unwrap()
+}
+
+/// The texts `embedding` was asked to make chunk vectors of, in its calls
+/// after the first `skip`, sorted.
+fn embedded_texts(embedding: &TestEmbedding, skip: usize) -> Vec<String> {
+    let calls = embedding.calls().into_iter().skip(skip);
+    let mut texts: Vec<String> = calls
+        .flat_map(|call| match call {
+            EmbeddingCall::EmbedChunks(texts) => texts,
+            _ => Vec::new(),
+        })
+        .collect();
+    texts.sort();
+    texts
+}
+
+/// The texts of the chunks of `documents`, sorted.
+fn texts_of(documents: &[DocumentToRegister]) -> Vec<String> {
+    let texts = documents.iter().flat_map(chunk_texts);
+    let mut texts: Vec<String> = texts.map(str::to_owned).collect();
+    texts.sort();
+    texts
+}
+
+/// Holds each call to make chunk vectors until as many calls wait as
+/// `parallelism`, or until each of the `documents` has started to be
+/// rebuilt, as the hooks report. A rebuild that works on fewer documents at
+/// once than `parallelism` never gets past it.
+struct GatedEmbedding {
+    inner: Arc<TestEmbedding>,
+    hooks: Arc<TestHooks>,
+    documents: usize,
+    parallelism: usize,
+    waiting: Mutex<usize>,
+    open: tokio::sync::watch::Sender<bool>,
+}
+
+impl GatedEmbedding {
+    fn new(
+        inner: Arc<TestEmbedding>,
+        hooks: Arc<TestHooks>,
+        documents: usize,
+        parallelism: usize,
+    ) -> Self {
+        Self {
+            inner,
+            hooks,
+            documents,
+            parallelism,
+            waiting: Mutex::new(0),
+            open: tokio::sync::watch::Sender::new(false),
+        }
+    }
+
+    fn started(&self) -> usize {
+        let stages = self.hooks.rebuilds();
+        let started = stages
+            .iter()
+            .filter(|stage| **stage == DocumentRebuild::Started);
+        started.count()
+    }
+}
+
+#[async_trait]
+impl Embedding for GatedEmbedding {
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    fn max_chunks_per_call(&self) -> std::num::NonZeroUsize {
+        self.inner.max_chunks_per_call()
+    }
+
+    async fn model(&self) -> Result<EmbeddingModel, EmbeddingError> {
+        self.inner.model().await
+    }
+
+    async fn embed_chunks(&self, texts: &[&str]) -> Result<Vec<ChunkEmbedding>, EmbeddingError> {
+        {
+            let mut waiting = self.waiting.lock().unwrap();
+            *waiting += 1;
+            if *waiting >= self.parallelism || self.started() >= self.documents {
+                self.open.send_replace(true);
+            }
+        }
+        let mut open = self.open.subscribe();
+        open.wait_for(|open| *open).await.unwrap();
+        {
+            let mut waiting = self.waiting.lock().unwrap();
+            *waiting -= 1;
+            if *waiting == 0 {
+                self.open.send_replace(false);
+            }
+        }
+        self.inner.embed_chunks(texts).await
+    }
+
+    async fn embed_query(&self, query: &str) -> Result<EmbeddingVector, EmbeddingError> {
+        self.inner.embed_query(query).await
+    }
+}
+
+/// What a [`ScriptedEmbedding`] does at its planned call.
+#[derive(Clone, Copy, Debug)]
+enum Then {
+    /// Never return.
+    Stall,
+    /// Fail as when the model cannot be used.
+    Fail,
+}
+
+/// Makes chunk vectors as `inner` does, except at its `at`th call (counting
+/// from 1), where it does what `then` says.
+struct ScriptedEmbedding {
+    inner: Arc<TestEmbedding>,
+    at: usize,
+    then: Then,
+    calls: AtomicUsize,
+}
+
+impl ScriptedEmbedding {
+    fn new(inner: Arc<TestEmbedding>, at: usize, then: Then) -> Self {
+        Self {
+            inner,
+            at,
+            then,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_calls(&self, count: usize) {
+        while self.calls() < count {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+#[async_trait]
+impl Embedding for ScriptedEmbedding {
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    fn max_chunks_per_call(&self) -> std::num::NonZeroUsize {
+        self.inner.max_chunks_per_call()
+    }
+
+    async fn model(&self) -> Result<EmbeddingModel, EmbeddingError> {
+        self.inner.model().await
+    }
+
+    async fn embed_chunks(&self, texts: &[&str]) -> Result<Vec<ChunkEmbedding>, EmbeddingError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.at {
+            match self.then {
+                Then::Stall => std::future::pending::<()>().await,
+                Then::Fail => {
+                    return Err(EmbeddingError::ModelUnavailable {
+                        source: "a planned failure".into(),
+                    });
+                }
+            }
+        }
+        self.inner.embed_chunks(texts).await
+    }
+
+    async fn embed_query(&self, query: &str) -> Result<EmbeddingVector, EmbeddingError> {
+        self.inner.embed_query(query).await
+    }
+}
+
+/// Makes, for `inner`'s model name and dimension, vectors other than
+/// `inner`'s, none covering the whole chunk, as another model with the same
+/// name and dimension would.
+struct ShiftedEmbedding(Arc<TestEmbedding>);
+
+fn shifted(vector: EmbeddingVector) -> EmbeddingVector {
+    vector.into_iter().map(|value| value + 1.0).collect()
+}
+
+#[async_trait]
+impl Embedding for ShiftedEmbedding {
+    fn model_name(&self) -> &str {
+        self.0.model_name()
+    }
+
+    fn max_chunks_per_call(&self) -> std::num::NonZeroUsize {
+        self.0.max_chunks_per_call()
+    }
+
+    async fn model(&self) -> Result<EmbeddingModel, EmbeddingError> {
+        self.0.model().await
+    }
+
+    async fn embed_chunks(&self, texts: &[&str]) -> Result<Vec<ChunkEmbedding>, EmbeddingError> {
+        let made = self.0.embed_chunks(texts).await?;
+        let shift = |made: ChunkEmbedding| ChunkEmbedding {
+            vector: shifted(made.vector),
+            covers_whole_chunk: false,
+        };
+        Ok(made.into_iter().map(shift).collect())
+    }
+
+    async fn embed_query(&self, query: &str) -> Result<EmbeddingVector, EmbeddingError> {
+        self.0.embed_query(query).await
+    }
+}
+
+/// Says its model has `dimension`, but makes `inner`'s vectors, which have
+/// another.
+struct MisreportedModel {
+    inner: Arc<TestEmbedding>,
+    dimension: usize,
+}
+
+#[async_trait]
+impl Embedding for MisreportedModel {
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    fn max_chunks_per_call(&self) -> std::num::NonZeroUsize {
+        self.inner.max_chunks_per_call()
+    }
+
+    async fn model(&self) -> Result<EmbeddingModel, EmbeddingError> {
+        let model = self.inner.model().await?;
+        Ok(EmbeddingModel {
+            dimension: self.dimension,
+            ..model
+        })
+    }
+
+    async fn embed_chunks(&self, texts: &[&str]) -> Result<Vec<ChunkEmbedding>, EmbeddingError> {
+        self.inner.embed_chunks(texts).await
+    }
+
+    async fn embed_query(&self, query: &str) -> Result<EmbeddingVector, EmbeddingError> {
+        self.inner.embed_query(query).await
+    }
+}
+
+// ---------------------------------------------------------------- the status of the index
+
+#[tokio::test]
+async fn status_counts_each_collections_documents_and_chunks_with_the_model_of_their_vectors() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_over_registered(&documents, embedding.clone(), &hooks).await;
+
+    let status = status_of(
+        &index,
+        StatusScope::All,
+        embedding.as_ref(),
+        DimensionCheck::Always,
+    )
+    .await;
+
+    let (in_notes, in_papers) = (chunk_count(&documents[..3]), chunk_count(&documents[3..]));
+    let indexed = |chunk_count| ModelStatus {
+        model: model(8),
+        same_as_compared: Some(true),
+        chunk_count,
+        truncated_chunk_count: 0,
+    };
+    assert_eq!(status.compared_model_name, MODEL_NAME);
+    assert_eq!(dimension_of(&status.compared_dimension), "Known(8)");
+    assert_eq!(status.models, [indexed(in_notes + in_papers)]);
+    let collections = BTreeMap::from([
+        (name(COLLECTION), vec![indexed(in_notes)]),
+        (name("papers"), vec![indexed(in_papers)]),
+    ]);
+    assert_eq!(status.collections, collections);
+    let counts = (
+        status.document_count,
+        status.chunk_count,
+        status.chunks_without_vector,
+    );
+    assert_eq!(counts, (4, in_notes + in_papers, 0));
+    assert!(!embed_calls_made(&embedding));
+}
+
+/// Whether `embedding` was asked to make chunk vectors.
+fn embed_calls_made(embedding: &TestEmbedding) -> bool {
+    embed_calls(embedding) > 0
+}
+
+#[tokio::test]
+async fn status_of_some_collections_counts_only_theirs() {
+    prepare_full_text_search().await;
+    let mut documents = documents_to_rebuild();
+    documents.push(document_in("it's 100%", "d.md"));
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_over_registered(&documents, embedding.clone(), &hooks).await;
+    let never = DimensionCheck::Never;
+
+    let some = status_of(
+        &index,
+        scope_of(&["papers", "it's 100%"]),
+        embedding.as_ref(),
+        never,
+    );
+    let some = some.await;
+    let none = status_of(&index, scope_of(&[]), embedding.as_ref(), never).await;
+    let missing = status_of(&index, scope_of(&["missing"]), embedding.as_ref(), never).await;
+
+    let in_some = chunk_count(&documents[3..]);
+    let indexed = |chunk_count| ModelStatus {
+        model: model(8),
+        same_as_compared: None,
+        chunk_count,
+        truncated_chunk_count: 0,
+    };
+    assert_eq!(some.models, [indexed(in_some)]);
+    let collections: Vec<_> = some
+        .collections
+        .keys()
+        .map(|name| name.0.as_str())
+        .collect();
+    assert_eq!(collections, ["it's 100%", "papers"]);
+    assert_eq!((some.document_count, some.chunk_count), (2, in_some));
+    for status in [none, missing] {
+        assert!(status.models.is_empty());
+        assert!(status.collections.is_empty());
+        assert_eq!((status.document_count, status.chunk_count), (0, 0));
+    }
+}
+
+#[tokio::test]
+async fn status_counts_the_chunks_whose_vector_does_not_cover_the_whole_chunk() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let (data_dir, index) = index_with(embedding.clone(), &Arc::new(TestHooks::default()));
+    register(&index, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    let truncating = Arc::new(ShiftedEmbedding(embedding.clone()));
+    let truncating = index_in(data_dir.path(), truncating, &Arc::new(TestHooks::default()));
+    register(&truncating, &document_in("papers", "c.md"))
+        .await
+        .unwrap();
+
+    let never = DimensionCheck::Never;
+    let status = status_of(&index, StatusScope::All, embedding.as_ref(), never).await;
+
+    let counts = |status: &ModelStatus| (status.chunk_count, status.truncated_chunk_count);
+    assert_eq!(counts(&status.models[0]), (8, 4));
+    assert_eq!(counts(&status.collections[&name(COLLECTION)][0]), (4, 0));
+    assert_eq!(counts(&status.collections[&name("papers")][0]), (4, 4));
+    assert_eq!(status.chunks_without_vector, 0);
+}
+
+#[tokio::test]
+async fn status_compares_the_names_first_and_checks_the_dimension_only_as_asked() {
+    use DimensionCheck::{Always, Never, OnlyIfSameName};
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let registered = [document("a.md", ASCII_BODY)];
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let (_data_dir, index) = index_over_registered(&registered, embedding, &hooks).await;
+    let cases = [
+        (OTHER_MODEL, 16, OnlyIfSameName, "NotChecked", Some(false)),
+        (OTHER_MODEL, 16, Always, "Known(16)", Some(false)),
+        (MODEL_NAME, 16, OnlyIfSameName, "Known(16)", Some(false)),
+        (MODEL_NAME, 8, OnlyIfSameName, "Known(8)", Some(true)),
+        (MODEL_NAME, 8, Never, "NotChecked", None),
+    ];
+
+    for (compared_name, dimension, check, expected_dimension, expected_same) in cases {
+        let compared = embedding_of(compared_name, dimension);
+        let status = status_of(&index, StatusScope::All, compared.as_ref(), check).await;
+
+        let case = format!("{compared_name} of {dimension} with {check:?}");
+        assert_eq!(status.compared_model_name, compared_name, "{case}");
+        assert_eq!(
+            dimension_of(&status.compared_dimension),
+            expected_dimension,
+            "{case}"
+        );
+        assert_eq!(status.models[0].same_as_compared, expected_same, "{case}");
+        assert_eq!(status.models[0].model, model(8), "{case}");
+        let asked = compared.calls();
+        let expected_calls = match expected_dimension {
+            "NotChecked" => Vec::new(),
+            _ => vec![EmbeddingCall::Model],
+        };
+        assert_eq!(asked, expected_calls, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn status_with_a_model_that_cannot_be_checked_leaves_its_sameness_unknown() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let registered = [document("a.md", ASCII_BODY)];
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let (_data_dir, index) = index_over_registered(&registered, embedding.clone(), &hooks).await;
+    let compared = UncheckableModel(embedding);
+
+    let always = DimensionCheck::Always;
+    let status = status_of(&index, StatusScope::All, &compared, always).await;
+
+    assert_eq!(dimension_of(&status.compared_dimension), "Unavailable");
+    assert_eq!(status.models[0].same_as_compared, None);
+}
+
+#[tokio::test]
+async fn partway_through_switching_the_vector_columns_no_chunk_counts_as_having_a_vector() {
+    use LanceCall::{DropColumns, RenameColumns};
+    prepare_full_text_search().await;
+    for stop in [
+        // The chunk table lacks the column it reads.
+        RenameColumns(TableName::Chunk),
+        // The tables read columns of different models.
+        DropColumns(TableName::Document),
+        // The document table lacks the column it reads.
+        RenameColumns(TableName::Document),
+    ] {
+        let documents = documents_to_rebuild();
+        let hooks = Arc::new(TestHooks::default());
+        let other = embedding_of(OTHER_MODEL, 16);
+        let (_data_dir, index) = index_over_registered(&documents, other.clone(), &hooks).await;
+        hooks.plan(stop, Plan::Fail);
+        rebuild(&index, false, 1).await.unwrap_err();
+
+        let always = DimensionCheck::Always;
+        let status = status_of(&index, StatusScope::All, other.as_ref(), always).await;
+
+        let chunks = chunk_count(&documents);
+        assert!(status.models.is_empty(), "{stop:?}");
+        let collections = BTreeMap::from([(name(COLLECTION), vec![]), (name("papers"), vec![])]);
+        assert_eq!(status.collections, collections, "{stop:?}");
+        let counts = (
+            status.document_count,
+            status.chunk_count,
+            status.chunks_without_vector,
+        );
+        assert_eq!(counts, (4, chunks, chunks), "{stop:?}");
+    }
+}
+
+#[tokio::test]
+async fn new_vector_columns_left_by_a_rebuild_leave_the_status_of_the_columns_read() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let hooks = Arc::new(TestHooks::default());
+    let other = embedding_of(OTHER_MODEL, 16);
+    let (_data_dir, index) = index_over_registered(&documents, other.clone(), &hooks).await;
+    // Both tables have their new columns, with their values.
+    hooks.plan(LanceCall::CreateIndex(TableName::Chunk), Plan::Fail);
+    rebuild(&index, false, 1).await.unwrap_err();
+
+    let always = DimensionCheck::Always;
+    let status = status_of(&index, StatusScope::All, other.as_ref(), always).await;
+
+    let chunks = chunk_count(&documents);
+    let indexed = ModelStatus {
+        model: model(8),
+        same_as_compared: Some(false),
+        chunk_count: chunks,
+        truncated_chunk_count: 0,
+    };
+    assert_eq!(status.models, [indexed]);
+    assert_eq!(status.chunks_without_vector, 0);
+}
+
+#[tokio::test]
+async fn status_reads_the_versions_it_pinned_while_another_component_registers() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let (data_dir, writer) = index_with(embedding.clone(), &Arc::new(TestHooks::default()));
+    register(&writer, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    let hooks = Arc::new(TestHooks::default());
+    let reader = index_in(data_dir.path(), embedding.clone(), &hooks);
+    // The reader holds the tables before it is asked for the status.
+    reader
+        .has_document(&name(COLLECTION), &key("a.md"))
+        .await
+        .unwrap();
+    let pause = Arc::new(Pause::default());
+    hooks.plan(
+        LanceCall::ReadRows(TableName::Chunk),
+        Plan::Pause(pause.clone()),
+    );
+
+    let never = DimensionCheck::Never;
+    let status = reader.status(StatusScope::All, embedding.as_ref(), never);
+    let register_meanwhile = async {
+        pause.reached.notified().await;
+        register(&writer, &document("b.md", ASCII_BODY))
+            .await
+            .unwrap();
+        pause.resume.notify_one();
+    };
+    let both = async { tokio::join!(status, register_meanwhile) };
+    let both = tokio::time::timeout(Duration::from_secs(30), both).await;
+    let (status, ()) = both.expect("the status, or the work done meanwhile, did not finish");
+    let later = status_of(&reader, StatusScope::All, embedding.as_ref(), never).await;
+    // The tables the reader holds were not pinned, so it still writes.
+    register(&reader, &document("c.md", ASCII_BODY))
+        .await
+        .unwrap();
+    let after_writing = status_of(&reader, StatusScope::All, embedding.as_ref(), never).await;
+
+    let status = status.unwrap();
+    assert_eq!((status.document_count, status.chunk_count), (1, 4));
+    assert_eq!((later.document_count, later.chunk_count), (2, 8));
+    let after = (after_writing.document_count, after_writing.chunk_count);
+    assert_eq!(after, (3, 12));
+}
+
+#[tokio::test]
+async fn status_answers_the_state_before_a_rebuild_another_component_finishes_meanwhile() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, reader) = index_over_registered(&documents, embedding.clone(), &hooks).await;
+    let other = embedding_of(OTHER_MODEL, 16);
+    let rebuilder = index_in(data_dir.path(), other, &Arc::new(TestHooks::default()));
+    let pause = Arc::new(Pause::default());
+    hooks.plan(
+        LanceCall::ReadRows(TableName::Chunk),
+        Plan::Pause(pause.clone()),
+    );
+
+    let always = DimensionCheck::Always;
+    let status = reader.status(StatusScope::All, embedding.as_ref(), always);
+    let rebuild_meanwhile = async {
+        pause.reached.notified().await;
+        rebuild(&rebuilder, false, 1).await.unwrap();
+        pause.resume.notify_one();
+    };
+    let both = async { tokio::join!(status, rebuild_meanwhile) };
+    let both = tokio::time::timeout(Duration::from_secs(30), both).await;
+    let (status, ()) = both.expect("the status, or the work done meanwhile, did not finish");
+    let later = status_of(&reader, StatusScope::All, embedding.as_ref(), always).await;
+
+    let chunks = chunk_count(&documents);
+    let indexed = |model, same_as_compared| ModelStatus {
+        model,
+        same_as_compared,
+        chunk_count: chunks,
+        truncated_chunk_count: 0,
+    };
+    let status = status.unwrap();
+    assert_eq!(status.models, [indexed(model(8), Some(true))]);
+    assert_eq!(status.chunks_without_vector, 0);
+    let rebuilt = model_named(OTHER_MODEL, 16);
+    assert_eq!(later.models, [indexed(rebuilt, Some(false))]);
+}
+
+// ---------------------------------------------------------------- rebuilding the embedding vectors
+
+#[tokio::test]
+async fn rebuilding_with_another_model_makes_every_vector_with_it_and_then_reads_them() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let other = embedding_of(OTHER_MODEL, 16);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&documents, other.clone(), &hooks).await;
+
+    let rebuilt = rebuild(&index, false, 2).await;
+
+    assert_eq!(rebuilt.unwrap(), chunk_count(&documents));
+    // Each chunk's vector was made once: none when gathering the document
+    // table's vectors.
+    assert_eq!(embedded_texts(&other, 0), texts_of(&documents));
+    assert_tables_read(data_dir.path(), &model_named(OTHER_MODEL, 16)).await;
+    // The columns read keep the vector index made for the new columns. This
+    // is checked before anything that creates missing indexes.
+    let tables = tables_as_they_are(data_dir.path()).await;
+    for (table, name) in tables.each() {
+        let indexed: Vec<String> = indexed_columns(table)
+            .await
+            .into_iter()
+            .map(|(column, _)| column)
+            .collect();
+        assert!(
+            indexed.contains(&name.vector_column().to_owned()),
+            "{name:?}"
+        );
+        assert_eq!(indexed.len(), 4, "{name:?}");
+    }
+    // So a new component finds every index, and creates none.
+    let fresh_hooks = Arc::new(TestHooks::default());
+    let fresh = index_in(data_dir.path(), other.clone(), &fresh_hooks);
+    let added = document("d.md", ASCII_BODY);
+    register(&fresh, &added).await.unwrap();
+    assert_eq!(
+        fresh_hooks.count(LanceCall::CreateIndex(TableName::Chunk)),
+        0
+    );
+    assert_eq!(
+        fresh_hooks.count(LanceCall::CreateIndex(TableName::Document)),
+        0
+    );
+    let mut all: Vec<_> = documents.iter().collect();
+    all.push(&added);
+    assert_index_holds(data_dir.path(), &all, &other).await;
+}
+
+/// The points where a rebuild can stop, each with the call that fails there
+/// and the error it makes, in the order a rebuild reaches them.
+fn rebuild_stops() -> Vec<(LanceCall, ExpectedError)> {
+    use ExpectedError::{CannotRead, CannotWrite};
+    use LanceCall::{
+        AddColumns, CreateIndex, DropColumns, Optimize, ReadRows, RebuildTable, RenameColumns,
+    };
+    use TableName::{Chunk, Document};
+    vec![
+        // Nothing has changed yet.
+        (ReadRows(Chunk), CannotRead),
+        // The chunk vectors were made, and kept, but not added.
+        (AddColumns(Chunk), CannotWrite),
+        (RebuildTable(RebuildTableCall::Add), CannotWrite),
+        // The chunk table has its new columns.
+        (Optimize(Chunk, MaintenanceStep::Index), CannotWrite),
+        (AddColumns(Document), CannotWrite),
+        // Both tables have their new columns, without their indexes.
+        (CreateIndex(Chunk), CannotWrite),
+        (CreateIndex(Document), CannotWrite),
+        // Both tables have their indexed new columns, and no table has
+        // switched.
+        (DropColumns(Chunk), CannotWrite),
+        // The chunk table dropped the columns it read.
+        (RenameColumns(Chunk), CannotWrite),
+        // The chunk table reads its new columns, and the document table not.
+        (DropColumns(Document), CannotWrite),
+        // The document table dropped the columns it read too.
+        (RenameColumns(Document), CannotWrite),
+        // Both tables switched, and the rebuild table is left.
+        (RebuildTable(RebuildTableCall::Drop), CannotWrite),
+    ]
+}
+
+fn assert_error(expected: ExpectedError, result: &Result<u64, IndexError>, case: &str) {
+    match (expected, result) {
+        (ExpectedError::CannotRead, Err(IndexError::CannotRead { .. }))
+        | (ExpectedError::CannotWrite, Err(IndexError::CannotWrite { .. })) => {}
+        _ => panic!("{case}: {result:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_rebuild_stopped_at_any_step_finishes_when_called_again() {
+    prepare_full_text_search().await;
+    let other = embedding_of(OTHER_MODEL, 16);
+    for (stop, expected) in rebuild_stops() {
+        let documents = documents_to_rebuild();
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, index) = index_over_registered(&documents, other.clone(), &hooks).await;
+        hooks.plan(stop, Plan::Fail);
+
+        let stopped = rebuild(&index, false, 1).await;
+        let rebuilt = rebuild(&index, false, 1).await;
+
+        let case = format!("{stop:?}");
+        assert_error(expected, &stopped, &case);
+        // Once both tables switched, there is nothing to rebuild: the call
+        // only drops the rebuild table.
+        let expected = match stop {
+            LanceCall::RebuildTable(RebuildTableCall::Drop) => 0,
+            _ => chunk_count(&documents),
+        };
+        assert_eq!(rebuilt.unwrap(), expected, "{case}");
+        let all: Vec<_> = documents.iter().collect();
+        assert_index_holds(data_dir.path(), &all, &other).await;
+        assert_tables_read(data_dir.path(), &model_named(OTHER_MODEL, 16)).await;
+        // Nothing was held after the error, so the second call connected.
+        assert_eq!(hooks.count(LanceCall::Connect), 2, "{case}");
+    }
+}
+
+/// A component over `documents`, registered with [`MODEL_NAME`], that
+/// rebuilds with [`OTHER_MODEL`] and keeps the vectors it makes every
+/// 4 chunks: those of `a.md`, the first document, are kept once made.
+async fn index_keeping_every_4_chunks(
+    documents: &[DocumentToRegister],
+    embedding: Arc<dyn Embedding>,
+    hooks: &Arc<TestHooks>,
+) -> (tempfile::TempDir, LanceDbIndex) {
+    let (data_dir, mut index) = index_over_registered(documents, embedding, hooks).await;
+    index.kept_rows_per_commit = 4;
+    (data_dir, index)
+}
+
+#[tokio::test]
+async fn a_rebuild_that_goes_on_makes_only_the_vectors_not_kept() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    assert_eq!(documents[0].chunks.len(), 4);
+    let other = embedding_of(OTHER_MODEL, 16);
+    // The first call makes the vectors of `a.md`, and the second fails.
+    let failing = Arc::new(ScriptedEmbedding::new(other.clone(), 2, Then::Fail));
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_keeping_every_4_chunks(&documents, failing, &hooks).await;
+    let stopped = rebuild(&index, false, 1).await;
+    assert!(matches!(stopped, Err(IndexError::Embedding(_))));
+    assert_eq!(rebuild_table_rows(data_dir.path()).await, 4);
+    let calls_before = other.calls().len();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let progress = LoggedProgress { log: log.clone() };
+
+    let rebuilt = index.rebuild_embeddings(false, 1, &progress).await;
+
+    let all = chunk_count(&documents);
+    assert_eq!(rebuilt.unwrap(), all);
+    assert_eq!(
+        embedded_texts(&other, calls_before),
+        texts_of(&documents[1..])
+    );
+    let first = log.lock().unwrap()[0].clone();
+    let total = Some(all);
+    assert_eq!(first, Step::Reported(Progress { done: 4, total }));
+    let documents: Vec<_> = documents.iter().collect();
+    assert_index_holds(data_dir.path(), &documents, &other).await;
+    assert_tables_read(data_dir.path(), &model_named(OTHER_MODEL, 16)).await;
+}
+
+#[tokio::test]
+async fn vectors_kept_before_a_rebuild_was_dropped_are_not_made_again() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let other = embedding_of(OTHER_MODEL, 16);
+    // As when the process is stopped while the second call makes vectors.
+    let stalling = Arc::new(ScriptedEmbedding::new(other.clone(), 2, Then::Stall));
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) =
+        index_keeping_every_4_chunks(&documents, stalling.clone(), &hooks).await;
+    tokio::select! {
+        result = rebuild(&index, false, 1) => panic!("the rebuild finished: {result:?}"),
+        () = stalling.wait_for_calls(2) => {}
+    }
+    let calls_before = other.calls().len();
+
+    let rebuilt = rebuild(&index, false, 1).await;
+
+    assert_eq!(rebuilt.unwrap(), chunk_count(&documents));
+    assert_eq!(
+        embedded_texts(&other, calls_before),
+        texts_of(&documents[1..])
+    );
+    let documents: Vec<_> = documents.iter().collect();
+    assert_index_holds(data_dir.path(), &documents, &other).await;
+}
+
+#[tokio::test]
+async fn kept_vectors_are_dropped_when_the_chunk_table_or_the_model_changed() {
+    prepare_full_text_search().await;
+    for change_model in [false, true] {
+        let documents = documents_to_rebuild();
+        let other = embedding_of(OTHER_MODEL, 16);
+        let failing = Arc::new(ScriptedEmbedding::new(other.clone(), 2, Then::Fail));
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, index) = index_keeping_every_4_chunks(&documents, failing, &hooks).await;
+        rebuild(&index, false, 1).await.unwrap_err();
+        assert_eq!(rebuild_table_rows(data_dir.path()).await, 4);
+        let (left, embedding) = match change_model {
+            // Deleting a document makes a new version of the chunk table.
+            false => {
+                let papers = &documents[3];
+                index
+                    .delete_document(&papers.collection, &papers.key)
+                    .await
+                    .unwrap();
+                (documents[..3].to_vec(), embedding_of(OTHER_MODEL, 16))
+            }
+            true => (documents.clone(), embedding_of("third-model", 4)),
+        };
+        let again = index_in(
+            data_dir.path(),
+            embedding.clone(),
+            &Arc::new(TestHooks::default()),
+        );
+
+        let rebuilt = rebuild(&again, false, 1).await;
+
+        let case = format!("changing the model: {change_model}");
+        assert_eq!(rebuilt.unwrap(), chunk_count(&left), "{case}");
+        assert_eq!(embedded_texts(&embedding, 0), texts_of(&left), "{case}");
+        let left: Vec<_> = left.iter().collect();
+        assert_index_holds(data_dir.path(), &left, &embedding).await;
+    }
+}
+
+#[tokio::test]
+async fn maintaining_after_a_rebuild_stopped_while_making_vectors_makes_it_start_over() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let other = embedding_of(OTHER_MODEL, 16);
+    let failing = Arc::new(ScriptedEmbedding::new(other.clone(), 2, Then::Fail));
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_keeping_every_4_chunks(&documents, failing, &hooks).await;
+    rebuild(&index, false, 1).await.unwrap_err();
+    let chunk_version = || async {
+        let chunk = tables_as_they_are(data_dir.path()).await.chunk;
+        chunk.version().await.unwrap()
+    };
+    let before = chunk_version().await;
+    // As a write operation does at its end, even when it failed.
+    index.maintain().await.unwrap();
+    let after = chunk_version().await;
+    let calls_before = other.calls().len();
+
+    let rebuilt = rebuild(&index, false, 1).await;
+
+    // Maintenance merges the fragments that each registration wrote, which
+    // makes a new version of the chunk table, so the kept vectors are not
+    // used.
+    assert_ne!(after, before);
+    assert_eq!(rebuilt.unwrap(), chunk_count(&documents));
+    assert_eq!(embedded_texts(&other, calls_before), texts_of(&documents));
+    let all: Vec<_> = documents.iter().collect();
+    assert_index_holds(data_dir.path(), &all, &other).await;
+}
+
+#[tokio::test]
+async fn new_columns_left_for_another_model_are_dropped_and_the_rebuild_starts_over() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let other = embedding_of(OTHER_MODEL, 16);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&documents, other, &hooks).await;
+    // Both tables have their new columns, and the rebuild table its vectors.
+    hooks.plan(LanceCall::CreateIndex(TableName::Chunk), Plan::Fail);
+    rebuild(&index, false, 1).await.unwrap_err();
+    let third = embedding_of("third-model", 4);
+    let changed = index_in(
+        data_dir.path(),
+        third.clone(),
+        &Arc::new(TestHooks::default()),
+    );
+
+    let rebuilt = rebuild(&changed, false, 1).await;
+
+    assert_eq!(rebuilt.unwrap(), chunk_count(&documents));
+    assert_eq!(embedded_texts(&third, 0), texts_of(&documents));
+    let all: Vec<_> = documents.iter().collect();
+    assert_index_holds(data_dir.path(), &all, &third).await;
+    assert_tables_read(data_dir.path(), &model_named("third-model", 4)).await;
+}
+
+#[tokio::test]
+async fn a_rebuild_stopped_partway_through_switching_finishes_with_the_next_configured_model() {
+    use LanceCall::{DropColumns, RenameColumns};
+    use TableName::{Chunk, Document};
+    prepare_full_text_search().await;
+    let cases = [
+        // The chunk table dropped the columns it read.
+        (RenameColumns(Chunk), "third-model", 4),
+        // The chunk table reads its new columns, and the document table not.
+        (DropColumns(Document), "third-model", 4),
+        // The same, back to the model the index was made with: only the
+        // chunk table is rebuilt.
+        (DropColumns(Document), MODEL_NAME, 8),
+    ];
+    for (stop, configured_name, dimension) in cases {
+        let documents = documents_to_rebuild();
+        let other = embedding_of(OTHER_MODEL, 16);
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, index) = index_over_registered(&documents, other, &hooks).await;
+        hooks.plan(stop, Plan::Fail);
+        rebuild(&index, false, 1).await.unwrap_err();
+        let configured = embedding_of(configured_name, dimension);
+        let hooks = Arc::new(TestHooks::default());
+        let changed = index_in(data_dir.path(), configured.clone(), &hooks);
+
+        let rebuilt = rebuild(&changed, false, 1).await;
+
+        let case = format!("{stop:?}, then {configured_name}");
+        assert_eq!(rebuilt.unwrap(), chunk_count(&documents), "{case}");
+        let all: Vec<_> = documents.iter().collect();
+        assert_index_holds(data_dir.path(), &all, &configured).await;
+        let model = model_named(configured_name, dimension);
+        assert_tables_read(data_dir.path(), &model).await;
+        let document_rebuilt = hooks.count(LanceCall::AddColumns(Document)) > 0;
+        assert_eq!(document_rebuilt, configured_name != MODEL_NAME, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn a_rebuild_back_to_the_model_the_chunk_table_reads_rebuilds_the_document_table_alone() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let other = embedding_of(OTHER_MODEL, 16);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&documents, other.clone(), &hooks).await;
+    // The chunk table reads vectors of the other model.
+    hooks.plan(LanceCall::DropColumns(TableName::Document), Plan::Fail);
+    rebuild(&index, false, 1).await.unwrap_err();
+    // A rebuild with a third model drops what the other model left, and
+    // stops while making the chunk vectors.
+    let third = embedding_of("third-model", 4);
+    let failing = Arc::new(ScriptedEmbedding::new(third, 1, Then::Fail));
+    let changed = index_in(data_dir.path(), failing, &Arc::new(TestHooks::default()));
+    rebuild(&changed, false, 1).await.unwrap_err();
+    let calls_before = other.calls().len();
+    let hooks = Arc::new(TestHooks::default());
+    let back = index_in(data_dir.path(), other.clone(), &hooks);
+
+    let rebuilt = rebuild(&back, false, 1).await;
+
+    assert_eq!(rebuilt.unwrap(), chunk_count(&documents));
+    assert!(embedded_texts(&other, calls_before).is_empty());
+    assert_eq!(hooks.count(LanceCall::AddColumns(TableName::Chunk)), 0);
+    let all: Vec<_> = documents.iter().collect();
+    // The document table's vectors are the chunk table's, in chunk order.
+    assert_index_holds(data_dir.path(), &all, &other).await;
+    assert_tables_read(data_dir.path(), &model_named(OTHER_MODEL, 16)).await;
+}
+
+#[tokio::test]
+async fn new_columns_left_when_the_columns_read_are_the_configured_models_are_dropped() {
+    prepare_full_text_search().await;
+    for include_configured_model in [false, true] {
+        let documents = documents_to_rebuild();
+        let other = embedding_of(OTHER_MODEL, 16);
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, index) = index_over_registered(&documents, other, &hooks).await;
+        hooks.plan(LanceCall::CreateIndex(TableName::Chunk), Plan::Fail);
+        rebuild(&index, false, 1).await.unwrap_err();
+        let configured = embedding_of(MODEL_NAME, 8);
+        let hooks = Arc::new(TestHooks::default());
+        let back = index_in(data_dir.path(), configured.clone(), &hooks);
+
+        let rebuilt = rebuild(&back, include_configured_model, 1).await;
+
+        let case = format!("including the configured model: {include_configured_model}");
+        let (expected, texts) = match include_configured_model {
+            true => (chunk_count(&documents), texts_of(&documents)),
+            false => (0, Vec::new()),
+        };
+        assert_eq!(rebuilt.unwrap(), expected, "{case}");
+        assert_eq!(embedded_texts(&configured, 0), texts, "{case}");
+        assert_tables_read(data_dir.path(), &model(8)).await;
+        let all: Vec<_> = documents.iter().collect();
+        assert_index_holds(data_dir.path(), &all, &configured).await;
+    }
+}
+
+#[tokio::test]
+async fn rebuilding_with_the_configured_model_does_nothing_unless_asked() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&documents, embedding.clone(), &hooks).await;
+    let tables = tables_as_they_are(data_dir.path()).await;
+    let before = (
+        versions(&tables.chunk).await,
+        versions(&tables.document).await,
+    );
+
+    let rebuilt = rebuild(&index, false, 1).await;
+
+    assert_eq!(rebuilt.unwrap(), 0);
+    assert!(!embed_calls_made(&embedding));
+    let after = (
+        versions(&tables.chunk).await,
+        versions(&tables.document).await,
+    );
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn rebuilding_with_the_configured_model_when_asked_makes_every_vector_again() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let inner = embedding_of(MODEL_NAME, 8);
+    let replacing = Arc::new(ShiftedEmbedding(inner.clone()));
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&documents, replacing, &hooks).await;
+
+    let rebuilt = rebuild(&index, true, 2).await;
+
+    assert_eq!(rebuilt.unwrap(), chunk_count(&documents));
+    assert_tables_read(data_dir.path(), &model(8)).await;
+    assert_holds_shifted_vectors(data_dir.path(), &documents, &inner).await;
+    // Each table switched to new columns once.
+    assert_eq!(hooks.count(LanceCall::AddColumns(TableName::Chunk)), 1);
+    assert_eq!(hooks.count(LanceCall::AddColumns(TableName::Document)), 1);
+}
+
+/// Checks that both tables in `data_dir` hold the vectors a
+/// [`ShiftedEmbedding`] over `inner` makes for `documents`.
+async fn assert_holds_shifted_vectors(
+    data_dir: &Path,
+    documents: &[DocumentToRegister],
+    inner: &TestEmbedding,
+) {
+    for row in chunk_rows(data_dir).await {
+        let expected = shifted(inner.vector_for(&row.text));
+        assert_eq!(row.vector, Some(expected), "{}", row.key);
+        assert_eq!(row.covers_whole, Some(false), "{}", row.key);
+    }
+    for row in document_rows(data_dir).await {
+        let document = documents.iter().find(|document| document.key.0 == row.key);
+        let texts = chunk_texts(document.unwrap());
+        let expected = texts.iter().map(|text| shifted(inner.vector_for(text)));
+        let expected: Vec<_> = expected.collect();
+        let expected = (!expected.is_empty()).then_some(expected);
+        assert_eq!(row.vectors, expected, "{}", row.key);
+    }
+}
+
+#[tokio::test]
+async fn a_rebuild_with_the_configured_model_stopped_anywhere_starts_over_when_asked_again() {
+    prepare_full_text_search().await;
+    let inner = embedding_of(MODEL_NAME, 8);
+    for (stop, expected) in rebuild_stops() {
+        let documents = documents_to_rebuild();
+        let replacing = Arc::new(ShiftedEmbedding(inner.clone()));
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, index) = index_over_registered(&documents, replacing, &hooks).await;
+        hooks.plan(stop, Plan::Fail);
+        let stopped = rebuild(&index, true, 1).await;
+        let calls_before = inner.calls().len();
+
+        let rebuilt = rebuild(&index, true, 1).await;
+
+        let case = format!("{stop:?}");
+        assert_error(expected, &stopped, &case);
+        assert_eq!(rebuilt.unwrap(), chunk_count(&documents), "{case}");
+        // Nothing kept was used: every vector was made again.
+        let made = embedded_texts(&inner, calls_before);
+        assert_eq!(made, texts_of(&documents), "{case}");
+        assert_tables_read(data_dir.path(), &model(8)).await;
+        assert_holds_shifted_vectors(data_dir.path(), &documents, &inner).await;
+    }
+}
+
+#[tokio::test]
+async fn a_rebuild_with_the_configured_model_stopped_anywhere_is_finished_or_dropped_unless_asked()
+{
+    use LanceCall::{DropColumns, RenameColumns};
+    use TableName::{Chunk, Document};
+    prepare_full_text_search().await;
+    let inner = embedding_of(MODEL_NAME, 8);
+    for (stop, expected) in rebuild_stops() {
+        let documents = documents_to_rebuild();
+        let replacing = Arc::new(ShiftedEmbedding(inner.clone()));
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, index) = index_over_registered(&documents, replacing, &hooks).await;
+        hooks.plan(stop, Plan::Fail);
+        let stopped = rebuild(&index, true, 1).await;
+        let calls_before = inner.calls().len();
+
+        let rebuilt = rebuild(&index, false, 1).await;
+
+        let case = format!("{stop:?}");
+        assert_error(expected, &stopped, &case);
+        // A table lacked the column it reads only after one of these.
+        let switched = matches!(stop, RenameColumns(Chunk) | RenameColumns(Document));
+        let expected = match switched {
+            true => chunk_count(&documents),
+            false => 0,
+        };
+        assert_eq!(rebuilt.unwrap(), expected, "{case}");
+        assert!(embedded_texts(&inner, calls_before).is_empty(), "{case}");
+        assert_tables_read(data_dir.path(), &model(8)).await;
+        // Once the chunk table switched, both tables hold the new vectors.
+        let new_vectors = matches!(
+            stop,
+            RenameColumns(Chunk) | DropColumns(Document) | RenameColumns(Document)
+        ) || stop == LanceCall::RebuildTable(RebuildTableCall::Drop);
+        match new_vectors {
+            true => assert_holds_shifted_vectors(data_dir.path(), &documents, &inner).await,
+            false => {
+                let all: Vec<_> = documents.iter().collect();
+                assert_index_holds(data_dir.path(), &all, &inner).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_rebuild_passes_each_documents_chunks_in_order_a_limited_number_at_a_time_with_progress_after_each()
+ {
+    prepare_full_text_search().await;
+    let long = document(
+        "long.md",
+        "alpha beta gamma delta epsilon zeta eta theta iota",
+    );
+    let documents = [long.clone(), document("empty.md", "")];
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let inner = Arc::new(TestEmbedding::new(OTHER_MODEL, 16).with_max_chunks_per_call(3));
+    let embedding = Arc::new(LoggedEmbedding {
+        inner,
+        log: log.clone(),
+    });
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_over_registered(&documents, embedding, &hooks).await;
+    let texts: Vec<String> = chunk_texts(&long).into_iter().map(str::to_owned).collect();
+    let progress = LoggedProgress { log: log.clone() };
+
+    let rebuilt = index.rebuild_embeddings(false, 1, &progress).await;
+
+    assert_eq!(texts.len(), 7);
+    assert_eq!(rebuilt.unwrap(), 7);
+    let reported = |done| {
+        Step::Reported(Progress {
+            done,
+            total: Some(7),
+        })
+    };
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![
+            reported(0),
+            Step::EmbedStarted(texts[0..3].to_vec()),
+            Step::EmbedReturned(3),
+            Step::ChunksAdded(3),
+            reported(3),
+            Step::EmbedStarted(texts[3..6].to_vec()),
+            Step::EmbedReturned(3),
+            Step::ChunksAdded(3),
+            reported(6),
+            Step::EmbedStarted(texts[6..7].to_vec()),
+            Step::EmbedReturned(1),
+            Step::ChunksAdded(1),
+            reported(7),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_rebuild_works_on_as_many_documents_at_once_as_the_parallelism_and_one_for_0() {
+    prepare_full_text_search().await;
+    for (parallelism, at_once) in [(3, 3), (0, 1)] {
+        let documents: Vec<_> = (0..7)
+            .map(|number| document(&format!("{number}.md"), ASCII_BODY))
+            .collect();
+        let hooks = Arc::new(TestHooks::default());
+        let other = embedding_of(OTHER_MODEL, 16);
+        let gated = GatedEmbedding::new(other, hooks.clone(), documents.len(), at_once);
+        let (_data_dir, index) = index_over_registered(&documents, Arc::new(gated), &hooks).await;
+
+        let rebuilding = rebuild(&index, false, parallelism);
+        let rebuilt = tokio::time::timeout(Duration::from_secs(30), rebuilding).await;
+
+        let case = format!("parallelism {parallelism}");
+        let rebuilt = rebuilt.unwrap_or_else(|_| panic!("{case}: fewer documents at once"));
+        assert_eq!(rebuilt.unwrap(), chunk_count(&documents), "{case}");
+        assert_eq!(hooks.most_rebuilt_at_once(), at_once, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn eight_documents_rebuilt_at_once_write_every_vector() {
+    prepare_full_text_search().await;
+    let documents: Vec<_> = (0..40)
+        .map(|number| document(&format!("{number}.md"), ASCII_BODY))
+        .collect();
+    let hooks = Arc::new(TestHooks::default());
+    let other = embedding_of(OTHER_MODEL, 16);
+    // Eight documents at a time reach their writes together, so that the
+    // writes to each table overlap.
+    let gated = GatedEmbedding::new(other.clone(), hooks.clone(), documents.len(), 8);
+    let (data_dir, index) = index_over_registered(&documents, Arc::new(gated), &hooks).await;
+
+    let rebuilding = rebuild(&index, false, 8);
+    let rebuilt = tokio::time::timeout(Duration::from_secs(60), rebuilding).await;
+
+    let rebuilt = rebuilt.expect("the rebuild did not finish");
+    assert_eq!(rebuilt.unwrap(), chunk_count(&documents));
+    assert_eq!(hooks.most_rebuilt_at_once(), 8);
+    let all: Vec<_> = documents.iter().collect();
+    assert_index_holds(data_dir.path(), &all, &other).await;
+}
+
+#[tokio::test]
+async fn a_rebuild_dropped_partway_makes_no_more_calls_to_make_vectors() {
+    prepare_full_text_search().await;
+    let documents: Vec<_> = (0..4)
+        .map(|number| document(&format!("{number}.md"), ASCII_BODY))
+        .collect();
+    let other = embedding_of(OTHER_MODEL, 16);
+    let stalling = Arc::new(ScriptedEmbedding::new(other, 2, Then::Stall));
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_over_registered(&documents, stalling.clone(), &hooks).await;
+
+    tokio::select! {
+        result = rebuild(&index, false, 2) => panic!("the rebuild finished: {result:?}"),
+        () = stalling.wait_for_calls(2) => {}
+    }
+    let calls = stalling.calls();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(stalling.calls(), calls);
+}
+
+#[tokio::test]
+async fn a_rebuild_stops_when_the_model_cannot_be_used_and_goes_on_when_called_again() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let other = embedding_of(OTHER_MODEL, 16);
+    let failing = Arc::new(ScriptedEmbedding::new(other.clone(), 2, Then::Fail));
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&documents, failing.clone(), &hooks).await;
+
+    let stopped = rebuild(&index, false, 1).await;
+    let calls = failing.calls();
+    let rebuilt = rebuild(&index, false, 1).await;
+
+    assert!(matches!(stopped, Err(IndexError::Embedding(_))));
+    // It stopped at the failing call, with documents left.
+    assert_eq!(calls, 2);
+    assert_eq!(rebuilt.unwrap(), chunk_count(&documents));
+    let all: Vec<_> = documents.iter().collect();
+    assert_index_holds(data_dir.path(), &all, &other).await;
+}
+
+#[tokio::test]
+async fn a_rebuild_whose_model_cannot_be_used_writes_nothing() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let other = embedding_of(OTHER_MODEL, 16);
+    let unusable = Arc::new(UncheckableModel(other));
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&documents, unusable, &hooks).await;
+    let tables = tables_as_they_are(data_dir.path()).await;
+    let before = (
+        versions(&tables.chunk).await,
+        versions(&tables.document).await,
+    );
+
+    let rebuilt = rebuild(&index, true, 1).await;
+
+    assert!(matches!(rebuilt, Err(IndexError::Embedding(_))));
+    let after = (
+        versions(&tables.chunk).await,
+        versions(&tables.document).await,
+    );
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn vectors_of_another_dimension_than_the_model_says_stop_a_rebuild_as_an_unusable_model() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let misreported = MisreportedModel {
+        inner: embedding_of(OTHER_MODEL, 8),
+        dimension: 16,
+    };
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&documents, Arc::new(misreported), &hooks).await;
+    let before = table_versions(data_dir.path()).await;
+
+    let rebuilt = rebuild(&index, false, 1).await;
+
+    assert!(matches!(rebuilt, Err(IndexError::Embedding(_))));
+    assert_eq!(table_versions(data_dir.path()).await, before);
+}
+
+/// The versions of both tables in `data_dir`.
+async fn table_versions(data_dir: &Path) -> (Vec<u64>, Vec<u64>) {
+    let tables = tables_as_they_are(data_dir).await;
+    (
+        versions(&tables.chunk).await,
+        versions(&tables.document).await,
+    )
+}
+
+#[tokio::test]
+async fn a_rebuild_of_tables_without_chunk_rows_switches_the_columns_and_returns_0() {
+    prepare_full_text_search().await;
+    // Documents without chunks, and no document at all.
+    for delete_all in [false, true] {
+        let documents = [document("empty.md", ""), document("a.md", ASCII_BODY)];
+        let hooks = Arc::new(TestHooks::default());
+        let other = embedding_of(OTHER_MODEL, 16);
+        let (data_dir, index) = index_over_registered(&documents, other.clone(), &hooks).await;
+        let keys: HashSet<Key> = match delete_all {
+            false => keys(&["empty.md"]),
+            true => HashSet::new(),
+        };
+        index
+            .delete_others(&name(COLLECTION), &keys, &[])
+            .await
+            .unwrap();
+
+        let rebuilt = rebuild(&index, false, 1).await;
+
+        let case = format!("deleting all: {delete_all}");
+        assert_eq!(rebuilt.unwrap(), 0, "{case}");
+        assert!(!embed_calls_made(&other), "{case}");
+        assert_tables_read(data_dir.path(), &model_named(OTHER_MODEL, 16)).await;
+        let left: Vec<_> = documents[..1]
+            .iter()
+            .take(usize::from(!delete_all))
+            .collect();
+        assert_index_holds(data_dir.path(), &left, &other).await;
+    }
+}
+
+#[tokio::test]
+async fn a_failure_reading_the_rows_to_gather_the_document_vectors_from_is_an_error_reading() {
+    use LanceCall::ReadRows;
+    use TableName::{Chunk, Document};
+    prepare_full_text_search().await;
+    // The chunk rows are first counted, then read to make their vectors, then
+    // read to gather each document's; the document rows are first counted.
+    for (call, allowed) in [(ReadRows(Chunk), 2), (ReadRows(Document), 1)] {
+        let documents = documents_to_rebuild();
+        let other = embedding_of(OTHER_MODEL, 16);
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, index) = index_over_registered(&documents, other.clone(), &hooks).await;
+        for _ in 0..allowed {
+            hooks.plan(call, Plan::Allow);
+        }
+        hooks.plan(call, Plan::Fail);
+
+        let stopped = rebuild(&index, false, 1).await;
+        let rebuilt = rebuild(&index, false, 1).await;
+
+        let case = format!("{call:?}");
+        assert!(
+            matches!(stopped, Err(IndexError::CannotRead { .. })),
+            "{case}"
+        );
+        assert_eq!(rebuilt.unwrap(), chunk_count(&documents), "{case}");
+        let all: Vec<_> = documents.iter().collect();
+        assert_index_holds(data_dir.path(), &all, &other).await;
+    }
+}
+
+#[tokio::test]
+async fn a_rebuild_that_stopped_before_keeping_any_vector_goes_on_with_its_rebuild_table() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let other = embedding_of(OTHER_MODEL, 16);
+    let failing = Arc::new(ScriptedEmbedding::new(other.clone(), 1, Then::Fail));
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&documents, failing, &hooks).await;
+    rebuild(&index, false, 1).await.unwrap_err();
+    assert_eq!(rebuild_table_rows(data_dir.path()).await, 0);
+    let creates_before = hooks.count(LanceCall::RebuildTable(RebuildTableCall::Create));
+
+    let rebuilt = rebuild(&index, false, 1).await;
+
+    assert_eq!(rebuilt.unwrap(), chunk_count(&documents));
+    let creates = hooks.count(LanceCall::RebuildTable(RebuildTableCall::Create));
+    assert_eq!(creates, creates_before);
+    let all: Vec<_> = documents.iter().collect();
+    assert_index_holds(data_dir.path(), &all, &other).await;
+}
+
+#[tokio::test]
+async fn a_chunk_row_without_a_vector_leaves_its_document_without_vectors() {
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 2), &hooks);
+    let values = Arc::new(Float32Array::from(vec![0.5_f32; 4]));
+    let nulls = NullBuffer::from(vec![true, false]);
+    let vectors = FixedSizeListArray::try_new(vector_item(), 2, values, Some(nulls)).unwrap();
+    let schema = Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("chunk_index", DataType::UInt32, false),
+        Field::new("range_start", DataType::UInt64, false),
+        Field::new("range_end", DataType::UInt64, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new("vector", vector_type(2).unwrap(), true),
+    ]);
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(vec!["a.md", "a.md"])),
+        Arc::new(UInt32Array::from(vec![0, 1])),
+        Arc::new(UInt64Array::from(vec![0, 2])),
+        Arc::new(UInt64Array::from(vec![2, 4])),
+        Arc::new(StringArray::from(vec!["ab", "cd"])),
+        Arc::new(vectors),
+    ];
+    let rows = [RecordBatch::try_new(Arc::new(schema), columns).unwrap()];
+    let (found, ranges) = ([(0, 0), (0, 1)], [0..2, 2..4]);
+
+    let gathered = index.vectors_in_order(&rows, &found, &ranges, "abcd", "vector");
+
+    assert!(gathered.await.unwrap().is_none());
+}
+
+// ---------------------------------------------------------------- checking that documents can be registered
+
+#[tokio::test]
+async fn checking_an_index_of_the_configured_model_passes_and_writes_nothing() {
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&documents, embedding, &hooks).await;
+    let tables = tables_as_they_are(data_dir.path()).await;
+    let before = (
+        versions(&tables.chunk).await,
+        versions(&tables.document).await,
+    );
+
+    index.check_ingestable().await.unwrap();
+
+    let after = (
+        versions(&tables.chunk).await,
+        versions(&tables.document).await,
+    );
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn checking_with_another_model_is_a_model_mismatch_unless_only_an_unchecked_dimension_could_differ()
+ {
+    prepare_full_text_search().await;
+    /// The configured name and dimension of the model mismatch, if any.
+    type Expected<'a> = Option<(&'a str, Option<usize>)>;
+    let other = embedding_of(OTHER_MODEL, 16);
+    let same_name = embedding_of(MODEL_NAME, 16);
+    let cases: [(Arc<dyn Embedding>, Expected); 4] = [
+        (other.clone(), Some((OTHER_MODEL, Some(16)))),
+        (same_name, Some((MODEL_NAME, Some(16)))),
+        (Arc::new(UncheckableModel(other)), Some((OTHER_MODEL, None))),
+        (
+            Arc::new(UncheckableModel(embedding_of(MODEL_NAME, 8))),
+            None,
+        ),
+    ];
+    for (embedding, expected) in cases {
+        let documents = documents_to_rebuild();
+        let hooks = Arc::new(TestHooks::default());
+        let (_data_dir, index) = index_over_registered(&documents, embedding, &hooks).await;
+
+        let checked = index.check_ingestable().await;
+
+        match (expected, checked) {
+            (None, Ok(())) => {}
+            (
+                Some((expected_name, expected_dimension)),
+                Err(IndexError::ModelMismatch {
+                    configured_name,
+                    configured_dimension,
+                    indexed,
+                }),
+            ) => {
+                assert_eq!(configured_name, expected_name);
+                assert_eq!(configured_dimension, expected_dimension);
+                assert_eq!(indexed, model(8));
+            }
+            (expected, checked) => panic!("expected {expected:?}, got {checked:?}"),
+        }
+    }
+}
+
+/// The versions of both tables in `data_dir`, and whether the rebuild table
+/// is there.
+async fn index_versions(data_dir: &Path) -> (Vec<u64>, Vec<u64>, bool) {
+    let tables = tables_as_they_are(data_dir).await;
+    (
+        versions(&tables.chunk).await,
+        versions(&tables.document).await,
+        rebuild_table_exists(data_dir).await,
+    )
+}
+
+#[tokio::test]
+async fn checking_after_a_rebuild_with_another_model_stopped_before_switching() {
+    prepare_full_text_search().await;
+    for back_to_the_old_model in [false, true] {
+        let documents = documents_to_rebuild();
+        let other = embedding_of(OTHER_MODEL, 16);
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, index) = index_over_registered(&documents, other.clone(), &hooks).await;
+        // Both tables have their new columns, and the rebuild table its
+        // vectors.
+        hooks.plan(LanceCall::CreateIndex(TableName::Chunk), Plan::Fail);
+        rebuild(&index, false, 1).await.unwrap_err();
+        let before = index_versions(data_dir.path()).await;
+        let embedding = match back_to_the_old_model {
+            false => other,
+            true => embedding_of(MODEL_NAME, 8),
+        };
+        let checking = index_in(data_dir.path(), embedding, &Arc::new(TestHooks::default()));
+
+        let checked = checking.check_ingestable().await;
+
+        match back_to_the_old_model {
+            false => {
+                assert!(matches!(checked, Err(IndexError::ModelMismatch { .. })));
+                assert_eq!(index_versions(data_dir.path()).await, before);
+            }
+            true => {
+                checked.unwrap();
+                assert_tables_read(data_dir.path(), &model(8)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn checking_partway_through_switching_to_another_model_is_an_unfinished_rebuild() {
+    use LanceCall::{DropColumns, RenameColumns};
+    use TableName::{Chunk, Document};
+    prepare_full_text_search().await;
+    for stop in [RenameColumns(Chunk), DropColumns(Document)] {
+        for configured_name in [OTHER_MODEL, MODEL_NAME] {
+            let documents = documents_to_rebuild();
+            let other = embedding_of(OTHER_MODEL, 16);
+            let hooks = Arc::new(TestHooks::default());
+            let (data_dir, index) = index_over_registered(&documents, other, &hooks).await;
+            hooks.plan(stop, Plan::Fail);
+            rebuild(&index, false, 1).await.unwrap_err();
+            let before = index_versions(data_dir.path()).await;
+            let dimension = if configured_name == MODEL_NAME { 8 } else { 16 };
+            let embedding = embedding_of(configured_name, dimension);
+            let checking = index_in(data_dir.path(), embedding, &Arc::new(TestHooks::default()));
+
+            let checked = checking.check_ingestable().await;
+
+            let case = format!("{stop:?} with {configured_name}");
+            assert!(
+                matches!(checked, Err(IndexError::RebuildIncomplete)),
+                "{case}"
+            );
+            assert_eq!(index_versions(data_dir.path()).await, before, "{case}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn checking_after_a_rebuild_with_the_configured_model_stopped_drops_it_or_finishes_switching()
+{
+    use LanceCall::{CreateIndex, DropColumns, RenameColumns};
+    use TableName::{Chunk, Document};
+    prepare_full_text_search().await;
+    // Before switching, and after each step of switching.
+    let stops = [
+        (CreateIndex(Chunk), false),
+        (RenameColumns(Chunk), true),
+        (DropColumns(Document), true),
+        (RenameColumns(Document), true),
+    ];
+    for (stop, switched) in stops {
+        let documents = documents_to_rebuild();
+        let inner = embedding_of(MODEL_NAME, 8);
+        let replacing = Arc::new(ShiftedEmbedding(inner.clone()));
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, index) = index_over_registered(&documents, replacing, &hooks).await;
+        hooks.plan(stop, Plan::Fail);
+        rebuild(&index, true, 1).await.unwrap_err();
+
+        index.check_ingestable().await.unwrap();
+
+        let case = format!("{stop:?}");
+        assert_tables_read(data_dir.path(), &model(8)).await;
+        match switched {
+            true => assert_holds_shifted_vectors(data_dir.path(), &documents, &inner).await,
+            false => {
+                let all: Vec<_> = documents.iter().collect();
+                assert_index_holds(data_dir.path(), &all, &inner).await;
+            }
+        }
+        // A document registered afterwards is found by vector search. The
+        // shifted vectors all point much the same way, so which is nearest is
+        // left open: the search is limited to the document's rows.
+        let added = document("added.md", "zeta eta theta iota kappa");
+        register(&index, &added).await.unwrap();
+        let tables = open_tables(data_dir.path()).await;
+        let nearest = tables
+            .chunk
+            .query()
+            .only_if("key = 'added.md'")
+            .nearest_to(shifted(inner.vector_for("zeta eta")))
+            .unwrap()
+            .column("vector")
+            .distance_type(DistanceType::Cosine)
+            .limit(1)
+            .execute()
+            .await
+            .unwrap();
+        let nearest: Vec<RecordBatch> = nearest.try_collect().await.unwrap();
+        let found: usize = nearest.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(found, 1, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn checking_an_index_without_chunks_makes_its_vector_columns_for_the_configured_model() {
+    prepare_full_text_search().await;
+    let empty = document("empty.md", "");
+    let other = embedding_of(OTHER_MODEL, 16);
+    let hooks = Arc::new(TestHooks::default());
+    let registered = [empty.clone()];
+    let (data_dir, index) = index_over_registered(&registered, other.clone(), &hooks).await;
+
+    index.check_ingestable().await.unwrap();
+
+    assert_tables_read(data_dir.path(), &model_named(OTHER_MODEL, 16)).await;
+    assert!(!embed_calls_made(&other));
+    let added = document("a.md", ASCII_BODY);
+    register(&index, &added).await.unwrap();
+    assert_index_holds(data_dir.path(), &[&empty, &added], &other).await;
+}
+
+#[tokio::test]
+async fn checking_an_index_without_chunks_partway_through_a_rebuild_makes_its_columns_anew() {
+    prepare_full_text_search().await;
+    let registered = [document("empty.md", "")];
+    let third = embedding_of("third-model", 4);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&registered, third, &hooks).await;
+    let tables = open_tables(data_dir.path()).await;
+    let left = model_named(OTHER_MODEL, 16);
+    add_new_columns_for(&tables.chunk, TableName::Chunk, &left).await;
+
+    index.check_ingestable().await.unwrap();
+
+    assert_tables_read(data_dir.path(), &model_named("third-model", 4)).await;
+}
+
+#[tokio::test]
+async fn checking_an_index_whose_document_table_still_has_vectors_is_a_model_mismatch() {
+    prepare_full_text_search().await;
+    let registered = [document("a.md", ASCII_BODY)];
+    let other = embedding_of(OTHER_MODEL, 16);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&registered, other, &hooks).await;
+    // As when deleting the last document stopped after its chunk rows.
+    let tables = open_tables(data_dir.path()).await;
+    tables.chunk.delete("true").await.unwrap();
+
+    let checked = index.check_ingestable().await;
+
+    assert!(matches!(checked, Err(IndexError::ModelMismatch { .. })));
+    assert_tables_read(data_dir.path(), &model(8)).await;
+}
+
+#[tokio::test]
+async fn checking_an_index_whose_only_vectors_are_in_new_columns_is_an_unfinished_rebuild() {
+    prepare_full_text_search().await;
+    let registered = [document("a.md", ASCII_BODY)];
+    let other = embedding_of(OTHER_MODEL, 16);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&registered, other, &hooks).await;
+    // The chunk table drops the columns it read and keeps its new ones.
+    hooks.plan(LanceCall::RenameColumns(TableName::Chunk), Plan::Fail);
+    rebuild(&index, false, 1).await.unwrap_err();
+    // With no document row, no column that a table reads has a vector.
+    let tables = open_tables(data_dir.path()).await;
+    tables.document.delete("true").await.unwrap();
+
+    let checked = index.check_ingestable().await;
+
+    assert!(matches!(checked, Err(IndexError::RebuildIncomplete)));
+}
+
+#[tokio::test]
+async fn checking_an_index_without_chunks_needs_the_dimension_when_the_names_differ() {
+    prepare_full_text_search().await;
+    let registered = [document("empty.md", "")];
+    let cases: [(Arc<dyn Embedding>, bool); 2] = [
+        (
+            Arc::new(UncheckableModel(embedding_of(OTHER_MODEL, 16))),
+            false,
+        ),
+        (
+            Arc::new(UncheckableModel(embedding_of(MODEL_NAME, 8))),
+            true,
+        ),
+    ];
+    for (embedding, passes) in cases {
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, index) = index_over_registered(&registered, embedding, &hooks).await;
+
+        let checked = index.check_ingestable().await;
+
+        match passes {
+            true => checked.unwrap(),
+            false => assert!(matches!(checked, Err(IndexError::Embedding(_)))),
+        }
+        assert_tables_read(data_dir.path(), &model(8)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_failure_making_the_columns_of_an_index_without_chunks_is_an_error_writing() {
+    prepare_full_text_search().await;
+    let registered = [document("empty.md", "")];
+    let other = embedding_of(OTHER_MODEL, 16);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_over_registered(&registered, other, &hooks).await;
+    hooks.plan(LanceCall::AddColumns(TableName::Document), Plan::Fail);
+
+    let first = index.check_ingestable().await;
+    let second = index.check_ingestable().await;
+
+    assert!(matches!(first, Err(IndexError::CannotWrite { .. })));
+    second.unwrap();
+    assert_eq!(hooks.count(LanceCall::Connect), 2);
+    assert_tables_read(data_dir.path(), &model_named(OTHER_MODEL, 16)).await;
+}
+
+#[tokio::test]
+async fn a_failure_reading_whether_the_index_has_vectors_is_an_error_reading() {
+    prepare_full_text_search().await;
+    let registered = [document("a.md", ASCII_BODY)];
+    let other = embedding_of(OTHER_MODEL, 16);
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_over_registered(&registered, other, &hooks).await;
+    hooks.plan(LanceCall::ReadRows(TableName::Chunk), Plan::Fail);
+
+    let first = index.check_ingestable().await;
+    let second = index.check_ingestable().await;
+
+    assert!(matches!(first, Err(IndexError::CannotRead { .. })));
+    assert!(matches!(second, Err(IndexError::ModelMismatch { .. })));
+    // The tables were held when the read failed, and were dropped after it.
+    assert_eq!(hooks.count(LanceCall::Connect), 2);
+}
+
+// ---------------------------------------------------------------- chunk rows that disagree with their document row
+
+#[tokio::test]
+async fn a_rebuild_makes_every_chunk_rows_vector_and_leaves_disagreeing_documents_without_vectors()
+{
+    prepare_full_text_search().await;
+    for mismatch in MISMATCHES {
+        let added = document("a.md", ASCII_BODY);
+        let other = embedding_of(OTHER_MODEL, 16);
+        let hooks = Arc::new(TestHooks::default());
+        let registered = [added.clone()];
+        let (data_dir, index) = index_over_registered(&registered, other.clone(), &hooks).await;
+        // As a registration that stopped after writing the chunk rows can
+        // leave.
+        make_mismatch(data_dir.path(), mismatch).await;
+        let chunks = chunk_rows(data_dir.path()).await.len() as u64;
+
+        let rebuilt = rebuild(&index, false, 1).await;
+
+        let case = format!("{mismatch:?}");
+        assert_eq!(rebuilt.unwrap(), chunks, "{case}");
+        for row in chunk_rows(data_dir.path()).await {
+            assert_eq!(row.vector, Some(other.vector_for(&row.text)), "{case}");
+        }
+        let rows = document_rows(data_dir.path()).await;
+        assert_eq!(rows[0].vectors, None, "{case}");
+        // Registering the document again makes the tables agree.
+        register(&index, &added).await.unwrap();
+        assert_index_holds(data_dir.path(), &[&added], &other).await;
     }
 }
