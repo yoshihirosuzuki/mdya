@@ -8,7 +8,7 @@
 use std::sync::Mutex;
 
 use super::super::operations::OutcomeAnomaly;
-use super::{ErrorReport, ExplainStyle, GatewayError, McpErrorBody};
+use super::{ErrorReport, Explanation, GatewayError, McpErrorCode};
 
 type ExitCodeFn = dyn Fn(&GatewayError) -> u8 + Send + Sync;
 
@@ -26,11 +26,11 @@ pub(crate) struct TestErrorReport {
 pub(crate) enum ReportCall {
     ExitCode(String),
     OutcomeExitCode(Vec<OutcomeAnomaly>),
-    Explain(String, ExplainStyle),
+    Explanation(String),
     McpError(String),
-    ExplainPanic(ExplainStyle),
+    PanicExplanation,
     McpPanicError,
-    ExplainMemoryLimit(u64, ExplainStyle),
+    MemoryLimitExplanation(u64),
 }
 
 impl TestErrorReport {
@@ -57,17 +57,28 @@ impl TestErrorReport {
         self.calls.lock().unwrap().push(call);
     }
 
-    /// The explanation the double gives for `error`.
-    pub(crate) fn explanation_of(error: &GatewayError) -> String {
-        format!("explanation of {error:?}")
+    /// The explanation the double gives for `error`: a message naming the
+    /// error, one cause, and one line of the fix.
+    pub(crate) fn explanation_of(error: &GatewayError) -> Explanation {
+        explanation(format!("explanation of {error:?}"))
     }
 
     /// The explanation the double gives for an unexpected failure.
-    pub(crate) const PANIC_EXPLANATION: &'static str = "explanation of a panic";
+    pub(crate) fn panic_explanation_of() -> Explanation {
+        explanation("explanation of a panic".to_owned())
+    }
 
     /// The explanation the double gives for going over the memory limit.
-    pub(crate) fn memory_limit_explanation(limit_mb: u64) -> String {
-        format!("explanation of the memory limit of {limit_mb} MB")
+    pub(crate) fn memory_limit_explanation_of(limit_mb: u64) -> Explanation {
+        explanation(format!("explanation of the memory limit of {limit_mb} MB"))
+    }
+}
+
+fn explanation(message: String) -> Explanation {
+    Explanation {
+        message,
+        causes: vec!["a test cause".to_owned()],
+        fix: vec!["a test fix".to_owned()],
     }
 }
 
@@ -88,37 +99,35 @@ impl ErrorReport for TestErrorReport {
         u8::from(!anomalies.is_empty())
     }
 
-    fn explain(&self, error: &GatewayError, style: ExplainStyle) -> String {
-        self.record(ReportCall::Explain(format!("{error:?}"), style));
+    fn explanation(&self, error: &GatewayError) -> Explanation {
+        self.record(ReportCall::Explanation(format!("{error:?}")));
         Self::explanation_of(error)
     }
 
-    fn mcp_error(&self, error: &GatewayError) -> McpErrorBody {
+    fn mcp_error(&self, error: &GatewayError) -> McpErrorCode {
         self.record(ReportCall::McpError(format!("{error:?}")));
-        McpErrorBody {
+        McpErrorCode {
             code: "test",
-            message: Self::explanation_of(error),
             details: serde_json::Map::new(),
         }
     }
 
-    fn explain_panic(&self, style: ExplainStyle) -> String {
-        self.record(ReportCall::ExplainPanic(style));
-        Self::PANIC_EXPLANATION.to_owned()
+    fn panic_explanation(&self) -> Explanation {
+        self.record(ReportCall::PanicExplanation);
+        Self::panic_explanation_of()
     }
 
-    fn mcp_panic_error(&self) -> McpErrorBody {
+    fn mcp_panic_error(&self) -> McpErrorCode {
         self.record(ReportCall::McpPanicError);
-        McpErrorBody {
+        McpErrorCode {
             code: "internal",
-            message: Self::PANIC_EXPLANATION.to_owned(),
             details: serde_json::Map::new(),
         }
     }
 
-    fn explain_memory_limit(&self, limit_mb: u64, style: ExplainStyle) -> String {
-        self.record(ReportCall::ExplainMemoryLimit(limit_mb, style));
-        Self::memory_limit_explanation(limit_mb)
+    fn memory_limit_explanation(&self, limit_mb: u64) -> Explanation {
+        self.record(ReportCall::MemoryLimitExplanation(limit_mb));
+        Self::memory_limit_explanation_of(limit_mb)
     }
 }
 
@@ -153,63 +162,60 @@ mod tests {
     }
 
     #[test]
-    fn explain_names_the_error_and_records_the_style() {
+    fn the_explanation_names_the_error_and_the_call_is_recorded() {
         let report = TestErrorReport::new();
-        let style = ExplainStyle {
-            color: true,
-            replace_controls: true,
-        };
 
-        let explanation = report.explain(&not_found(), style);
+        let explanation = report.explanation(&not_found());
 
-        assert!(explanation.contains("CollectionNotFound"));
-        assert!(explanation.contains("notes"));
+        assert!(explanation.message.contains("CollectionNotFound"));
+        assert!(explanation.message.contains("notes"));
         assert_eq!(
             report.calls(),
-            vec![ReportCall::Explain(format!("{:?}", not_found()), style)]
+            vec![ReportCall::Explanation(format!("{:?}", not_found()))]
         );
     }
 
     #[test]
-    fn the_mcp_errors_carry_the_explanations() {
+    fn the_mcp_errors_have_a_test_code_or_internal() {
         let report = TestErrorReport::new();
 
         let error = report.mcp_error(&not_found());
         let panic = report.mcp_panic_error();
 
-        assert_eq!(error.message, TestErrorReport::explanation_of(&not_found()));
+        assert_eq!(error.code, "test");
         assert_eq!(panic.code, "internal");
-        assert_eq!(panic.message, TestErrorReport::PANIC_EXPLANATION);
-    }
-
-    #[test]
-    fn explain_panic_gives_the_panic_explanation_and_records_the_style() {
-        let report = TestErrorReport::new();
-        let style = ExplainStyle {
-            color: false,
-            replace_controls: true,
-        };
-
-        let explanation = report.explain_panic(style);
-
-        assert_eq!(explanation, TestErrorReport::PANIC_EXPLANATION);
-        assert_eq!(report.calls(), vec![ReportCall::ExplainPanic(style)]);
-    }
-
-    #[test]
-    fn explain_memory_limit_names_the_limit_and_records_the_style() {
-        let report = TestErrorReport::new();
-        let style = ExplainStyle {
-            color: true,
-            replace_controls: false,
-        };
-
-        let explanation = report.explain_memory_limit(8192, style);
-
-        assert_eq!(explanation, TestErrorReport::memory_limit_explanation(8192));
         assert_eq!(
             report.calls(),
-            vec![ReportCall::ExplainMemoryLimit(8192, style)]
+            vec![
+                ReportCall::McpError(format!("{:?}", not_found())),
+                ReportCall::McpPanicError
+            ]
+        );
+    }
+
+    #[test]
+    fn the_panic_explanation_is_the_doubles_and_the_call_is_recorded() {
+        let report = TestErrorReport::new();
+
+        let explanation = report.panic_explanation();
+
+        assert_eq!(explanation, TestErrorReport::panic_explanation_of());
+        assert_eq!(report.calls(), vec![ReportCall::PanicExplanation]);
+    }
+
+    #[test]
+    fn the_memory_limit_explanation_names_the_limit_and_the_call_is_recorded() {
+        let report = TestErrorReport::new();
+
+        let explanation = report.memory_limit_explanation(8192);
+
+        assert_eq!(
+            explanation,
+            TestErrorReport::memory_limit_explanation_of(8192)
+        );
+        assert_eq!(
+            report.calls(),
+            vec![ReportCall::MemoryLimitExplanation(8192)]
         );
     }
 }
