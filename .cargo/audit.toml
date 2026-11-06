@@ -17,6 +17,9 @@ ignore = [
     # paste (unmaintained, via datafusion -> lance)
     # https://rustsec.org/advisories/RUSTSEC-2024-0436.html
     "RUSTSEC-2024-0436",
+    # unsafe-libyaml (unmaintained, via lindera -> serde_yaml_ng)
+    # https://rustsec.org/advisories/RUSTSEC-2024-0449.html
+    "RUSTSEC-2024-0449",
     # number_prefix (unmaintained, via hf-hub -> indicatif)
     # https://rustsec.org/advisories/RUSTSEC-2025-0119.html
     "RUSTSEC-2025-0119",
