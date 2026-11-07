@@ -12,7 +12,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use super::super::LogSettings;
 use super::super::cli::LogFormat;
-use super::super::escape::Escape;
+use super::super::formatter;
 use super::fields::{EscapedFields, Layout};
 use super::lock;
 use super::pretty::PrettyFormat;
@@ -30,11 +30,10 @@ pub(super) fn set_log_receiver(settings: LogSettings) {
 /// The receiver, without setting it.
 fn log_receiver(settings: LogSettings) -> Box<dyn Subscriber + Send + Sync> {
     let screen = Arc::clone(&settings.stderr.screen);
-    let escape = Arc::clone(&settings.stderr.escape);
     let registry = tracing_subscriber::registry().with(settings.filter.env_filter());
-    let plain = || LogWriter {
+    let writer = |json| LogWriter {
         screen: Arc::clone(&screen),
-        json_escape: None,
+        json,
     };
     match settings.format {
         LogFormat::Compact => Box::new(
@@ -42,8 +41,8 @@ fn log_receiver(settings: LogSettings) -> Box<dyn Subscriber + Send + Sync> {
                 fmt::layer()
                     .compact()
                     .with_ansi(settings.color)
-                    .fmt_fields(EscapedFields::new(escape, Layout::Compact))
-                    .with_writer(plain()),
+                    .fmt_fields(EscapedFields::new(Layout::Compact))
+                    .with_writer(writer(false)),
             ),
         ),
         LogFormat::Pretty => Box::new(
@@ -51,47 +50,62 @@ fn log_receiver(settings: LogSettings) -> Box<dyn Subscriber + Send + Sync> {
                 fmt::layer()
                     .with_ansi(settings.color)
                     .event_format(PrettyFormat::new(SystemTime))
-                    .fmt_fields(EscapedFields::new(escape, Layout::Pretty))
-                    .with_writer(plain()),
+                    .fmt_fields(EscapedFields::new(Layout::Pretty))
+                    .with_writer(writer(false)),
             ),
         ),
-        LogFormat::Json => Box::new(registry.with(
-            fmt::layer().json().with_ansi(false).with_writer(LogWriter {
-                screen: Arc::clone(&screen),
-                json_escape: Some(escape),
-            }),
-        )),
+        LogFormat::Json => Box::new(
+            registry.with(
+                fmt::layer()
+                    .json()
+                    .with_ansi(false)
+                    .with_writer(writer(true)),
+            ),
+        ),
     }
 }
 
-/// Makes the writer of each log: the shared stderr, behind the JSON escapes
-/// in the JSON log format. tracing-subscriber writes a whole log, ending in a
-/// line break, at once and drops the writer without flushing it; dropping the
-/// JSON escapes writes what they hold, and they hold nothing after a line
-/// break.
+/// Makes the writer of each log: the shared stderr.
 struct LogWriter {
     screen: Arc<Mutex<Screen>>,
-    json_escape: Option<Arc<dyn Escape>>,
+    /// Whether the logs are written as JSON.
+    json: bool,
 }
 
 impl<'a> MakeWriter<'a> for LogWriter {
-    type Writer = Box<dyn Write + Send>;
+    type Writer = LogLine;
 
     fn make_writer(&'a self) -> Self::Writer {
-        let line = Box::new(LogLine(Arc::clone(&self.screen)));
-        match &self.json_escape {
-            Some(escape) => escape.json_writer(line),
-            None => line,
+        LogLine {
+            screen: Arc::clone(&self.screen),
+            json: self.json,
         }
     }
 }
 
-/// The writer of one log. tracing-subscriber writes a whole log at once.
-struct LogLine(Arc<Mutex<Screen>>);
+/// The writer of one log. tracing-subscriber writes a whole log, ending in a
+/// line break, with one `write_all`, and `write` takes all of it, so one
+/// `write` holds a whole log. A log written as JSON has the characters that
+/// change the direction of text escaped, by the formatter's rule on
+/// characters; the escaping sees the whole log, and so no character in two
+/// parts.
+struct LogLine {
+    screen: Arc<Mutex<Screen>>,
+    json: bool,
+}
 
 impl Write for LogLine {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        lock(&self.0).write(buf)?;
+        if self.json {
+            // tracing-subscriber writes a `String`, so this borrows it
+            // unchanged. Bytes that are not UTF-8 would become U+FFFD, and
+            // so could not hold a character to escape in two parts.
+            let log = String::from_utf8_lossy(buf);
+            let escaped = formatter::escape_direction_characters(&log);
+            lock(&self.screen).write(escaped.as_bytes())?;
+        } else {
+            lock(&self.screen).write(buf)?;
+        }
         Ok(buf.len())
     }
 
@@ -108,26 +122,19 @@ mod tests {
 
     use super::*;
     use crate::gateway::cli::LogFormat;
-    use crate::gateway::escape::test_double::{EscapeCall, TestEscape};
     use crate::gateway::log_progress::lock;
     use crate::gateway::log_progress::{SharedStderr, log_filter, shared_stderr};
     use crate::gateway::test_double::captured::CapturedOutput;
 
     struct Receiver {
         output: CapturedOutput,
-        escape: Arc<TestEscape>,
         stderr: Arc<SharedStderr>,
     }
 
     fn receiver() -> Receiver {
         let output = CapturedOutput::new();
-        let escape = Arc::new(TestEscape::new());
-        let stderr = shared_stderr(Box::new(output.clone()), None, escape.clone());
-        Receiver {
-            output,
-            escape,
-            stderr,
-        }
+        let stderr = shared_stderr(Box::new(output.clone()), None);
+        Receiver { output, stderr }
     }
 
     impl Receiver {
@@ -152,12 +159,19 @@ mod tests {
     }
 
     #[test]
-    fn the_compact_format_writes_a_line_with_the_values_through_the_replacement() {
-        let text = receiver().written(LogFormat::Compact, false, "warn", || warn!("skipped"));
+    fn the_compact_format_writes_a_line_with_the_values_replaced() {
+        let text = receiver().written(
+            LogFormat::Compact,
+            false,
+            "warn",
+            || warn!(path = %"a\u{1b}b", "skipped"),
+        );
 
         let line = text.strip_suffix('\n').unwrap();
         assert!(
-            line.ends_with(" WARN mdya::gateway::log_progress::receiver::tests: «skipped»"),
+            line.ends_with(
+                " WARN mdya::gateway::log_progress::receiver::tests: skipped path=a\\u{1b}b"
+            ),
             "{text:?}"
         );
     }
@@ -175,7 +189,7 @@ mod tests {
             debug!("opened")
         });
 
-        assert!(text.contains("«opened»"), "{text:?}");
+        assert!(text.contains(": opened\n"), "{text:?}");
     }
 
     /// A record of the `log` crate, at warn, from `target`, handed to the
@@ -199,7 +213,7 @@ mod tests {
         });
 
         assert!(!text.contains("lance::io"), "{text:?}");
-        assert!(text.contains("datafusion::sql: «opened»"), "{text:?}");
+        assert!(text.contains("datafusion::sql: opened"), "{text:?}");
     }
 
     #[test]
@@ -207,30 +221,43 @@ mod tests {
         let text = receiver().written(LogFormat::Pretty, false, "warn", || warn!("skipped"));
 
         assert!(
-            text.contains(&format!("«skipped»\n    at {}:", file!())),
+            text.contains(&format!("skipped\n    at {}:", file!())),
             "{text:?}"
         );
     }
 
     #[test]
-    fn the_json_format_writes_through_the_json_escapes() {
-        let receiver = receiver();
-
-        let text = receiver.written(LogFormat::Json, false, "warn", || {
-            warn!(key = "a", "skipped")
-        });
+    fn the_json_format_escapes_the_direction_characters_and_no_other_character() {
+        let text = receiver().written(
+            LogFormat::Json,
+            false,
+            "warn",
+            || warn!(key = %"a\u{202e}b\u{7f}\u{9b}c\u{1b}", "skipped"),
+        );
 
         let log: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(log["fields"]["message"], "skipped");
-        assert_eq!(log["fields"]["key"], "a");
-        assert!(receiver.escape.calls().contains(&EscapeCall::JsonWriter));
-        assert!(
-            !receiver
-                .escape
-                .calls()
-                .iter()
-                .any(|call| matches!(call, EscapeCall::ReplaceControls(_)))
-        );
+        assert_eq!(log["fields"]["key"], "a\u{202e}b\u{7f}\u{9b}c\u{1b}");
+        // The escapes, each a backslash and `u` with four digits, built here
+        // so that this file holds no such escape.
+        let escaped = format!("a{0}u202eb\u{7f}\u{9b}c{0}u001b", '\\');
+        assert!(text.contains(&escaped), "{text:?}");
+        assert!(text.ends_with('\n'), "{text:?}");
+    }
+
+    #[test]
+    fn a_json_log_written_in_two_parts_inside_a_character_does_not_hold_it() {
+        let receiver = receiver();
+        let mut line = LogLine {
+            screen: Arc::clone(&receiver.stderr.screen),
+            json: true,
+        };
+
+        // U+202E is E2 80 AE in UTF-8; the first part ends inside it.
+        line.write_all(b"{\"a\":\"b\xe2\x80").unwrap();
+        line.write_all(b"\xaec\"}\n").unwrap();
+
+        assert_eq!(receiver.output.text(), "{\"a\":\"b\u{fffd}\u{fffd}c\"}\n");
     }
 
     #[test]
@@ -252,6 +279,6 @@ mod tests {
         let text = receiver.written(LogFormat::Compact, false, "warn", || warn!("skipped"));
 
         assert!(text.starts_with("\r3/10\r    \r"), "{text:?}");
-        assert!(text.ends_with("«skipped»\n\r3/10"), "{text:?}");
+        assert!(text.ends_with(": skipped\n\r3/10"), "{text:?}");
     }
 }

@@ -1,18 +1,20 @@
 //! Writes logs, messages, and progress to stderr, so that a log or a message
 //! written while the one-line progress display is on screen does not break
-//! it.
+//! it. Also writes what the libraries that mdya uses write to the process's
+//! stdout as warnings in the logs.
 
 #![expect(dead_code, reason = "the rest of `gateway` does not use these yet")]
 
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::LogSettings;
-use super::escape::Escape;
 use super::operations::GatewayProgressSink;
 use progress::StderrProgress;
 use screen::Screen;
+
+pub(crate) use stdout_pipe::StdoutLogging;
 
 mod fields;
 mod filter;
@@ -21,6 +23,7 @@ mod progress;
 mod progress_text;
 mod receiver;
 mod screen;
+mod stdout_pipe;
 #[cfg(test)]
 pub(crate) mod test_double;
 
@@ -106,7 +109,6 @@ pub(crate) fn stderr_width() -> Option<usize> {
 pub(crate) struct SharedStderr {
     screen: Arc<Mutex<Screen>>,
     terminal: Option<MeasureWidth>,
-    escape: Arc<dyn Escape>,
 }
 
 impl Console for SharedStderr {
@@ -129,12 +131,10 @@ impl Console for SharedStderr {
 pub(crate) fn shared_stderr(
     stderr: Box<dyn Write + Send>,
     terminal: Option<MeasureWidth>,
-    escape: Arc<dyn Escape>,
 ) -> Arc<SharedStderr> {
     Arc::new(SharedStderr {
         screen: Arc::new(Mutex::new(Screen::new(stderr))),
         terminal,
-        escape,
     })
 }
 
@@ -150,16 +150,26 @@ pub(crate) fn set_log_receiver(settings: LogSettings) {
     receiver::set_log_receiver(settings);
 }
 
+/// Starts writing what the libraries write to the process's stdout as
+/// warnings in the logs, line by line, through the log receiver. `pipe` is
+/// the reading end of the pipe on the process's stdout. Reading `pipe` never
+/// waits on the logs: up to 256 lines of up to 4096 bytes each, as read, are
+/// kept for the logs, a longer line is kept and written in parts, and the
+/// lines read while 256 are kept are dropped, with a warning that says how
+/// many. Runs on two threads of its own; an error if they cannot be started.
+pub(crate) fn log_stdout(pipe: impl Read + Send + 'static) -> io::Result<StdoutLogging> {
+    stdout_pipe::log_stdout(pipe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::escape::test_double::TestEscape;
     use crate::gateway::test_double::captured::CapturedOutput;
 
     #[test]
     fn a_message_is_written_to_stderr_as_it_is() {
         let output = CapturedOutput::new();
-        let stderr = shared_stderr(Box::new(output.clone()), None, Arc::new(TestEscape::new()));
+        let stderr = shared_stderr(Box::new(output.clone()), None);
 
         stderr.write_stderr("Updated notes.\n");
 
@@ -168,11 +178,7 @@ mod tests {
 
     fn progress_shown(terminal: Option<MeasureWidth>) -> String {
         let output = CapturedOutput::new();
-        let stderr = shared_stderr(
-            Box::new(output.clone()),
-            terminal,
-            Arc::new(TestEscape::new()),
-        );
+        let stderr = shared_stderr(Box::new(output.clone()), terminal);
 
         let display = stderr.start_progress(ProgressKind::Update);
         let shown = output.text();

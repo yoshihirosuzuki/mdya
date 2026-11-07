@@ -1,7 +1,8 @@
 //! Which characters each output format writes in another form: in the
-//! human-readable output, the control characters and the characters that
-//! change the direction of text are replaced with visible forms; in the
-//! command line's JSON, the characters that change the direction of text are
+//! human-readable output and in the logs not written as JSON, the control
+//! characters and the characters that change the direction of text are
+//! replaced with visible forms; in the command line's JSON and in the logs
+//! written as JSON, the characters that change the direction of text are
 //! escaped, in addition to the escapes JSON itself requires.
 
 use std::borrow::Cow;
@@ -33,9 +34,9 @@ pub(crate) fn replace_controls(text: &str) -> Cow<'_, str> {
 /// of the code point. They can appear only inside strings, as everything else
 /// in JSON is ASCII (RFC 8259, section 2), so the JSON reads as the same
 /// value.
-pub(super) fn escape_direction_characters(json: String) -> String {
+pub(crate) fn escape_direction_characters(json: &str) -> Cow<'_, str> {
     if !json.chars().any(changes_direction) {
-        return json;
+        return Cow::Borrowed(json);
     }
     let mut escaped = String::with_capacity(json.len() + 8);
     for c in json.chars() {
@@ -45,7 +46,7 @@ pub(super) fn escape_direction_characters(json: String) -> String {
             escaped.push(c);
         }
     }
-    escaped
+    Cow::Owned(escaped)
 }
 
 /// Whether `c` is replaced. `char::is_control` is the Cc category.

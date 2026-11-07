@@ -158,13 +158,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use tracing::{info_span, warn};
     use tracing_log::log;
 
     use super::*;
-    use crate::gateway::escape::test_double::{EscapeCall, TestEscape};
     use crate::gateway::log_progress::fields::{EscapedFields, Layout};
     use crate::gateway::test_double::captured::CapturedOutput;
 
@@ -177,33 +174,33 @@ mod tests {
     }
 
     /// What the pretty format writes for the logs that `make_logs` makes.
-    fn written(ansi: bool, escape: Arc<TestEscape>, make_logs: impl FnOnce()) -> String {
+    fn written(ansi: bool, make_logs: impl FnOnce()) -> String {
         let output = CapturedOutput::new();
         let writer = output.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || writer.clone())
             .with_ansi(ansi)
             .event_format(PrettyFormat::new(FixedTime))
-            .fmt_fields(EscapedFields::new(escape, Layout::Pretty))
+            .fmt_fields(EscapedFields::new(Layout::Pretty))
             .finish();
         tracing::subscriber::with_default(subscriber, make_logs);
         output.text()
     }
 
     fn pretty(make_logs: impl FnOnce()) -> String {
-        written(false, Arc::new(TestEscape::new()), make_logs)
+        written(false, make_logs)
     }
 
     const TARGET: &str = "mdya::gateway::log_progress::pretty::tests";
 
     #[test]
-    fn a_log_is_written_over_lines_with_the_values_through_the_replacement() {
-        let (text, line) = (pretty(|| warn!(key = "a", "skipped")), line!());
+    fn a_log_is_written_over_lines_with_the_values_replaced() {
+        let (text, line) = (pretty(|| warn!(key = %"a\nb", "skipped")), line!());
 
         assert_eq!(
             text,
             format!(
-                "  2026-11-02T09:00:00.000000Z  WARN {TARGET}: «skipped», key: «\"a\"»\n    at {}:{line}\n\n",
+                "  2026-11-02T09:00:00.000000Z  WARN {TARGET}: skipped, key: a\\nb\n    at {}:{line}\n\n",
                 file!()
             )
         );
@@ -212,7 +209,7 @@ mod tests {
     #[test]
     fn the_spans_are_written_from_the_innermost_with_their_values() {
         let text = pretty(|| {
-            let _outer = info_span!("update", collection = "notes").entered();
+            let _outer = info_span!("update", collection = %"no\u{1b}tes").entered();
             let _inner = info_span!("register").entered();
             warn!("skipped");
         });
@@ -222,7 +219,7 @@ mod tests {
             lines[2..],
             [
                 format!("    in {TARGET}::register"),
-                format!("    in {TARGET}::update with collection: «\"notes\"»"),
+                format!("    in {TARGET}::update with collection: no\\u{{1b}}tes"),
                 String::new(),
             ]
         );
@@ -247,23 +244,18 @@ mod tests {
 
         assert_eq!(
             text,
-            "  2026-11-02T09:00:00.000000Z  WARN lance::io: «opened»\n    at src/io.rs:7\n\n"
+            "  2026-11-02T09:00:00.000000Z  WARN lance::io: opened\n    at src/io.rs:7\n\n"
         );
     }
 
     #[test]
-    fn with_colors_only_the_values_go_through_the_replacement() {
-        let escape = Arc::new(TestEscape::new());
-
-        let text = written(true, Arc::clone(&escape), || warn!(key = "a", "skipped"));
+    fn with_colors_the_parts_are_styled_and_only_the_values_are_replaced() {
+        let text = written(true, || warn!(key = %"a\u{1b}b", "skipped"));
 
         assert!(text.contains("\u{1b}[33m"), "{text:?}");
-        assert_eq!(
-            escape.calls(),
-            [
-                EscapeCall::ReplaceControls("skipped".to_owned()),
-                EscapeCall::ReplaceControls("\"a\"".to_owned()),
-            ]
+        assert!(
+            text.contains("\u{1b}[1mkey\u{1b}[0m: a\\u{1b}b"),
+            "{text:?}"
         );
     }
 }

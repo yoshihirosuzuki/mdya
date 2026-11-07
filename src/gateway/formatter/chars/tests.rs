@@ -77,13 +77,16 @@ fn a_backslash_stays() {
     assert_eq!(replace_controls("C:\\Users\\me"), "C:\\Users\\me");
 }
 
-// Escaping in JSON, for the command line's JSON.
+// Escaping in JSON, for the command line's JSON and the logs written as JSON.
 
 #[test]
-fn json_without_the_direction_characters_is_kept() {
-    let json = r#"{"key":"a.md","text":"日本\n\u007f\u0080"}"#.to_owned();
+fn json_without_the_direction_characters_is_borrowed_unchanged() {
+    let json = r#"{"key":"a.md","text":"日本\n\u007f\u0080"}"#;
 
-    assert_eq!(escape_direction_characters(json.clone()), json);
+    let escaped = escape_direction_characters(json);
+
+    assert!(matches!(escaped, Cow::Borrowed(_)));
+    assert_eq!(escaped, json);
 }
 
 #[test]
@@ -92,7 +95,7 @@ fn the_nine_direction_characters_are_written_as_json_escapes() {
         "\"a\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}b\"".to_owned();
 
     assert_eq!(
-        escape_direction_characters(json),
+        escape_direction_characters(&json),
         r#""a\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069b""#
     );
 }
@@ -102,7 +105,7 @@ fn the_escaped_json_reads_as_the_same_value() {
     let value = serde_json::json!({ "key": "a\u{202e}b", "nested": ["c\u{2066}d"] });
     let json = serde_json::to_string(&value).unwrap();
 
-    let escaped = escape_direction_characters(json);
+    let escaped = escape_direction_characters(&json);
 
     assert!(!escaped.contains('\u{202e}'));
     assert_eq!(
@@ -113,7 +116,7 @@ fn the_escaped_json_reads_as_the_same_value() {
 
 #[test]
 fn delete_and_the_c1_controls_are_not_escaped_in_json() {
-    let json = "\"\u{7f}\u{80}\u{9f}\"".to_owned();
+    let json = "\"\u{7f}\u{80}\u{9f}\"";
 
-    assert_eq!(escape_direction_characters(json.clone()), json);
+    assert_eq!(escape_direction_characters(json), json);
 }

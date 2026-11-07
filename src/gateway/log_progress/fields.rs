@@ -1,10 +1,9 @@
 //! Writes the values of a log in the log formats that are not JSON, with the
 //! control characters and the characters that change the direction of text
-//! in each value replaced.
+//! in each value replaced, by the formatter's rule on characters.
 
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 
 use nu_ansi_term::Style;
 use tracing::field::{Field, Visit};
@@ -13,7 +12,7 @@ use tracing_subscriber::field::{RecordFields, VisitOutput};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FormatFields, FormattedFields};
 
-use super::super::escape::Escape;
+use super::super::formatter;
 
 /// How the values are laid out.
 #[derive(Clone, Copy, Debug)]
@@ -36,13 +35,12 @@ impl Layout {
 
 /// The `FormatFields` of the log formats that are not JSON.
 pub(super) struct EscapedFields {
-    escape: Arc<dyn Escape>,
     layout: Layout,
 }
 
 impl EscapedFields {
-    pub(super) fn new(escape: Arc<dyn Escape>, layout: Layout) -> Self {
-        Self { escape, layout }
+    pub(super) fn new(layout: Layout) -> Self {
+        Self { layout }
     }
 
     /// The visitor that writes to `writer`, which holds values already if
@@ -50,7 +48,6 @@ impl EscapedFields {
     fn visitor<'a>(&self, writer: Writer<'a>, is_empty: bool) -> EscapingVisitor<'a> {
         EscapingVisitor {
             writer,
-            escape: Arc::clone(&self.escape),
             layout: self.layout,
             is_empty,
             result: Ok(()),
@@ -85,7 +82,6 @@ impl<'writer> FormatFields<'writer> for EscapedFields {
 /// through the replacement.
 pub(super) struct EscapingVisitor<'a> {
     writer: Writer<'a>,
-    escape: Arc<dyn Escape>,
     layout: Layout,
     /// Whether no value has been written yet.
     is_empty: bool,
@@ -108,8 +104,7 @@ impl EscapingVisitor<'_> {
         if name != "message" {
             self.write_name(name.strip_prefix("r#").unwrap_or(name))?;
         }
-        let replaced = self.escape.replace_controls(text);
-        self.writer.write_str(&replaced)
+        self.writer.write_str(&formatter::replace_controls(text))
     }
 
     fn write_name(&mut self, name: &str) -> fmt::Result {
@@ -173,18 +168,12 @@ mod tests {
     use tracing::{info_span, warn};
 
     use super::*;
-    use crate::gateway::escape::test_double::{EscapeCall, TestEscape};
     use crate::gateway::test_double::captured::CapturedOutput;
 
     /// What the compact format writes, with these fields in `layout`, for
     /// the logs that `make_logs` makes, without the time, the level, and the
     /// target.
-    fn written(
-        layout: Layout,
-        ansi: bool,
-        escape: Arc<TestEscape>,
-        make_logs: impl FnOnce(),
-    ) -> String {
+    fn written(layout: Layout, ansi: bool, make_logs: impl FnOnce()) -> String {
         let output = CapturedOutput::new();
         let writer = output.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -194,45 +183,42 @@ mod tests {
             .with_level(false)
             .with_target(false)
             .compact()
-            .fmt_fields(EscapedFields::new(escape, layout))
+            .fmt_fields(EscapedFields::new(layout))
             .finish();
         tracing::subscriber::with_default(subscriber, make_logs);
         output.text()
     }
 
     fn compact(make_logs: impl FnOnce()) -> String {
-        written(
-            Layout::Compact,
-            false,
-            Arc::new(TestEscape::new()),
-            make_logs,
-        )
+        written(Layout::Compact, false, make_logs)
     }
 
     #[test]
-    fn the_message_goes_through_the_replacement() {
-        assert_eq!(compact(|| warn!("ignoring {}", "a")), "«ignoring a»\n");
+    fn the_message_has_its_control_characters_replaced() {
+        let text = compact(|| warn!("ignoring {}", "a\u{1b}[31m"));
+
+        assert_eq!(text, "ignoring a\\u{1b}[31m\n");
     }
 
     #[test]
-    fn each_value_goes_through_the_replacement_after_its_name() {
+    fn each_value_is_written_after_its_name() {
         let text = compact(|| warn!(key = "notes/a.md", count = 3, "skipped"));
 
-        assert_eq!(text, "«skipped» key=«\"notes/a.md\"» count=«3»\n");
+        assert_eq!(text, "skipped key=\"notes/a.md\" count=3\n");
     }
 
     #[test]
-    fn a_value_written_with_display_goes_through_the_replacement_as_it_is() {
-        let text = compact(|| warn!(path = %"a\nb", "skipped"));
+    fn a_value_written_with_display_has_its_control_and_direction_characters_replaced() {
+        let text = compact(|| warn!(path = %"a\nb\u{202e}c", "skipped"));
 
-        assert_eq!(text, "«skipped» path=«a\nb»\n");
+        assert_eq!(text, "skipped path=a\\nb\\u{202e}c\n");
     }
 
     #[test]
     fn a_raw_identifier_is_written_without_its_prefix() {
         let text = compact(|| warn!(r#type = "md", "skipped"));
 
-        assert_eq!(text, "«skipped» type=«\"md\"»\n");
+        assert_eq!(text, "skipped type=\"md\"\n");
     }
 
     #[test]
@@ -242,7 +228,7 @@ mod tests {
         // write them where they write those of tracing's own logs.
         let text = compact(|| warn!(log.target = "lance::io", "opened"));
 
-        assert_eq!(text, "«opened»\n");
+        assert_eq!(text, "opened\n");
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -261,7 +247,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "«failed» error=«cannot read the index error.sources=[no such file]»\n"
+            "failed error=cannot read the index error.sources=[no such file]\n"
         );
     }
 
@@ -269,23 +255,23 @@ mod tests {
     fn an_error_without_sources_is_written_alone() {
         let text = compact(|| warn!(error = &Inner as &dyn Error, "failed"));
 
-        assert_eq!(text, "«failed» error=«no such file»\n");
+        assert_eq!(text, "failed error=no such file\n");
     }
 
     #[test]
-    fn the_values_of_a_span_go_through_the_replacement() {
+    fn the_values_of_a_span_have_their_control_characters_replaced() {
         let text = compact(|| {
-            let _span = info_span!("update", collection = "notes").entered();
+            let _span = info_span!("update", collection = %"no\u{1b}tes").entered();
             warn!("skipped");
         });
 
-        assert_eq!(text, "update: «skipped» collection=«\"notes\"»\n");
+        assert_eq!(text, "update: skipped collection=no\\u{1b}tes\n");
     }
 
     /// What the compact format writes, with the fields in `layout`, for a
     /// span whose second value is recorded after the span was made.
     fn recorded_later(layout: Layout) -> String {
-        written(layout, false, Arc::new(TestEscape::new()), || {
+        written(layout, false, || {
             let span = info_span!("update", a = 1, b = tracing::field::Empty).entered();
             span.record("b", 2);
             warn!("skipped");
@@ -294,40 +280,33 @@ mod tests {
 
     #[test]
     fn a_value_recorded_later_follows_the_others_as_they_are_laid_out() {
-        assert_eq!(
-            recorded_later(Layout::Compact),
-            "update: «skipped» a=«1» b=«2»\n"
-        );
+        assert_eq!(recorded_later(Layout::Compact), "update: skipped a=1 b=2\n");
         assert_eq!(
             recorded_later(Layout::Pretty),
-            "update: «skipped» a: «1», b: «2»\n"
+            "update: skipped a: 1, b: 2\n"
         );
     }
 
     #[test]
     fn the_pretty_layout_separates_the_values_with_commas_and_colons() {
-        let text = written(Layout::Pretty, false, Arc::new(TestEscape::new()), || {
+        let text = written(Layout::Pretty, false, || {
             warn!(key = "notes/a.md", count = 3, "skipped")
         });
 
-        assert_eq!(text, "«skipped», key: «\"notes/a.md\"», count: «3»\n");
+        assert_eq!(text, "skipped, key: \"notes/a.md\", count: 3\n");
     }
 
     #[test]
-    fn with_colors_only_the_values_go_through_the_replacement() {
-        let escape = Arc::new(TestEscape::new());
+    fn with_colors_the_names_are_styled_and_only_the_values_are_replaced() {
+        let text = written(
+            Layout::Compact,
+            true,
+            || warn!(key = %"a\u{1b}b", "skipped"),
+        );
 
-        let text = written(Layout::Compact, true, Arc::clone(&escape), || {
-            warn!(key = "a", "skipped")
-        });
-
-        assert!(text.contains('\u{1b}'), "{text:?}");
-        assert_eq!(
-            escape.calls(),
-            [
-                EscapeCall::ReplaceControls("skipped".to_owned()),
-                EscapeCall::ReplaceControls("\"a\"".to_owned()),
-            ]
+        assert!(
+            text.contains("\u{1b}[3mkey\u{1b}[0m\u{1b}[2m=\u{1b}[0ma\\u{1b}b"),
+            "{text:?}"
         );
     }
 }
