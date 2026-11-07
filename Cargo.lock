@@ -4040,12 +4040,14 @@ dependencies = [
  "clap",
  "futures",
  "lancedb",
+ "libc",
  "lindera",
  "lindera-dictionary",
  "lindera-ipadic",
  "nu-ansi-term",
  "reqwest 0.12.28",
  "rmcp",
+ "rustix",
  "schemars 1.2.3",
  "serde",
  "serde_json",
@@ -4059,6 +4061,7 @@ dependencies = [
  "tracing",
  "tracing-log",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

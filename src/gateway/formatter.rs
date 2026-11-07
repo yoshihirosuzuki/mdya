@@ -21,6 +21,7 @@ use super::error_report::{Explanation, McpErrorCode};
 use super::operations::{DocumentText, VersionOutput};
 
 mod chars;
+mod failure;
 mod messages;
 mod numbers;
 mod results;
@@ -29,6 +30,7 @@ mod results;
 mod tests;
 
 pub(crate) use chars::{escape_direction_characters, replace_controls};
+pub(crate) use failure::{FailurePlace, PanicClue, human_failure_place, human_panic};
 pub(crate) use messages::{Message, ModelUnknown, Prompt, human_message, human_prompt};
 pub(crate) use numbers::UnsafeNumber;
 pub(crate) use results::{human_collection_list, human_search, human_settings, human_status};

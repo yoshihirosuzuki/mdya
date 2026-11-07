@@ -136,7 +136,12 @@ thiserror = "2.0.21"
 # features, which bring in C (onig) and C++ (esaxx_fast) code; regular
 # expressions come from fancy-regex instead.
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
-tokio = { version = "1.54.1", features = ["fs", "io-util", "net", "rt", "sync"], default-features = false }
+# `rt-multi-thread`: `gateway` runs the asynchronous work on a runtime with
+# several threads, as a component may need more than one thread to keep from
+# holding up the others. `time`: the MCP server over stdio waits a limited
+# time for what it wrote to reach stdout. The build already enables both
+# through other dependencies; mdya asks for them here as it uses them itself.
+tokio = { version = "1.54.1", features = ["fs", "io-util", "net", "rt", "rt-multi-thread", "sync", "time"], default-features = false }
 # `TaskTracker`, with which the MCP server waits for the tool calls in
 # progress before it returns. `rt` brings in only futures-util, which the
 # build already has.
@@ -161,14 +166,36 @@ tracing-log = { version = "0.2.0", default-features = false }
 # double (src/test_support/log_receiver.rs) uses `registry` as well.
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "registry", "std", "tracing-log"] }
 
+[target.'cfg(unix)'.dependencies]
+# Puts a pipe on the process's stdout (fd 1), so that what the libraries write
+# there goes to the logs and not to the user's stdout, without `unsafe` in
+# mdya. The build already has rustix, through tempfile and terminal_size;
+# `stdio` adds only its functions for the standard streams.
+rustix = { version = "1.1.4", features = ["stdio"] }
+
+[target.'cfg(windows)'.dependencies]
+# Puts the same pipe on the C runtime's standard output, which the C code in
+# the build writes through (`_open_osfhandle` and `_dup2`). The build already
+# has libc.
+libc = "0.2.186"
+# Puts the same pipe on the process's standard output handle, which Rust's
+# standard library writes through, and writes mdya's results to a console in
+# UTF-16 as the standard library does. The build already has windows-sys
+# 0.61.2 with these features.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [profile.release]
 lto = "thin"
-strip = "symbols"
+# Strip the debug information but keep the symbols, so that the backtrace that
+# mdya writes on an unexpected failure names the functions it went through.
+strip = "debuginfo"
 opt-level = 3
 codegen-units = 1
 # Unwind on panic, so that `gateway` can catch an unexpected failure and
-# report it: the CLI will exit with a message asking for a bug report, and the
-# MCP server will fail only the tool call that panicked and keep serving.
+# report it: the CLI exits with a message asking for a bug report; the MCP
+# server fails only the tool call that panicked and keeps serving, and stops
+# in the same way as the CLI only when a panic outside the tool calls leaves
+# it unable to go on.
 panic = "unwind"
 
 # The profile that 'dist' will build with
@@ -205,6 +232,9 @@ unimplemented = "deny"
 arrow-array = "58"
 arrow-schema = "58"
 futures = "0.3.34"
+# The tests of the pipe on the process's stdout write to it through the C
+# library, as the C code in the build does.
+libc = "0.2.186"
 # `io-util` and `net` for the tests that answer HTTP requests in place of a
 # server, on a local port. `time` for the MCP server's tests that check that
 # it is still waiting a while later. `test-util` to start the MCP server with

@@ -9,6 +9,7 @@
 use serde_json::{Value, json};
 
 use super::super::super::error_report::test_double::TestErrorReport;
+use super::super::super::log_progress::test_double::TestConsole;
 use super::super::super::operations::test_double::TestOperations;
 use super::super::super::operations::{
     CollectionEntry, CollectionList, SafeInteger, SafeJsonObject,
@@ -37,6 +38,7 @@ fn parts() -> McpServerParts {
         show_version: true,
         size_limit: None,
         error_report: Arc::new(TestErrorReport::new()),
+        console: Arc::new(TestConsole::new()),
     }
 }
 

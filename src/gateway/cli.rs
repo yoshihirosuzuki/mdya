@@ -1,8 +1,6 @@
 //! The command line: reads the arguments, checks what the arguments alone can
 //! tell, asks for confirmation, and writes results, messages, and errors.
 
-#![expect(dead_code, reason = "the rest of `gateway` does not use these yet")]
-
 use std::ffi::OsString;
 use std::io::{BufRead, Write};
 use std::net::SocketAddr;
@@ -40,15 +38,15 @@ pub(crate) struct Invocation {
     pub(crate) action: Action,
 }
 
-/// The options that every command takes, given before the command.
+/// The options that every command takes, given before the command, but for
+/// `--no-color`: `entry` looks for it in the arguments themselves, so that
+/// an error in reading them is not colored either.
 #[derive(Debug, Default)]
 pub(crate) struct GlobalOptions {
     /// `--log-level`, not yet checked.
     pub(crate) log_level: Option<String>,
     /// `--log-format`; `Compact` when not given.
     pub(crate) log_format: LogFormat,
-    /// Whether `--no-color` was given.
-    pub(crate) no_color: bool,
     /// `--data-dir`, before `~` and relative paths are resolved.
     pub(crate) data_dir: Option<PathBuf>,
     /// `--model-cache-dir`, before `~` and relative paths are resolved.
@@ -85,6 +83,30 @@ pub(crate) enum McpTransport {
 /// A command line operation and its arguments. Only this submodule reads it.
 #[derive(Debug)]
 pub(crate) struct CliOperation(Operation);
+
+impl CliOperation {
+    /// The commands that name the operation, such as `mdya collection add`,
+    /// without the values of the arguments.
+    pub(crate) fn command(&self) -> &'static str {
+        match self.0 {
+            Operation::CreateCollection { .. } => "mdya collection add",
+            Operation::DeleteCollection { .. } => "mdya collection remove",
+            Operation::ListCollections { .. } => "mdya collection list",
+            Operation::ChangeCollection { .. } => "mdya collection set",
+            Operation::Update { .. } | Operation::UpdateAll { .. } => "mdya update",
+            Operation::Put { .. } => "mdya put",
+            Operation::DeleteDocument { .. } => "mdya remove",
+            Operation::Search { .. } => "mdya search",
+            Operation::Get { .. } => "mdya get",
+            Operation::Status { .. } => "mdya status",
+            Operation::ListSettings { .. } => "mdya config list",
+            Operation::SetSetting { .. } => "mdya config set",
+            Operation::ResetSetting { .. } => "mdya config reset",
+            Operation::RebuildEmbeddings { .. } => "mdya embedding rebuild",
+            Operation::Optimize => "mdya optimize",
+        }
+    }
+}
 
 /// The help to show, as clap made it. Only this submodule reads it.
 #[derive(Debug)]

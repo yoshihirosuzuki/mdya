@@ -176,7 +176,6 @@ fn global_options(cli: &Cli) -> Result<GlobalOptions, CliError> {
     Ok(GlobalOptions {
         log_level: cli.log_level.clone(),
         log_format,
-        no_color: cli.no_color,
         data_dir: cli.data_dir.clone(),
         model_cache_dir: cli.model_cache_dir.clone(),
     })
@@ -514,6 +513,8 @@ struct Cli {
         help = "How to write logs [default: compact] [possible values: compact, pretty, json]"
     )]
     log_format: Option<String>,
+    // Read by `entry` from the arguments themselves, so that an error in
+    // reading them is not colored either.
     #[arg(long, help = "Do not color the output")]
     no_color: bool,
     // Every command takes it, as clap's own help flag, which is turned off

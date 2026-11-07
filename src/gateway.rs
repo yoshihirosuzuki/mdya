@@ -34,7 +34,7 @@ use crate::format::Format;
 use crate::index::Index;
 use crate::ingest::Ingest;
 use crate::query::Query;
-use crate::types::CollectionType;
+use crate::types::{CollectionType, DirLookup};
 use crate::watchdog::WatchdogSettings;
 
 mod cli;
@@ -51,8 +51,16 @@ mod write_lock;
 /// Runs mdya with the process's arguments, environment variables, stdin,
 /// stdout, and stderr, and the real components. Called from the executable's
 /// `main`.
-pub fn run() -> ExitCode {
-    todo!()
+///
+/// # Safety
+///
+/// No other thread may be running in the process when it is called: it sets
+/// environment variables on the process (with `std::env::set_var`) before it
+/// starts any thread of its own, which is sound only while no other thread
+/// can read or set them.
+pub unsafe fn run() -> ExitCode {
+    // SAFETY: the caller keeps to the same condition.
+    unsafe { entry::run() }
 }
 
 /// Runs mdya with the given arguments (the first one is the program name),
@@ -65,8 +73,7 @@ pub fn run_with(
     io: Io,
     factories: Factories,
 ) -> ExitCode {
-    let _ = (args, env, io, factories);
-    todo!()
+    entry::run_with(args, env, io, factories)
 }
 
 /// Where mdya reads and writes. [`run`] passes the process's stdin, stdout,
@@ -126,4 +133,9 @@ pub struct Factories {
             + Send
             + Sync,
     >,
+    /// Looks up the home directory and the working directory, to make the
+    /// settings and index directory, the embedding model cache directory, and
+    /// the places in type-specific attributes absolute. Tests replace it with
+    /// one that gives fixed answers.
+    pub dirs: DirLookup,
 }
