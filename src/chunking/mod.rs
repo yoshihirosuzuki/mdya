@@ -49,11 +49,6 @@
 //!   the body verbatim (searchable via FTS / vector), `#` lines inside the
 //!   fence do not open new chunks, and packing never splits a fence across
 //!   chunks unless the fence alone exceeds the window
-//! - Markdown documents pulldown-cmark cannot report offsets for
-//!   (<https://github.com/pulldown-cmark/pulldown-cmark/issues/1129>):
-//!   chunked like a PDF (plain text, 700 / 70-char window, Markdown syntax
-//!   and any front matter kept in the body), so the whole document is still
-//!   indexed
 //!
 //! These rules are pinned in code only; no chunking knob lives in the
 //! YAML, so altering any of them in a future release is a soft change
@@ -81,11 +76,8 @@ use mapped_text::MappedText;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     /// Chunk text: the section's heading (if any) followed by its body,
-    /// rendered to plain text with Markdown formatting stripped — except
-    /// in a document pulldown-cmark cannot report offsets for, which is
-    /// split into fixed-width windows with its Markdown syntax and any
-    /// front matter kept (see the module docs). An empty body marks the
-    /// placeholder (no chunkable content).
+    /// rendered to plain text with Markdown formatting stripped. An empty
+    /// body marks the placeholder (no chunkable content).
     pub body: String,
     /// Byte range of the original document this chunk covers — the same
     /// string the ingest writer stores in the `sources` table, so the range

@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The Markdown documents that 0.4.2 began indexing as plain text are now chunked by headings like any other Markdown document, with Markdown syntax and YAML front matter left out of the indexed text. An example is a document with a list item holding only a link reference definition (`- [a]: https://example.com`), directly followed by a whitespace-only line indented at least four columns past the item's text. The plain-text fallback was there because `pulldown-cmark` 0.13.4 panicked on such documents; with 0.13.6 (see Security) it is no longer needed and has been removed. The chunker's tests now run those inputs through the heading-aware chunker and check that it no longer panics on them and that the chunks' source ranges still cover each whole document. A document already in an index keeps its plain-text chunks until its content changes or the index is rebuilt.
+
 ### Security
 
+- Bumped `pulldown-cmark` 0.13.4 → 0.13.6; `Cargo.toml` now asks for `0.13.6` instead of pinning `=0.13.4`. 0.13.6 is a fixed version for two advisories, and `cargo audit` no longer reports them:
+  - RUSTSEC-2026-0414: exponential event growth with `ENABLE_WIKILINKS` (fixed in 0.13.5).
+  - RUSTSEC-2026-0433: quadratic parsing of nested image wikilinks with `ENABLE_WIKILINKS` (fixed in 0.13.6).
+
+  Both apply only when a parser enables `ENABLE_WIKILINKS`. mdya parses Markdown in one place, the chunker, with `ENABLE_YAML_STYLE_METADATA_BLOCKS` only, so it was not affected.
 - Bumped `zstd` 0.13.3 → 0.13.4 and `zstd-safe` 7.2.4 → 7.4.0 in the lockfile; no manifest change was needed. In the binary, `zstd` 0.13 reaches mdya through `arrow-ipc` 58, which `lancedb` uses. The new releases are the fixed versions for thirteen advisories, and `cargo audit` no longer reports them:
   - Vulnerabilities: RUSTSEC-2026-0391 (`zstd`), RUSTSEC-2026-0398 and RUSTSEC-2026-0403 (`zstd-safe`).
   - Unsoundness in `zstd-safe`: RUSTSEC-2026-0395 to 0397, 0399 to 0402, and 0404 to 0406.
