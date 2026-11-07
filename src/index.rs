@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use futures::stream::{BoxStream, FuturesUnordered};
 use futures::{StreamExt, TryStreamExt};
 use lancedb::DistanceType;
 use lancedb::arrow::arrow_array::builder::StringBuilder;
@@ -161,10 +162,45 @@ pub enum IndexError {
     CannotWrite { source: BoxError },
 }
 
+/// What gets the outcome of each document `register_stream` has written.
+pub trait RegistrationSink: Send + Sync {
+    fn registered(&self, collection: &CollectionName, key: &Key, outcome: DocumentOutcome);
+}
+
 #[async_trait]
 pub trait Index: Send + Sync {
-    /// Registers a document: adds it, replaces it, updates only its time, or
-    /// skips it, and says which.
+    /// Registers the documents of `documents`: adds, replaces, updates only
+    /// the time of, or skips each, and passes which to `results` once the
+    /// document is written. It asks `documents` for the next document only
+    /// when it needs one, and makes the embedding vectors of at most
+    /// `parallelism` documents at once (one when it is 0).
+    ///
+    /// The documents are read and written a bulk at a time. When making a
+    /// document's embedding vectors fails, it starts no other document, and
+    /// first writes the documents whose vectors are made and passes their
+    /// outcomes. A document it has not finished is neither written nor
+    /// passed. It returns the first error that made it stop. The caller passes no document twice, in one stream
+    /// or in two calls at once.
+    ///
+    /// By default, the documents are registered one at a time with
+    /// `register`, which the test doubles of other components rely on; the
+    /// component itself reads and writes them a bulk at a time.
+    async fn register_stream(
+        &self,
+        mut documents: BoxStream<'_, DocumentToRegister>,
+        _parallelism: usize,
+        results: &dyn RegistrationSink,
+        progress: Option<&dyn ProgressSink>,
+    ) -> Result<(), IndexError> {
+        while let Some(document) = documents.next().await {
+            let (collection, key) = (document.collection.clone(), document.key.clone());
+            let outcome = self.register(document, progress).await?;
+            results.registered(&collection, &key, outcome);
+        }
+        Ok(())
+    }
+    /// Registers one document, as `register_stream` does a stream of it
+    /// alone, and says what it did.
     async fn register(
         &self,
         document: DocumentToRegister,
@@ -420,9 +456,11 @@ enum LanceCall {
     ReadDictionary,
     /// Reading a document's rows, or the rows of many documents.
     ReadRows(TableName),
-    /// Replacing, updating some columns of, or deleting a document's rows, or
-    /// deleting the rows of many documents.
+    /// Upserting, updating some columns of, or deleting the rows of
+    /// documents.
     WriteRows(TableName),
+    /// Adding the rows of documents.
+    AddRows(TableName),
     /// One step of maintaining a table, or, before a rebuild fills the
     /// document table, adding the chunk table's new rows to its indexes.
     Optimize(TableName, MaintenanceStep),
@@ -484,6 +522,12 @@ impl MaintenanceStep {
             },
             Self::Index,
         ]
+    }
+
+    /// Whether the step leaves the table at its version: only cleaning up
+    /// old versions does, as it commits nothing.
+    fn keeps_the_version(self) -> bool {
+        matches!(self, Self::Prune { .. })
     }
 
     fn action(self) -> OptimizeAction {
@@ -633,6 +677,10 @@ struct LanceDbIndex {
     /// Always [`KEPT_ROWS_PER_COMMIT`]; a field so that the unit tests can
     /// make it small.
     kept_rows_per_commit: usize,
+    /// Always [`BULK_DOCUMENTS`] and [`BULK_BYTES`]; fields so that the unit
+    /// tests can make them small.
+    bulk_documents: usize,
+    bulk_bytes: usize,
 }
 
 /// The number of keys `delete_others` deletes in one commit of each table. A
@@ -668,59 +716,34 @@ struct Prepared {
     model: EmbeddingModel,
 }
 
+/// The most documents registering puts in one bulk: the documents it reads
+/// the versions of, and writes, together.
+const BULK_DOCUMENTS: usize = 500;
+
+/// The most bytes of bodies and embedding vectors registering puts in one
+/// bulk, which it holds from making the vectors until it has written them.
+/// A document larger than this alone is a bulk of its own. Well below the
+/// smallest memory limit worth setting, so that what a bulk holds stays a
+/// small part of it.
+const BULK_BYTES: usize = 64 << 20;
+
 /// What registering a document comes down to after comparing its versions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     /// Write nothing: the document has not changed.
     Skip,
     /// Replace only the time of the document's row.
     ReplaceTime,
     /// Write the document and its chunks, with new embedding vectors.
-    Write {
-        outcome: DocumentOutcome,
-        delete_first: DeleteFirst,
-    },
+    Write(DocumentOutcome),
 }
 
-impl Action {
-    fn write(outcome: DocumentOutcome) -> Self {
-        Self::Write {
-            outcome,
-            delete_first: DeleteFirst::Nothing,
-        }
-    }
-}
-
-/// Rows of the document to delete before writing them, each in a commit of
-/// its own. Replacing rows cannot get rid of two rows that match one new row:
-/// LanceDB leaves both, and its documentation calls that case undefined. Only
-/// a change from outside the component leaves such rows.
-///
-/// Between the deletion and the write, readers see the document without the
-/// deleted rows, and a stop there leaves it so until the document is
-/// registered again, which writes what is missing.
-///
-/// Two chunk rows with the same number are found only when the chunk rows are
-/// compared with the document row, which happens only when the body has not
-/// changed, the registration does not overwrite, and the document has one
-/// row. When the document has more than one row, the chunk rows are deleted
-/// without being compared. Other registrations can leave such rows: LanceDB
-/// leaves every row of a number that the new version also has.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeleteFirst {
-    Nothing,
-    /// Two of the document's chunk rows have the same chunk number.
-    ChunkRows,
-    /// The document has more than one row in the document table. Its chunk
-    /// rows are deleted too, since they are not compared and may be repeated
-    /// as well.
-    AllRows,
-}
-
-/// What [`LanceDbIndex::write`] writes besides the document it is given.
-struct NewVersion<'a> {
-    hash: &'a DocumentHash,
+/// A document of a bulk, once its versions are compared.
+struct Decided {
+    document: DocumentToRegister,
+    hash: DocumentHash,
     time: Option<TimeMicros>,
-    delete_first: DeleteFirst,
+    action: Action,
 }
 
 /// How a document's chunk rows compare with its row.
@@ -743,6 +766,8 @@ impl LanceDbIndex {
             writing: tokio::sync::Mutex::new(()),
             key_batch_len: KEY_BATCH_LEN,
             kept_rows_per_commit: KEPT_ROWS_PER_COMMIT,
+            bulk_documents: BULK_DOCUMENTS,
+            bulk_bytes: BULK_BYTES,
         }
     }
 
@@ -903,12 +928,20 @@ impl LanceDbIndex {
 
     /// Maintains both tables, each with the steps of [`MaintenanceStep`] in
     /// order. Nothing is done before the tables exist.
+    ///
+    /// While the rebuild table keeps the vectors of a rebuild that stopped,
+    /// the chunk table is only cleaned up: merging its fragments or indexing
+    /// its new rows makes a new version of it, and a rebuild uses the kept
+    /// vectors only for the version they were made for.
     async fn maintain_tables(&self) -> Result<(), IndexError> {
         let Some(tables) = self.store.tables_to_read().await? else {
             return Ok(());
         };
+        let rebuilding = self.open_rebuild_table().await?.is_some();
         for (table, name) in tables.each() {
-            for step in MaintenanceStep::all() {
+            let steps = MaintenanceStep::all().into_iter();
+            let keep_version = rebuilding && name == TableName::Chunk;
+            for step in steps.filter(|step| !keep_version || step.keeps_the_version()) {
                 self.hooks
                     .before(LanceCall::Optimize(name, step))
                     .await
@@ -1656,17 +1689,7 @@ impl LanceDbIndex {
         if ranges.is_empty() {
             return Ok(None);
         }
-        let mut rows = Vec::new();
-        for (position, batch) in chunk_rows.iter().enumerate() {
-            let at: Vec<u32> = found
-                .iter()
-                .filter(|(in_batch, _)| *in_batch == position)
-                .map(|(_, row)| *row)
-                .collect();
-            if !at.is_empty() {
-                rows.push(take_record_batch(batch, &UInt32Array::from(at))?);
-            }
-        }
+        let rows = rows_at(chunk_rows, found)?;
         let compared = compare_chunk_rows(&rows, ranges, body, self.hooks.as_ref());
         if compared.await? != ChunkRows::Agree {
             return Ok(None);
@@ -1929,7 +1952,7 @@ impl LanceDbIndex {
         &self,
         table: &lancedb::Table,
         name: TableName,
-        rows: RecordBatch,
+        rows: Vec<RecordBatch>,
     ) -> Result<(), IndexError> {
         self.hooks
             .before(LanceCall::WriteRows(name))
@@ -1956,50 +1979,111 @@ impl LanceDbIndex {
         }
     }
 
-    async fn register_document(
+    /// Registers the documents of `documents` a bulk at a time: it asks for
+    /// the documents of a bulk, registers them, and only then asks for the
+    /// next bulk's. The vector columns are checked before the first document
+    /// is asked for, and again just before each bulk is written.
+    async fn register_documents(
         &self,
-        document: &DocumentToRegister,
+        mut documents: BoxStream<'_, DocumentToRegister>,
+        parallelism: usize,
+        results: &dyn RegistrationSink,
         progress: Option<&dyn ProgressSink>,
-    ) -> Result<DocumentOutcome, IndexError> {
+    ) -> Result<(), IndexError> {
         self.read_dictionary().await?;
-        let prepared = self.prepare_to_write().await?;
-        let hash = DocumentHash::of_body(&document.body, self.hooks.as_ref()).await;
-        let time = document.time.map(TimeMicros::from_time);
-        let (prepared, action) = match self.read_version(&prepared.tables.document, document).await
-        {
-            Ok(stored) => {
-                let action = self
-                    .decide(&prepared.tables.chunk, document, &hash, time, stored)
-                    .await?;
-                (prepared, action)
+        let mut prepared = self.prepare_to_write().await?;
+        let mut held = None;
+        loop {
+            let bulk = self.next_bulk(&mut documents, &mut held, prepared.model.dimension);
+            let bulk = bulk.await;
+            if bulk.is_empty() {
+                return Ok(());
             }
-            Err(cause) => {
-                warn_version_unreadable(document, cause.as_ref());
-                self.store.discard().await;
-                let reopened = self.prepare_to_write().await?;
-                (reopened, Action::write(DocumentOutcome::Changed))
-            }
-        };
-        match action {
-            Action::Skip => Ok(DocumentOutcome::Unchanged),
-            Action::ReplaceTime => {
-                self.replace_time(&prepared, document, time).await?;
-                Ok(DocumentOutcome::Changed)
-            }
-            Action::Write {
-                outcome,
-                delete_first,
-            } => {
-                let new_version = NewVersion {
-                    hash: &hash,
-                    time,
-                    delete_first,
-                };
-                self.write(&prepared, document, new_version, progress)
-                    .await?;
-                Ok(outcome)
-            }
+            let registering = Registering {
+                parallelism,
+                results,
+                progress,
+            };
+            self.register_bulk(&mut prepared, bulk, &registering)
+                .await?;
         }
+    }
+
+    /// The documents of the next bulk: `held`, if any, then those asked for
+    /// from `documents` until the bulk has [`Self::bulk_documents`]
+    /// documents, or the next document is of another collection or would
+    /// make the bulk larger than [`Self::bulk_bytes`]. That document is held
+    /// for the bulk after. Empty when the stream has ended.
+    async fn next_bulk(
+        &self,
+        documents: &mut BoxStream<'_, DocumentToRegister>,
+        held: &mut Option<DocumentToRegister>,
+        dimension: usize,
+    ) -> Vec<DocumentToRegister> {
+        let mut bulk: Vec<DocumentToRegister> = Vec::new();
+        let mut bytes = 0;
+        if let Some(document) = held.take() {
+            bytes = held_bytes(&document, dimension);
+            bulk.push(document);
+        }
+        while bulk.len() < self.bulk_documents {
+            let Some(document) = documents.next().await else {
+                break;
+            };
+            let size = held_bytes(&document, dimension);
+            let fits = match bulk.first() {
+                None => true,
+                Some(first) => {
+                    first.collection == document.collection
+                        && bytes.saturating_add(size) <= self.bulk_bytes
+                }
+            };
+            if !fits {
+                *held = Some(document);
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            bulk.push(document);
+        }
+        bulk
+    }
+
+    /// Registers the documents of a bulk, all of one collection: reads their
+    /// versions at once, decides what each needs, makes the embedding vectors
+    /// of those to write, and writes them together. The outcome of a document
+    /// that needs nothing is passed as soon as that is decided, and the others'
+    /// once they are written. When making the vectors fails, the documents
+    /// whose vectors are made are written all the same, and the first error is
+    /// returned after.
+    async fn register_bulk(
+        &self,
+        prepared: &mut Prepared,
+        bulk: Vec<DocumentToRegister>,
+        registering: &Registering<'_>,
+    ) -> Result<(), IndexError> {
+        let decided = self.decide_bulk(prepared, bulk).await?;
+        for skipped in decided.iter().filter(|done| done.action == Action::Skip) {
+            let document = &skipped.document;
+            let results = registering.results;
+            results.registered(
+                &document.collection,
+                &document.key,
+                DocumentOutcome::Unchanged,
+            );
+        }
+        let (made, failed) = self
+            .make_bulk_vectors(prepared, &decided, registering)
+            .await;
+        let written = self.write_bulk(prepared, decided, made, registering.results);
+        let written = written.await;
+        let Some(error) = failed else {
+            return written;
+        };
+        // The model's error stopped the registration first, so it is the one
+        // returned. A failed write still drops the held connection, as it
+        // does when it is returned.
+        self.discard_after(&written).await;
+        Err(error)
     }
 
     /// Places the full-text search dictionary configuration if it is not
@@ -2067,131 +2151,262 @@ impl LanceDbIndex {
         }
     }
 
-    /// The versions of the document in the index, one per row: none when the
-    /// index does not have the document. Any error means the version cannot
-    /// be read.
-    async fn read_version(
+    /// Decides what each document of the bulk needs: reads the stored
+    /// versions of all of them at once, and, for those whose body has not
+    /// changed and that are not to be overwritten, their chunk rows at once,
+    /// to compare them with their document rows.
+    async fn decide_bulk(
+        &self,
+        prepared: &mut Prepared,
+        bulk: Vec<DocumentToRegister>,
+    ) -> Result<Vec<Decided>, IndexError> {
+        let collection = bulk[0].collection.clone();
+        let keys: Vec<Key> = bulk.iter().map(|document| document.key.clone()).collect();
+        let stored = self.read_versions(prepared, &collection, &keys).await?;
+        let mut hashed = Vec::with_capacity(bulk.len());
+        for document in bulk {
+            let hash = DocumentHash::of_body(&document.body, self.hooks.as_ref()).await;
+            let time = document.time.map(TimeMicros::from_time);
+            hashed.push((document, hash, time));
+        }
+        let versions_of = |key: &Key| stored.get(&key.0).map_or(&[][..], Vec::as_slice);
+        let to_compare: Vec<Key> = hashed
+            .iter()
+            .filter(|(document, hash, _)| compares(document, hash, versions_of(&document.key)))
+            .map(|(document, ..)| document.key.clone())
+            .collect();
+        let chunk_rows = match to_compare.is_empty() {
+            true => Vec::new(),
+            false => {
+                let read = self.read_chunk_rows(&prepared.tables.chunk, &collection, &to_compare);
+                read.await?
+            }
+        };
+        let by_key = rows_by_key(&chunk_rows).map_err(read_error)?;
+        let mut decided = Vec::with_capacity(hashed.len());
+        for (document, hash, time) in hashed {
+            let versions = versions_of(&document.key);
+            let found = by_key
+                .get(document.key.0.as_str())
+                .map_or(&[][..], Vec::as_slice);
+            let comparing = Comparing {
+                hash: &hash,
+                time,
+                versions,
+                chunk_rows: &chunk_rows,
+                found,
+            };
+            let action = self.decide(&document, &comparing).await?;
+            decided.push(Decided {
+                document,
+                hash,
+                time,
+                action,
+            });
+        }
+        Ok(decided)
+    }
+
+    /// The stored versions of the documents of the collection with `keys`,
+    /// by key, read in one go. When the read fails, the connection and the
+    /// tables are opened again and it is read again, up to
+    /// [`VERSION_READ_RETRIES`] times, before the index counts as unreadable.
+    async fn read_versions(
+        &self,
+        prepared: &mut Prepared,
+        collection: &CollectionName,
+        keys: &[Key],
+    ) -> Result<HashMap<String, Vec<StoredVersion>>, IndexError> {
+        let mut retried = 0;
+        loop {
+            let read = self.try_read_versions(&prepared.tables.document, collection, keys);
+            let error = match read.await {
+                Ok(versions) => return Ok(versions),
+                Err(error) => error,
+            };
+            if retried == VERSION_READ_RETRIES {
+                return Err(read_error(error));
+            }
+            retried += 1;
+            warn_versions_unreadable(collection, error.as_ref());
+            prepared.tables = self.reopen_tables(&prepared.model).await?;
+        }
+    }
+
+    async fn try_read_versions(
         &self,
         table: &lancedb::Table,
-        document: &DocumentToRegister,
-    ) -> Result<Vec<StoredVersion>, BoxError> {
+        collection: &CollectionName,
+        keys: &[Key],
+    ) -> Result<HashMap<String, Vec<StoredVersion>>, BoxError> {
         self.hooks
             .before(LanceCall::ReadRows(TableName::Document))
             .await?;
-        let columns = ["time", "hash", "chunk_ranges"];
-        let batches = read_rows(
-            table,
-            document_filter(&document.collection, &document.key),
-            &columns,
-        )
-        .await?;
-        let mut versions = Vec::new();
+        let columns = ["key", "time", "hash", "chunk_ranges"];
+        let batches = read_rows(table, keys_filter(collection, keys), &columns).await?;
+        let mut versions: HashMap<String, Vec<StoredVersion>> = HashMap::new();
         for batch in &batches {
-            versions.extend(StoredVersion::from_rows(batch)?);
+            let keys = string_column(batch, "key")?;
+            let stored = StoredVersion::from_rows(batch)?;
+            for (row, version) in stored.into_iter().enumerate() {
+                let key = keys.value(row).to_owned();
+                versions.entry(key).or_default().push(version);
+            }
         }
         Ok(versions)
     }
 
-    async fn decide(
-        &self,
-        chunk_table: &lancedb::Table,
-        document: &DocumentToRegister,
-        hash: &DocumentHash,
-        time: Option<TimeMicros>,
-        stored: Vec<StoredVersion>,
-    ) -> Result<Action, IndexError> {
-        let stored = match <[StoredVersion; 1]>::try_from(stored) {
-            Ok([stored]) => stored,
-            Err(stored) if stored.is_empty() => return Ok(Action::write(DocumentOutcome::Added)),
-            Err(_) => {
-                return Ok(Action::Write {
-                    outcome: DocumentOutcome::Changed,
-                    delete_first: DeleteFirst::AllRows,
-                });
-            }
-        };
-        let same_body = stored.hash == hash.as_str();
-        let same_version = same_body && stored.time == time;
-        if document.overwrite {
-            let outcome = match same_version {
-                true => DocumentOutcome::Reingested,
-                false => DocumentOutcome::Changed,
-            };
-            return Ok(Action::write(outcome));
-        }
-        if !same_body {
-            return Ok(Action::write(DocumentOutcome::Changed));
-        }
-        let chunks = self.read_chunks(chunk_table, document).await?;
-        let hooks = self.hooks.as_ref();
-        let compared = compare_chunk_rows(&chunks, &stored.chunk_ranges, &document.body, hooks);
-        match (compared.await.map_err(read_error)?, same_version) {
-            (ChunkRows::Agree, true) => Ok(Action::Skip),
-            (ChunkRows::Agree, false) => Ok(Action::ReplaceTime),
-            (ChunkRows::Disagree, _) => Ok(Action::write(DocumentOutcome::Changed)),
-            (ChunkRows::RepeatNumbers, _) => Ok(Action::Write {
-                outcome: DocumentOutcome::Changed,
-                delete_first: DeleteFirst::ChunkRows,
-            }),
-        }
+    /// Drops the connection and the tables held, and opens them again, while
+    /// no other function of this component writes.
+    async fn reopen_tables(&self, model: &EmbeddingModel) -> Result<Tables, IndexError> {
+        self.store.discard().await;
+        let _writing = self.writing.lock().await;
+        let tables = self.store.tables_to_write(Some(model)).await?;
+        tables.ok_or_else(|| write_error("the tables could not be opened again".into()))
     }
 
-    /// The document's rows in the chunk table, with the columns that are
-    /// compared with the document's row.
-    async fn read_chunks(
+    /// The chunk rows of the documents of the collection with `keys`, with
+    /// the columns that are compared with the document rows, read in one go.
+    async fn read_chunk_rows(
         &self,
         table: &lancedb::Table,
-        document: &DocumentToRegister,
+        collection: &CollectionName,
+        keys: &[Key],
     ) -> Result<Vec<RecordBatch>, IndexError> {
         self.hooks
             .before(LanceCall::ReadRows(TableName::Chunk))
             .await
             .map_err(read_error)?;
-        let columns = ["chunk_index", "range_start", "range_end", "text"];
-        read_rows(
-            table,
-            document_filter(&document.collection, &document.key),
-            &columns,
-        )
-        .await
-        .map_err(read_error)
+        let columns = ["key", "chunk_index", "range_start", "range_end", "text"];
+        let read = read_rows(table, keys_filter(collection, keys), &columns).await;
+        read.map_err(read_error)
     }
 
-    /// Writes the document. Makes the embedding vectors and builds the rows
-    /// before writing anything.
-    async fn write(
+    /// What registering `document` comes down to, as `comparing` finds.
+    async fn decide(
+        &self,
+        document: &DocumentToRegister,
+        comparing: &Comparing<'_>,
+    ) -> Result<Action, IndexError> {
+        let [stored] = comparing.versions else {
+            return Ok(Action::Write(match comparing.versions.is_empty() {
+                true => DocumentOutcome::Added,
+                false => DocumentOutcome::Changed,
+            }));
+        };
+        let same_body = stored.hash == comparing.hash.as_str();
+        let same_version = same_body && stored.time == comparing.time;
+        if document.overwrite {
+            return Ok(Action::Write(match same_version {
+                true => DocumentOutcome::Reingested,
+                false => DocumentOutcome::Changed,
+            }));
+        }
+        if !same_body {
+            return Ok(Action::Write(DocumentOutcome::Changed));
+        }
+        let rows = rows_at(comparing.chunk_rows, comparing.found).map_err(read_error)?;
+        let hooks = self.hooks.as_ref();
+        let compared = compare_chunk_rows(&rows, &stored.chunk_ranges, &document.body, hooks);
+        Ok(match (compared.await.map_err(read_error)?, same_version) {
+            (ChunkRows::Agree, true) => Action::Skip,
+            (ChunkRows::Agree, false) => Action::ReplaceTime,
+            (ChunkRows::Disagree | ChunkRows::RepeatNumbers, _) => {
+                Action::Write(DocumentOutcome::Changed)
+            }
+        })
+    }
+
+    /// Makes the embedding vectors of the documents of the bulk to write, up
+    /// to the parallelism at a time. Once a document fails, no other one is
+    /// started, and those under way are finished. Returns the vectors made,
+    /// by the document's place in the bulk, and the first error.
+    async fn make_bulk_vectors(
         &self,
         prepared: &Prepared,
-        document: &DocumentToRegister,
-        new_version: NewVersion<'_>,
-        progress: Option<&dyn ProgressSink>,
+        decided: &[Decided],
+        registering: &Registering<'_>,
+    ) -> (Vec<Option<Vec<ChunkEmbedding>>>, Option<IndexError>) {
+        let mut made: Vec<Option<Vec<ChunkEmbedding>>> = decided.iter().map(|_| None).collect();
+        let mut waiting = decided
+            .iter()
+            .enumerate()
+            .filter(|(_, done)| matches!(done.action, Action::Write(_)));
+        let mut running = FuturesUnordered::new();
+        let mut failed = None;
+        let most = registering.parallelism.max(1);
+        loop {
+            while failed.is_none() && running.len() < most {
+                let Some((at, done)) = waiting.next() else {
+                    break;
+                };
+                let embedding = self.embed(&done.document, &prepared.model, registering.progress);
+                running.push(async move { (at, embedding.await) });
+            }
+            match running.next().await {
+                Some((at, Ok(vectors))) => made[at] = Some(vectors),
+                Some((_, Err(error))) => {
+                    failed.get_or_insert(error);
+                }
+                None => return (made, failed),
+            }
+        }
+    }
+
+    /// Writes the documents of the bulk whose vectors are made, and replaces
+    /// the times to replace, then passes their outcomes. Each table's rows of
+    /// the documents to write are deleted and their new rows added, the chunk
+    /// table first; the times are replaced last. A document's outcome is
+    /// passed once both its tables are written.
+    ///
+    /// The document rows are deleted and added rather than upserted: on
+    /// lancedb 0.41.0, upserting document rows with large bodies or many
+    /// vectors held several times their size in memory, more with each bulk.
+    /// Between the deletion and the addition, readers see the documents
+    /// without their rows, and a stop there leaves them so until they are
+    /// registered again. Deleting also gets rid of a document's repeated rows,
+    /// which only a change from outside the component leaves.
+    async fn write_bulk(
+        &self,
+        prepared: &Prepared,
+        decided: Vec<Decided>,
+        made: Vec<Option<Vec<ChunkEmbedding>>>,
+        results: &dyn RegistrationSink,
     ) -> Result<(), IndexError> {
-        let embeddings = self.embed(document, &prepared.model, progress).await?;
-        let mut pace = Pace::new(self.hooks.as_ref(), Computation::Build);
-        let new_rows = NewRows::build(&prepared.model, document, &embeddings, &mut pace);
-        let new_rows = new_rows.await.map_err(write_error)?;
-        let document_row = new_rows.document_row(new_version.hash, new_version.time, &mut pace);
-        let document_row = document_row.await.map_err(write_error)?;
-        drop(pace);
+        let collection = decided[0].document.collection.clone();
+        let rows = BulkRows::build(&prepared.model, decided, made, self.hooks.as_ref());
+        let rows = rows.await.map_err(write_error)?;
+        if rows.written.is_empty() && rows.timed.is_empty() {
+            return Ok(());
+        }
         let _writing = self.writing.lock().await;
         self.check_columns_again(prepared).await?;
-        let (chunk_table, document_table) = (&prepared.tables.chunk, &prepared.tables.document);
-        let rows = document_filter(&document.collection, &document.key);
-        let delete_first = new_version.delete_first;
-        let delete_chunks_first =
-            matches!(delete_first, DeleteFirst::ChunkRows | DeleteFirst::AllRows);
-        // Writing no chunk rows deletes them anyway.
-        if delete_chunks_first && new_rows.chunk_rows.num_rows() > 0 {
-            self.delete_rows(chunk_table, TableName::Chunk, &rows)
+        let tables = &prepared.tables;
+        if !rows.written.is_empty() {
+            let keys: Vec<Key> = rows.written.iter().map(|(key, _)| key.clone()).collect();
+            let keys = keys_filter(&collection, &keys);
+            self.delete_rows(&tables.chunk, TableName::Chunk, &keys)
                 .await?;
-        }
-        self.replace_chunks(chunk_table, document, new_rows.chunk_rows)
-            .await?;
-        if delete_first == DeleteFirst::AllRows {
-            self.delete_rows(document_table, TableName::Document, &rows)
+            if !rows.chunk_rows.is_empty() {
+                self.add_rows(&tables.chunk, TableName::Chunk, rows.chunk_rows)
+                    .await?;
+            }
+            self.delete_rows(&tables.document, TableName::Document, &keys)
                 .await?;
+            self.add_rows(&tables.document, TableName::Document, rows.document_rows)
+                .await?;
+            for (key, outcome) in &rows.written {
+                results.registered(&collection, key, *outcome);
+            }
         }
-        self.replace_document(document_table, document_row).await
+        if !rows.timed.is_empty() {
+            self.update_rows(&tables.document, TableName::Document, rows.time_rows)
+                .await?;
+            for key in &rows.timed {
+                results.registered(&collection, key, DocumentOutcome::Changed);
+            }
+        }
+        Ok(())
     }
 
     /// Makes the embedding vectors of the document's chunks, as many at a
@@ -2246,31 +2461,19 @@ impl LanceDbIndex {
         Ok(all)
     }
 
-    /// Replaces the document's rows in the chunk table with `rows`, deleting
-    /// the rows left over, in one commit.
-    async fn replace_chunks(
+    /// Adds `rows` to `table`, the table `name`, in one commit.
+    async fn add_rows(
         &self,
         table: &lancedb::Table,
-        document: &DocumentToRegister,
-        rows: RecordBatch,
+        name: TableName,
+        rows: Vec<RecordBatch>,
     ) -> Result<(), IndexError> {
-        let document_rows = document_filter(&document.collection, &document.key);
-        if rows.num_rows() == 0 {
-            self.delete_rows(table, TableName::Chunk, &document_rows)
-                .await?;
-            return Ok(());
-        }
         self.hooks
-            .before(LanceCall::WriteRows(TableName::Chunk))
+            .before(LanceCall::AddRows(name))
             .await
             .map_err(write_error)?;
-        let mut merge = table.merge_insert(TableName::Chunk.row_columns());
-        merge
-            .when_matched_update_all(None)
-            .when_not_matched_insert_all()
-            .when_not_matched_by_source_delete_expr(document_rows);
-        let merged = merge.execute(reader(rows)).await;
-        merged.map_err(|error| write_error(error.into()))?;
+        let added = table.add(rows).execute().await;
+        added.map_err(|error| write_error(error.into()))?;
         Ok(())
     }
 
@@ -2291,39 +2494,6 @@ impl LanceDbIndex {
         Ok(deleted.num_deleted_rows)
     }
 
-    /// Replaces the document's row in the document table with `row`.
-    async fn replace_document(
-        &self,
-        table: &lancedb::Table,
-        row: RecordBatch,
-    ) -> Result<(), IndexError> {
-        self.hooks
-            .before(LanceCall::WriteRows(TableName::Document))
-            .await
-            .map_err(write_error)?;
-        let mut merge = table.merge_insert(TableName::Document.row_columns());
-        merge
-            .when_matched_update_all(None)
-            .when_not_matched_insert_all();
-        let merged = merge.execute(reader(row)).await;
-        merged.map_err(|error| write_error(error.into()))?;
-        Ok(())
-    }
-
-    /// Replaces only the time in the document's row.
-    async fn replace_time(
-        &self,
-        prepared: &Prepared,
-        document: &DocumentToRegister,
-        time: Option<TimeMicros>,
-    ) -> Result<(), IndexError> {
-        let row = time_row(&prepared.model, document, time).map_err(write_error)?;
-        let _writing = self.writing.lock().await;
-        self.check_columns_again(prepared).await?;
-        self.update_rows(&prepared.tables.document, TableName::Document, row)
-            .await
-    }
-
     /// Checks the vector columns again as [`Self::check_columns`] does, for
     /// the model the rows were made for, just before writing them while no
     /// other function of this component writes: the write lock is not held
@@ -2339,14 +2509,32 @@ impl LanceDbIndex {
 
 #[async_trait]
 impl Index for LanceDbIndex {
+    async fn register_stream(
+        &self,
+        documents: BoxStream<'_, DocumentToRegister>,
+        parallelism: usize,
+        results: &dyn RegistrationSink,
+        progress: Option<&dyn ProgressSink>,
+    ) -> Result<(), IndexError> {
+        let result = self.register_documents(documents, parallelism, results, progress);
+        let result = result.await;
+        self.discard_after(&result).await;
+        result
+    }
+
+    #[expect(clippy::expect_used)]
     async fn register(
         &self,
         document: DocumentToRegister,
         progress: Option<&dyn ProgressSink>,
     ) -> Result<DocumentOutcome, IndexError> {
-        let result = self.register_document(&document, progress).await;
-        self.discard_after(&result).await;
-        result
+        let outcome = OneOutcome::default();
+        let documents = futures::stream::iter([document]).boxed();
+        self.register_stream(documents, 1, &outcome, progress)
+            .await?;
+        let outcome = outcome.0.into_inner();
+        let outcome = outcome.unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(outcome.expect("a registration that returned no error passed the document's outcome"))
     }
 
     async fn delete_others(
@@ -2450,13 +2638,143 @@ fn tables_not_created(configured: Result<EmbeddingModel, EmbeddingError>) -> Ind
     }
 }
 
-fn warn_version_unreadable(document: &DocumentToRegister, cause: &(dyn Error + 'static)) {
+fn warn_versions_unreadable(collection: &CollectionName, cause: &(dyn Error + 'static)) {
     tracing::warn!(
-        collection = document.collection.0.as_str(),
-        key = document.key.0.as_str(),
+        collection = collection.0.as_str(),
         cause = causes(cause).as_str(),
-        "the previous version of a document cannot be read, so the document is registered again"
+        "the stored versions of documents cannot be read; opening the index again to read them again"
     );
+}
+
+/// How many times registering reads the stored versions of a bulk again,
+/// opening the index again first, before the index counts as unreadable.
+const VERSION_READ_RETRIES: usize = 2;
+
+/// How a call of `register_stream` registers its documents.
+struct Registering<'a> {
+    parallelism: usize,
+    results: &'a dyn RegistrationSink,
+    progress: Option<&'a dyn ProgressSink>,
+}
+
+/// What deciding a document of a bulk compares it with.
+struct Comparing<'a> {
+    hash: &'a DocumentHash,
+    time: Option<TimeMicros>,
+    /// The document's rows in the document table.
+    versions: &'a [StoredVersion],
+    /// The chunk rows read for the bulk, and where the document's are in
+    /// them.
+    chunk_rows: &'a [RecordBatch],
+    found: &'a [(usize, u32)],
+}
+
+/// Whether deciding `document` compares its chunk rows with its row: it has
+/// one row, with the same body, and is not to be overwritten.
+fn compares(
+    document: &DocumentToRegister,
+    hash: &DocumentHash,
+    versions: &[StoredVersion],
+) -> bool {
+    match versions {
+        [stored] => !document.overwrite && stored.hash == hash.as_str(),
+        _ => false,
+    }
+}
+
+/// The bytes a bulk holds for `document`: its body, and its embedding vectors
+/// of `dimension` numbers, one per chunk, counted even when none is made.
+fn held_bytes(document: &DocumentToRegister, dimension: usize) -> usize {
+    let vectors = document.chunks.len().saturating_mul(dimension);
+    let vectors = vectors.saturating_mul(size_of::<f32>());
+    document.body.len().saturating_add(vectors)
+}
+
+/// The rows a bulk writes.
+struct BulkRows {
+    /// The keys of the documents written, with their outcomes.
+    written: Vec<(Key, DocumentOutcome)>,
+    chunk_rows: Vec<RecordBatch>,
+    document_rows: Vec<RecordBatch>,
+    /// The keys of the documents whose time alone is replaced.
+    timed: Vec<Key>,
+    time_rows: Vec<RecordBatch>,
+}
+
+impl BulkRows {
+    /// Builds the rows of the documents to write whose vectors `made` has,
+    /// and of the times to replace, a slice at a time. Each document and its
+    /// vectors are dropped once its rows are built, so that the bulk does not
+    /// hold its bodies again beside its rows while they are written.
+    async fn build(
+        model: &EmbeddingModel,
+        decided: Vec<Decided>,
+        made: Vec<Option<Vec<ChunkEmbedding>>>,
+        hooks: &dyn Hooks,
+    ) -> Result<Self, BoxError> {
+        let mut rows = Self {
+            written: Vec::new(),
+            chunk_rows: Vec::new(),
+            document_rows: Vec::new(),
+            timed: Vec::new(),
+            time_rows: Vec::new(),
+        };
+        let mut pace = Pace::new(hooks, Computation::Build);
+        for (done, vectors) in decided.into_iter().zip(made) {
+            match (done.action, vectors) {
+                (Action::Write(outcome), Some(vectors)) => {
+                    let new_rows = NewRows::build(model, &done.document, &vectors, &mut pace);
+                    let new_rows = new_rows.await?;
+                    let document_row = new_rows.document_row(&done.hash, done.time, &mut pace);
+                    rows.document_rows.push(document_row.await?);
+                    if new_rows.chunk_rows.num_rows() > 0 {
+                        rows.chunk_rows.push(new_rows.chunk_rows);
+                    }
+                    rows.written.push((done.document.key, outcome));
+                }
+                (Action::ReplaceTime, _) => {
+                    rows.time_rows
+                        .push(time_row(model, &done.document, done.time)?);
+                    rows.timed.push(done.document.key);
+                }
+                _ => {}
+            }
+        }
+        Ok(rows)
+    }
+}
+
+/// Collects the one outcome of `register`'s stream of one document.
+#[derive(Default)]
+struct OneOutcome(std::sync::Mutex<Option<DocumentOutcome>>);
+
+impl RegistrationSink for OneOutcome {
+    fn registered(&self, _collection: &CollectionName, _key: &Key, outcome: DocumentOutcome) {
+        let mut held = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *held = Some(outcome);
+    }
+}
+
+/// The rows of `chunk_rows` at `found`, one batch for each batch they are in.
+fn rows_at(
+    chunk_rows: &[RecordBatch],
+    found: &[(usize, u32)],
+) -> Result<Vec<RecordBatch>, BoxError> {
+    let mut rows = Vec::new();
+    for (position, batch) in chunk_rows.iter().enumerate() {
+        let at: Vec<u32> = found
+            .iter()
+            .filter(|(in_batch, _)| *in_batch == position)
+            .map(|(_, row)| *row)
+            .collect();
+        if !at.is_empty() {
+            rows.push(take_record_batch(batch, &UInt32Array::from(at))?);
+        }
+    }
+    Ok(rows)
 }
 
 /// The error and its sources, joined with `: `.
@@ -3721,13 +4039,12 @@ async fn read_rows(
     Ok(rows.try_collect().await?)
 }
 
-/// `rows` as the source of a write.
-fn reader(rows: RecordBatch) -> Box<dyn RecordBatchReader + Send> {
-    let schema = rows.schema();
-    Box::new(RecordBatchIterator::new(
-        [Ok::<_, ArrowError>(rows)],
-        schema,
-    ))
+/// `rows`, which have the same columns and at least one batch, as the source
+/// of a write.
+fn reader(rows: Vec<RecordBatch>) -> Box<dyn RecordBatchReader + Send> {
+    let schema = rows[0].schema();
+    let rows = rows.into_iter().map(Ok::<_, ArrowError>);
+    Box::new(RecordBatchIterator::new(rows, schema))
 }
 
 /// What the document table holds about a version of a document.

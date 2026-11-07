@@ -313,6 +313,9 @@ impl Index for TestIndex {
 mod tests {
     use std::sync::Arc;
 
+    use futures::StreamExt;
+
+    use super::super::RegistrationSink;
     use super::*;
     use crate::embedding::test_double::TestEmbedding;
     use crate::types::Chunk;
@@ -402,5 +405,47 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(stopped.deleted, 2);
+    }
+
+    /// Records the keys and outcomes passed to it, in order.
+    #[derive(Default)]
+    struct Outcomes(Mutex<Vec<(String, DocumentOutcome)>>);
+
+    impl RegistrationSink for Outcomes {
+        fn registered(&self, _collection: &CollectionName, key: &Key, outcome: DocumentOutcome) {
+            self.0.lock().unwrap().push((key.0.clone(), outcome));
+        }
+    }
+
+    #[tokio::test]
+    async fn registers_a_stream_one_document_at_a_time_until_one_fails() {
+        let double =
+            Arc::new(
+                TestIndex::new().on_register(|document, _| match document.key.0.as_str() {
+                    "same.md" => Ok(DocumentOutcome::Unchanged),
+                    "bad.md" => Err(IndexError::CannotWrite {
+                        source: "disk full".into(),
+                    }),
+                    _ => Ok(DocumentOutcome::Added),
+                }),
+            );
+        let index: Arc<dyn Index> = double.clone();
+        let keys = ["a.md", "same.md", "bad.md", "c.md"];
+        let documents = futures::stream::iter(keys.map(document)).boxed();
+        let outcomes = Outcomes::default();
+
+        let stopped = index.register_stream(documents, 4, &outcomes, None).await;
+
+        assert!(matches!(stopped, Err(IndexError::CannotWrite { .. })));
+        assert_eq!(
+            *outcomes.0.lock().unwrap(),
+            [
+                ("a.md".to_owned(), DocumentOutcome::Added),
+                ("same.md".to_owned(), DocumentOutcome::Unchanged),
+            ]
+        );
+        let registered =
+            ["a.md", "same.md", "bad.md"].map(|key| IndexCall::Register(document(key)));
+        assert_eq!(double.calls(), registered);
     }
 }
