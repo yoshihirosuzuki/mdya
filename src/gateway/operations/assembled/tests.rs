@@ -2321,6 +2321,7 @@ async fn updating_all_updates_each_updatable_collection_and_sums_the_counts() {
             ..UpdateReport::default()
         }
     );
+    assert_eq!(outcome.updated_collections, 2);
     assert!(outcome.unreadable_sources.is_empty());
     assert!(outcome.status_error.is_none());
     assert_eq!(
@@ -2407,6 +2408,7 @@ async fn updating_all_goes_on_past_a_collection_whose_source_cannot_be_read() {
             ..report(3, 0)
         }
     );
+    assert_eq!(outcome.updated_collections, 1);
     assert_eq!(outcome.unreadable_sources, [name("archives")]);
     assert_eq!(
         doubles.index.calls(),
@@ -3208,6 +3210,7 @@ async fn updating_a_collection_updates_it_reads_its_status_then_maintains() {
         .unwrap();
 
     assert_eq!(outcome.counts, report(3, 1));
+    assert_eq!(outcome.updated_collections, 1);
     assert!(outcome.unreadable_sources.is_empty());
     assert!(outcome.status_error.is_none());
     assert_eq!(
@@ -3280,6 +3283,7 @@ async fn a_collection_whose_source_cannot_be_read_is_skipped_and_still_maintaine
         .unwrap();
 
     assert_eq!(outcome.counts, UpdateReport::default());
+    assert_eq!(outcome.updated_collections, 0);
     assert_eq!(outcome.unreadable_sources, [name("notes")]);
     assert_eq!(outcome.anomalies(), [OutcomeAnomaly::SourcesUnreadable]);
     assert_eq!(

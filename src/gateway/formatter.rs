@@ -14,24 +14,47 @@
 //! A number that breaks the rules is a bug in mdya: the functions return it
 //! as an error, and the caller treats it as an unexpected failure.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the rest of `gateway` does not use these yet")
-)]
-
 use nu_ansi_term::Color;
 use serde::Serialize;
 
 use super::error_report::{Explanation, McpErrorCode};
+use super::operations::{DocumentText, VersionOutput};
 
 mod chars;
+mod messages;
 mod numbers;
+mod results;
 
 #[cfg(test)]
 mod tests;
 
 pub(crate) use chars::{escape_direction_characters, replace_controls};
+pub(crate) use messages::{Message, ModelUnknown, Prompt, human_message, human_prompt};
 pub(crate) use numbers::UnsafeNumber;
+pub(crate) use results::{human_collection_list, human_search, human_settings, human_status};
+
+/// The help as the command line writes it: the text clap made from mdya's
+/// own descriptions of the commands, with the control characters and the
+/// characters that change the direction of text in each line replaced all
+/// the same. The line breaks between the lines are kept.
+pub(crate) fn human_help(help: &str) -> String {
+    help.split('\n')
+        .map(|line| replace_controls(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// mdya's version as the command line writes it: `mdya 1.2.3` and a line
+/// break.
+pub(crate) fn human_version(version: &VersionOutput) -> String {
+    format!("{}\n", replace_controls(&version.version))
+}
+
+/// The text of a document as the command line writes it: as it is, without
+/// a line break added, and with no character replaced.
+pub(crate) fn human_document_text(document: &DocumentText) -> &str {
+    &document.text
+}
 
 /// `value` as the command line's JSON: one line, without a final line break.
 pub(crate) fn cli_json<T: Serialize + ?Sized>(value: &T) -> Result<String, UnsafeNumber> {

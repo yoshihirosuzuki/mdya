@@ -363,6 +363,12 @@ fn cli(error: &CliError) -> Shown<'_> {
                 .to_owned(),
             &[CONFIRMATION_FIX],
         ),
+        CliError::StdoutUnwritable { .. } => Shown::new(
+            1,
+            "the result could not be written to stdout".to_owned(),
+            &[STDOUT_FIX],
+        )
+        .causes_of(error),
     }
 }
 
@@ -743,6 +749,7 @@ const CHUNK_RANGE_FIX: &str = "Give the start chunk index (--chunk-index, or chu
 const UNKNOWN_SETTING_FIX: &str = "Check the setting names with mdya config list.";
 const LOG_LEVEL_FIX: &str = "Give --log-level a level (error, warn, info, debug, or trace), or levels for each part of mdya or of the libraries it uses, such as mdya=debug.";
 const USAGE_FIX: &str = "See mdya --help, or run the command with --help.";
+const STDOUT_FIX: &str = "Check that stdout can be written to (for example, that the disk of the file it goes to is not full), and run the command again.";
 
 const CONTENT_UNREADABLE_FIX: &str =
     "Make the content readable (for example, fix the permissions), then run mdya put again.";
