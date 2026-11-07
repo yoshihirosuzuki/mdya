@@ -42,7 +42,9 @@ fn spawn_watchdog(limit_mb: u64, on_breach: fn(used_mb: u64, limit_mb: u64) -> !
 
 fn run_watchdog(limit_mb: u64, on_breach: fn(used_mb: u64, limit_mb: u64) -> !) -> ! {
     let pid = get_current_pid().expect("sysinfo: current pid resolvable on supported platforms");
-    let mut sys = System::new();
+    // sysinfo fails here only on platforms it does not support, and there
+    // `get_current_pid` above has already failed.
+    let mut sys = System::new().expect("sysinfo: System constructible on supported platforms");
     loop {
         sys.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[pid]),
