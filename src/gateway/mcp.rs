@@ -1,17 +1,30 @@
-//! The MCP server, over stdio or HTTP.
+//! The MCP server, over stdio or HTTP. It passes what `formatter` makes to
+//! rmcp without changing it, and leaves turning it into JSON, and reading and
+//! writing the exchange, to rmcp.
 
-#![expect(dead_code, reason = "the rest of `gateway` does not use these yet")]
+#![cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the rest of `gateway` does not use these yet")
+)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use rmcp::service::QuitReason;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+use tokio_util::task::TaskTracker;
 
 use crate::types::BoxError;
 
 use super::error_report::ErrorReport;
-use super::escape::Escape;
 use super::operations::Operations;
+
+mod http;
+mod server;
+#[cfg(test)]
+mod tests;
+mod tools;
 
 /// What the MCP server works with.
 #[derive(Clone)]
@@ -21,7 +34,6 @@ pub(crate) struct McpServerParts {
     pub(crate) show_version: bool,
     /// The MCP output size limit in bytes. `None` applies none.
     pub(crate) size_limit: Option<u64>,
-    pub(crate) escape: Arc<dyn Escape>,
     pub(crate) error_report: Arc<dyn ErrorReport>,
 }
 
@@ -31,7 +43,14 @@ pub(crate) struct McpServerParts {
 /// write after the exchange started either lets it go on or ends it in the
 /// same way. Returns [`McpError::Transport`] when the exchange could not be
 /// started, including when the client closed the connection before it
-/// started.
+/// started. A panic outside the tool calls, in a task that rmcp runs for the
+/// exchange, leaves the exchange unable to go on: it is passed on as a panic,
+/// as an unexpected failure outside the tool calls. `reader` and `writer`
+/// are handed to rmcp as they are.
+///
+/// The future cannot be spawned as a task: the compiler cannot prove that
+/// the borrows that rmcp's futures for the exchange hold are `Send` for every
+/// lifetime. Await it where it is made, as `block_on` does.
 pub(crate) async fn serve_stdio<R, W>(
     parts: McpServerParts,
     reader: R,
@@ -41,34 +60,55 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let _ = (parts, reader, writer);
-    todo!()
+    let calls = TaskTracker::new();
+    let server = server::McpServer::new(parts, calls.clone());
+    let ended = match rmcp::serve_server(server, (reader, writer)).await {
+        Ok(running) => Ok(running.waiting().await),
+        Err(error) => Err(error),
+    };
+    calls.close();
+    calls.wait().await;
+    match ended {
+        Err(error) => Err(McpError::Transport {
+            source: Box::new(error),
+        }),
+        // The task that rmcp runs the exchange in panicked, or one that it
+        // sends a request to the client in did.
+        Ok(Err(error) | Ok(QuitReason::JoinError(error))) if error.is_panic() => {
+            std::panic::resume_unwind(error.into_panic())
+        }
+        // The exchange ended (the client closed the connection, or reading or
+        // writing failed), or its task was cancelled because the runtime is
+        // shutting down: the exchange is over either way.
+        Ok(_) => Ok(()),
+    }
 }
 
 /// Starts listening for the MCP server (HTTP). `host` is in the form of
 /// [`super::cli::McpTransport::Http`]; a host name listens on every address
 /// it resolves to.
 pub(crate) async fn listen_http(host: &str, port: u16) -> Result<McpHttpListener, McpError> {
-    let _ = (host, port);
-    todo!()
+    http::listen(host, port).await
 }
 
 /// Listening, not yet serving.
 #[derive(Debug)]
-pub(crate) struct McpHttpListener {}
+pub(crate) struct McpHttpListener {
+    listeners: Vec<TcpListener>,
+    addrs: Vec<SocketAddr>,
+}
 
 impl McpHttpListener {
     /// The addresses it listens on. With port 0, the port the OS chose.
     pub(crate) fn local_addrs(&self) -> &[SocketAddr] {
-        todo!()
+        &self.addrs
     }
 
     /// Runs the MCP server (HTTP) until the process ends. A failure in
     /// accepting a connection or in the exchange with one MCP client does
     /// not stop it and is not returned. A test stops it by aborting its task.
-    pub(crate) async fn serve(self, parts: McpServerParts) -> Result<(), McpError> {
-        let _ = parts;
-        todo!()
+    pub(crate) async fn serve(self, parts: McpServerParts) {
+        http::serve(self.listeners, parts).await;
     }
 }
 
@@ -94,6 +134,10 @@ pub(crate) enum McpError {
     /// the input; `detail` says what is wrong.
     #[error("the tool input {input} is not valid: {detail}")]
     InvalidToolInput { input: String, detail: String },
+    /// The search tool's `limit` is 0. A search limit cannot be 0, so the
+    /// server turns it away before it makes the search's input.
+    #[error("the limit is zero")]
+    ZeroLimit,
 }
 
 /// `host` and `port` as one address, with an IPv6 address (which `host`
@@ -103,31 +147,4 @@ pub(crate) fn socket_address(host: &str, port: u16) -> String {
         return format!("[{host}]:{port}");
     }
     format!("{host}:{port}")
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io;
-
-    use super::McpError;
-
-    fn unavailable(host: &str) -> McpError {
-        McpError::AddressUnavailable {
-            host: host.to_owned(),
-            port: 8000,
-            source: io::Error::new(io::ErrorKind::AddrInUse, "address in use"),
-        }
-    }
-
-    #[test]
-    fn an_unavailable_address_is_shown_with_only_an_ipv6_host_in_brackets() {
-        assert_eq!(
-            unavailable("::1").to_string(),
-            "cannot listen on [::1]:8000"
-        );
-        assert_eq!(
-            unavailable("127.0.0.1").to_string(),
-            "cannot listen on 127.0.0.1:8000"
-        );
-    }
 }

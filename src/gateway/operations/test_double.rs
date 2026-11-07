@@ -36,7 +36,8 @@ type Handler<I, O> =
 /// same name, and keeps the inputs it received. An operation without a
 /// handler panics, so that a test sets a handler for every operation it
 /// expects. The operations that hold a confirmation or a content reader also
-/// take an asynchronous handler, set with `on_*_async`.
+/// take an asynchronous handler, set with `on_*_async`, and so does the search,
+/// so that a test can hold a search in progress.
 #[derive(Default)]
 pub(crate) struct TestOperations {
     create_collection: Option<Handler<CreateCollectionInput, CollectionInfo>>,
@@ -174,6 +175,7 @@ impl TestOperations {
         DeleteCollectionOutcome
     );
     async_setter!(on_put_document_async, put_document, PutInput, PutOutcome);
+    async_setter!(on_search_async, search, SearchInput, SearchOutput);
     async_setter!(
         on_delete_document_async,
         delete_document,

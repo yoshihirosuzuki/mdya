@@ -387,6 +387,7 @@ fn mcp(error: &McpError) -> Shown<'_> {
         )
         .with_fix(format!("Fix the input {input} and call the tool again."))
         .invalid_input(input),
+        McpError::ZeroLimit => zero_limit(),
     }
 }
 
@@ -487,9 +488,7 @@ fn query<'a>(context: &ErrorContext, error: &'a QueryError) -> Shown<'a> {
             Shown::new(2, "the query is empty".to_owned(), &[EMPTY_QUERY_FIX])
                 .invalid_input("query")
         }
-        QueryError::ZeroLimit => {
-            Shown::new(2, "the limit is zero".to_owned(), &[ZERO_LIMIT_FIX]).invalid_input("limit")
-        }
+        QueryError::ZeroLimit => zero_limit(),
         QueryError::InvalidChunkRange => Shown::new(
             2,
             "the chunk range is not valid".to_owned(),
@@ -696,6 +695,11 @@ fn document_not_found<'a>(collection: Option<&str>, key: Option<&str>) -> Shown<
         shown = shown.detail("key", key);
     }
     shown
+}
+
+/// A search limit of 0, whether the search found it or the MCP server did.
+fn zero_limit<'a>() -> Shown<'a> {
+    Shown::new(2, "the limit is zero".to_owned(), &[ZERO_LIMIT_FIX]).invalid_input("limit")
 }
 
 const INTERNAL: &str = "internal";

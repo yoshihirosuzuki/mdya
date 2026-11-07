@@ -704,6 +704,20 @@ fn a_tool_input_against_its_schema_is_about_that_input() {
 }
 
 #[test]
+fn a_zero_limit_given_to_the_mcp_server_is_shown_as_one_the_search_finds() {
+    assert_shown(
+        GatewayError::Mcp(McpError::ZeroLimit),
+        2,
+        "Error: the limit is zero\n\
+         \n\
+         How to fix:\n    \
+         Give a limit of 1 or more.",
+        "invalid_input",
+        json!({ "input": "limit" }),
+    );
+}
+
+#[test]
 fn an_invalid_log_level_names_the_value_and_is_a_usage_error() {
     assert_shown(
         GatewayError::Entry(EntryError::InvalidLogLevel(InvalidLogLevel {
