@@ -20,19 +20,12 @@
 //! Each segment remembers where its first block starts in the source and
 //! where each of its text pieces came from, so every chunk's source range
 //! can be recorded (see [`super::Chunk::source_range`]).
-//!
-//! A document pulldown-cmark cannot report offsets for is chunked as plain
-//! text with the same fixed-width window, Markdown syntax included, so it
-//! is still indexed in full.
 
 use std::ops::Range;
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-use super::{
-    Chunk, ChunkingError, DraftChunk, MappedText, WINDOW_CHARS, chunk_plain_text,
-    split_with_overlap, tile,
-};
+use super::{Chunk, ChunkingError, DraftChunk, MappedText, WINDOW_CHARS, split_with_overlap, tile};
 
 /// Chunk a Markdown document. See module-level docs for the rules; the
 /// behaviour is fully covered by `#[cfg(test)]` cases below.
@@ -42,14 +35,7 @@ use super::{
 /// block is delivered as a `MetadataBlock` whose text the walker drops. A
 /// block without a closing delimiter is not metadata — the parser keeps it
 /// as ordinary content, so it stays in the body.
-///
-/// A document the offset parser cannot walk (see
-/// `offset_parser_would_panic`) is chunked as plain text instead, so it is
-/// still indexed in full.
 pub fn chunk_markdown(content: &str) -> Result<Vec<Chunk>, ChunkingError> {
-    if offset_parser_would_panic(content) {
-        return Ok(chunk_plain_text(content));
-    }
     let mut walker = Walker::new(content);
     for (event, range) in Parser::new_ext(content, PARSER_OPTIONS).into_offset_iter() {
         walker.handle(event, range);
@@ -57,34 +43,8 @@ pub fn chunk_markdown(content: &str) -> Result<Vec<Chunk>, ChunkingError> {
     Ok(tile(walker.finalize(), content.len()))
 }
 
-/// Shared by the offset walk and [`offset_parser_would_panic`]: the check is
-/// exact only when both parse with the same options.
+/// Parser options for the offset walk in [`chunk_markdown`].
 const PARSER_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-
-/// Whether pulldown-cmark's offset iterator panics on `content`
-/// (<https://github.com/pulldown-cmark/pulldown-cmark/issues/1129>). Some
-/// inputs — e.g. a list item holding only a link reference definition,
-/// directly followed by a whitespace-only line indented at least four
-/// columns past the item's text — leave an empty tight paragraph that the
-/// offset iterator unwraps. The plain iterator walks the same tree with the
-/// same code except at that point, where it returns `None` early instead of
-/// panicking, and yields events again when polled once more. So a plain
-/// iterator that resumes after its first `None` marks exactly the inputs the
-/// offset iterator panics on.
-///
-/// `Parser` is declared a `FusedIterator`, so the resume breaks that
-/// contract; the check depends on it, so do not `.fuse()` the parser here.
-/// A pulldown-cmark release that makes the plain iterator unwrap at that
-/// point too would make this check panic as well, and one that fixes the
-/// upstream issue would leave the check out of step with the offset
-/// iterator. The test `offset_parser_check_matches_the_upstream_panic`
-/// fails on either upgrade; remove this check once the upstream issue is
-/// fixed.
-fn offset_parser_would_panic(content: &str) -> bool {
-    let mut parser = Parser::new_ext(content, PARSER_OPTIONS);
-    parser.by_ref().for_each(drop);
-    parser.next().is_some()
-}
 
 /// A block-level run of text and where its first block starts in the
 /// source.
@@ -844,10 +804,12 @@ mod tests {
         assert!(range_texts(&md, &out)[1].starts_with('b'));
     }
 
-    /// A list item holding only a link reference definition, directly
-    /// followed by a whitespace-only line indented at least four columns
-    /// past the item's text.
-    const OFFSET_PARSER_TRIGGERS: [&str; 11] = [
+    /// Inputs that pulldown-cmark 0.13.4's offset iterator panicked on
+    /// (<https://github.com/pulldown-cmark/pulldown-cmark/issues/1129>): a
+    /// list item holding only a link reference definition, directly followed
+    /// by a whitespace-only line indented at least four columns past the
+    /// item's text.
+    const OFFSET_ITER_PANIC_INPUTS: [&str; 11] = [
         "- [a]: b\n      ",
         "- [a]: /u\n\t\t",
         "    indented\n- [^1]: foot\n\t\t",
@@ -862,78 +824,16 @@ mod tests {
     ];
 
     #[test]
-    fn documents_the_offset_parser_cannot_handle_are_indexed_in_full() {
-        for md in OFFSET_PARSER_TRIGGERS {
+    fn documents_that_panicked_the_offset_iter_in_0_13_4_are_indexed_in_full() {
+        for md in OFFSET_ITER_PANIC_INPUTS {
             let out = chunk_markdown(md).expect("ok");
             assert_ranges_tile(md, &out);
         }
-        let md = OFFSET_PARSER_TRIGGERS[3];
+        let md = OFFSET_ITER_PANIC_INPUTS[3];
         let out = chunk_markdown(md).expect("ok");
         assert!(
             out.iter().any(|c| c.body.contains("after text")),
-            "text after the trigger is missing: {out:?}"
+            "text after the list item is missing: {out:?}"
         );
-    }
-
-    #[test]
-    fn long_document_after_a_trigger_is_window_split_within_its_ranges() {
-        let md = format!(
-            "- [a]: b\n      \n\n{}\r\n\r\n{}\r\n",
-            "あ".repeat(800),
-            "い".repeat(800)
-        );
-        assert!(offset_parser_would_panic(&md));
-        let out = chunk_markdown(&md).expect("ok");
-        assert_eq!(out.len(), 3, "{out:?}");
-        assert_ranges_tile(&md, &out);
-        for chunk in &out {
-            assert!(md[chunk.source_range.clone()].contains(&chunk.body));
-        }
-    }
-
-    /// Whether pulldown-cmark's offset iterator really panics on `md`. Tests
-    /// unwind, so the panic can be caught here; release builds abort.
-    fn offset_iter_panics(md: &str) -> bool {
-        std::panic::catch_unwind(|| {
-            Parser::new_ext(md, PARSER_OPTIONS)
-                .into_offset_iter()
-                .count()
-        })
-        .is_err()
-    }
-
-    #[test]
-    fn offset_parser_check_matches_the_upstream_panic() {
-        // Tripwire for pulldown-cmark upgrades. If the triggers stop
-        // panicking upstream, the issue is fixed and
-        // `offset_parser_would_panic` can go; if the check and the real panic
-        // disagree, the guard no longer holds and must be revisited.
-        for md in OFFSET_PARSER_TRIGGERS {
-            assert!(offset_iter_panics(md), "{md:?} no longer panics upstream");
-        }
-        let near_misses = [
-            "- [a]: b\n  ",
-            "- [a]: b\n\t",
-            "- [a]: b\n\t ",
-            "- [a]: b\n     ",
-            "1. [a]: b\n      ",
-            "- [a]: b\n\n      \n",
-            "- [a]: b\r\n      \r\nrest",
-            "# T\n\n- [a]: b\n\nafter text\n",
-        ];
-        for md in near_misses {
-            assert!(!offset_iter_panics(md), "{md:?} now panics upstream");
-        }
-        let docs = OFFSET_PARSER_TRIGGERS
-            .into_iter()
-            .chain(near_misses)
-            .chain(TEXT_LESS_BLOCK_DOCS);
-        for md in docs {
-            assert_eq!(
-                offset_parser_would_panic(md),
-                offset_iter_panics(md),
-                "{md:?}"
-            );
-        }
     }
 }
