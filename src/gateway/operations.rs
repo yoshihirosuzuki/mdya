@@ -443,6 +443,8 @@ pub(crate) enum DeleteCollectionOutcome {
 pub(crate) struct UpdateOutcome {
     /// Summed over the collections.
     pub(crate) counts: UpdateReport,
+    /// How many collections were updated: those whose source could be read.
+    pub(crate) updated_collections: usize,
     /// The collections skipped because their source could not be read.
     pub(crate) unreadable_sources: Vec<CollectionName>,
     /// Why the index status could not be read after the operation.
@@ -789,6 +791,7 @@ mod tests {
     ) -> UpdateOutcome {
         UpdateOutcome {
             counts,
+            updated_collections: 1,
             unreadable_sources: unreadable.iter().map(|name| collection(name)).collect(),
             status_error: status_unreadable.then_some(IndexError::RebuildIncomplete),
         }

@@ -14,11 +14,9 @@
 //! operation at a time, `log_progress` writes logs and progress to stderr,
 //! with what the libraries write to stdout as warnings in the logs,
 //! `formatter` makes what is shown the user, for each output format, keep
-//! the rules on characters and numbers, `escape` makes control characters
-//! and the characters that change the direction of text harmless (and is to
-//! give way to `formatter`), and `error_report` turns every error into an
-//! exit code, an MCP error's code and details, and what its explanation
-//! holds.
+//! the rules on characters and numbers, and `error_report` turns every error
+//! into an exit code, an MCP error's code and details, and what its
+//! explanation holds.
 
 #![allow(clippy::print_stdout)]
 
@@ -42,7 +40,6 @@ use crate::watchdog::WatchdogSettings;
 mod cli;
 mod entry;
 mod error_report;
-mod escape;
 mod formatter;
 mod log_progress;
 mod mcp;

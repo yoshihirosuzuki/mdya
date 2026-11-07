@@ -60,6 +60,12 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 candle-core = { version = "0.11.1", default-features = false }
 candle-nn = { version = "0.11.1", default-features = false }
 candle-transformers = { version = "0.11.1", default-features = false }
+# Reads the command line arguments and makes the help. Without the default
+# `color`, so that the help it makes has no colors in it; the other default
+# features (`std`, `help`, `usage`, `error-context`, `suggestions`) are kept.
+# Without `env`: the environment variables are read where the components are
+# assembled, not by the argument parser.
+clap = { version = "4.6.7", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
 # The shared ingest flow processes several documents at once within one task
 # (`FuturesUnordered`), because what it borrows (the progress sink) keeps it
 # from spawning a task per document, and catches the panics of the futures it
