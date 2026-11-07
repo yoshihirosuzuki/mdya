@@ -45,6 +45,14 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait = "0.1.92"
+# Serves the MCP server over HTTP: accepts the connections and hands the
+# requests to rmcp's HTTP service. `axum::serve` keeps accepting after a failed
+# accept instead of returning, so one bad connection does not stop the server.
+# `tracing` lets it log a failed accept that is not about one connection, such
+# as running out of open files, as an error. The default features for JSON,
+# forms, queries, the matched path, the original URI, and tower's logging are
+# left off, as mdya does not use them.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "tracing"] }
 # Runs the embedding models on this PC, on the CPU. Their GPU and vendor math
 # library backends are features, all left off. candle-nn and
 # candle-transformers ask for candle-core 0.11 themselves, so the build has one
@@ -90,8 +98,18 @@ nu-ansi-term = "0.50.3"
 # lindera-ipadic. Move to 0.13 once the reqwest in lancedb's dependencies is
 # 0.13.
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+# The MCP server, over stdio (`server`, which reads and writes any async reader
+# and writer) and over HTTP (`transport-streamable-http-server`). Without the
+# default `macros`: the tools are defined by hand, so that a tool input that
+# does not fit its schema is a tool error naming the input, not a JSON-RPC
+# error. Its build script compiles nothing: it only sets git's hooks path to
+# `.githooks` in the directory two levels above rmcp's own, when that
+# directory holds both `.githooks` and `.git`. mdya's repository has no
+# `.githooks`, so the script does nothing even when the dependencies are
+# vendored into it.
+rmcp = { version = "3.9.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 # The JSON Schema of the MCP tools' results, made from the same types that the
-# CLI writes as JSON. rmcp, the MCP library the server is to use, depends on
+# CLI writes as JSON. rmcp, the MCP library the server uses, depends on
 # schemars 1 as well, so the two share one copy.
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -112,7 +130,11 @@ thiserror = "2.0.21"
 # features, which bring in C (onig) and C++ (esaxx_fast) code; regular
 # expressions come from fancy-regex instead.
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
-tokio = { version = "1.54.1", features = ["fs", "io-util", "rt", "sync"], default-features = false }
+tokio = { version = "1.54.1", features = ["fs", "io-util", "net", "rt", "sync"], default-features = false }
+# `TaskTracker`, with which the MCP server waits for the tool calls in
+# progress before it returns. `rt` brings in only futures-util, which the
+# build already has.
+tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }
 # The components log through the `tracing` macros, and `gateway` sets the
 # receiver that writes the logs out. mdya asks for only `std`, not the default
 # `attributes` feature (`#[instrument]`). A component that uses
@@ -178,5 +200,7 @@ arrow-array = "58"
 arrow-schema = "58"
 futures = "0.3.34"
 # `io-util` and `net` for the tests that answer HTTP requests in place of a
-# server, on a local port.
-tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt"] }
+# server, on a local port. `time` for the MCP server's tests that check that
+# it is still waiting a while later. `test-util` to start the MCP server with
+# its clock paused, so that a wait inside rmcp ends at once.
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt", "test-util", "time"] }
