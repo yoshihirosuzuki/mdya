@@ -292,9 +292,11 @@ impl AssembledOperations {
                 }
             }
         }
+        let updated_collections = finished.len();
         let status_error = self.warn_about_finished(finished).await;
         Ok(UpdateOutcome {
             counts,
+            updated_collections,
             unreadable_sources,
             status_error,
         })

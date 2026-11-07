@@ -270,3 +270,31 @@ fn the_color_is_added_after_the_replacement_so_it_is_not_replaced() {
 
     assert!(laid_out.starts_with("\u{1b}[31mError:\u{1b}[0m a\\u{1b}b\n"));
 }
+
+#[test]
+fn the_help_keeps_its_line_breaks_and_replaces_the_other_controls() {
+    assert_eq!(
+        human_help("Usage: mdya\n\n  a\u{1b}b\u{202e}c\n"),
+        format!("Usage: mdya\n\n  a{0}u{{1b}}b{0}u{{202e}}c\n", '\\')
+    );
+}
+
+#[test]
+fn the_version_is_one_line() {
+    let version = VersionOutput {
+        version: "mdya 1.2.3".to_owned(),
+    };
+
+    assert_eq!(human_version(&version), "mdya 1.2.3\n");
+}
+
+#[test]
+fn the_text_of_a_document_is_kept_as_it_is() {
+    let document = DocumentText {
+        collection: "notes".to_owned(),
+        key: "a.md".to_owned(),
+        text: "a\u{1b}b\u{202e}c".to_owned(),
+    };
+
+    assert_eq!(human_document_text(&document), "a\u{1b}b\u{202e}c");
+}
