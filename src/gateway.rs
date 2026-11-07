@@ -12,8 +12,10 @@
 //! command line and the MCP server, `operations` calls the components for each
 //! operation, `cli` and `mcp` talk to the user, `write_lock` keeps one write
 //! operation at a time, `log_progress` writes logs and progress to stderr,
-//! `escape` makes control characters and the characters that change the
-//! direction of text harmless, and `error_report` turns every error into an
+//! `formatter` makes what is shown the user, for each output format, keep
+//! the rules on characters and numbers, `escape` makes control characters
+//! and the characters that change the direction of text harmless (and is to
+//! give way to `formatter`), and `error_report` turns every error into an
 //! exit code, an MCP error's code and details, and what its explanation
 //! holds.
 
@@ -40,6 +42,7 @@ mod cli;
 mod entry;
 mod error_report;
 mod escape;
+mod formatter;
 mod log_progress;
 mod mcp;
 mod operations;

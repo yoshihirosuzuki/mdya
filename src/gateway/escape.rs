@@ -2,7 +2,9 @@
 //! as something it is not. In human-readable output, replaces control
 //! characters and the characters that change the direction of text with
 //! visible ones; in JSON output, escapes U+007F, U+0080 to U+009F, and the
-//! characters that change the direction of text.
+//! characters that change the direction of text. The replacing is the
+//! formatter's character rule; the formatter is to take over the rest as the
+//! other submodules move to it.
 
 #![cfg_attr(
     not(test),
@@ -15,7 +17,8 @@ use std::sync::Arc;
 
 use tokio::io::AsyncWrite;
 
-mod controls;
+use super::formatter;
+
 mod json;
 #[cfg(test)]
 pub(crate) mod test_double;
@@ -74,7 +77,7 @@ struct Escaping;
 
 impl Escape for Escaping {
     fn replace_controls<'a>(&self, text: &'a str) -> Cow<'a, str> {
-        controls::replace_controls(text)
+        formatter::replace_controls(text)
     }
 
     fn json_writer(&self, inner: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
