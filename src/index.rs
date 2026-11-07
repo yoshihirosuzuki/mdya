@@ -377,10 +377,10 @@ pub async fn place_fts_dictionary_config(data_dir: &Path) -> Result<(), IndexErr
         .join(LANGUAGE_MODELS_DIR)
         .join("lindera")
         .join("ipadic");
-    // The file operations block, so they run on tokio's blocking threads. The
-    // task cannot be cancelled: if the caller stops waiting, the task still
-    // runs to the end, placing the file or trying to remove its temporary file.
-    let task = tokio::task::spawn_blocking(move || {
+    // Once the task has started, it cannot be cancelled: if the caller stops
+    // waiting, the task still runs to the end, placing the file or trying to
+    // remove its temporary file.
+    let placed = run_blocking(move || {
         let path = dir.join("config.yml");
         if path.try_exists().map_err(cannot_write)? {
             return Ok(());
@@ -388,12 +388,25 @@ pub async fn place_fts_dictionary_config(data_dir: &Path) -> Result<(), IndexErr
         std::fs::create_dir_all(&dir).map_err(cannot_write)?;
         write_unless_present(&dir, &path, DICTIONARY_CONFIG)
     });
-    match task.await {
-        Ok(result) => result,
+    placed
+        .await
+        .unwrap_or_else(|error| Err(write_error(Box::new(error))))
+}
+
+/// Runs `work`, which blocks, on tokio's blocking threads, so that it does not
+/// hold up other asynchronous work, and waits for it to end. A panic in `work`
+/// reaches the caller as the same panic, not as an error. The error is
+/// returned only when the task was cancelled before it started, as can happen
+/// when the runtime shuts down. Once the task has started, it cannot be
+/// cancelled: a caller that stops waiting leaves it running to the end, and a
+/// panic in it then reaches no one, so callers wait for it.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => Ok(value),
         Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        Err(error) => Err(IndexError::CannotWrite {
-            source: Box::new(error),
-        }),
+        Err(error) => Err(error),
     }
 }
 
@@ -3313,7 +3326,9 @@ impl Store {
     }
 
     async fn lancedb_dir_exists(&self) -> Result<bool, IndexError> {
-        let exists = tokio::fs::try_exists(self.data_dir.join(LANCEDB_DIR)).await;
+        let lancedb_dir = self.data_dir.join(LANCEDB_DIR);
+        let exists = run_blocking(move || lancedb_dir.try_exists()).await;
+        let exists = exists.map_err(|error| read_error(error.into()))?;
         exists.map_err(|error| read_error(error.into()))
     }
 
@@ -3380,7 +3395,8 @@ impl Store {
         // panic on the way leaves nothing held.
         let taken = std::mem::take(&mut *held);
         let lancedb_dir = self.data_dir.join(LANCEDB_DIR);
-        let created = tokio::fs::create_dir_all(&lancedb_dir).await;
+        let created = run_blocking(move || std::fs::create_dir_all(lancedb_dir)).await;
+        let created = created.map_err(|error| write_error(error.into()))?;
         created.map_err(|error| write_error(error.into()))?;
         let connection = match taken.connection {
             Some(connection) => connection,
