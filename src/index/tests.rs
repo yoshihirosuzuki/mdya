@@ -3199,6 +3199,30 @@ async fn after_a_panic_while_reading_the_dictionary_configuration_the_next_regis
     assert_eq!(hooks.count(LanceCall::ReadDictionary), 2);
 }
 
+// ---------------------------------------------------------------- blocking work
+
+#[derive(Debug, PartialEq)]
+struct BlockingWorkPanicked(u8);
+
+#[tokio::test]
+async fn blocking_work_returns_its_value_once_it_has_ended() {
+    let value = run_blocking(|| 7).await.unwrap();
+
+    assert_eq!(value, 7);
+}
+
+#[tokio::test]
+async fn a_panic_in_blocking_work_comes_through_as_the_same_panic() {
+    let running = run_blocking(|| -> () { std::panic::panic_any(BlockingWorkPanicked(3)) });
+    let panicked = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(running));
+    let payload = panicked.await.unwrap_err();
+
+    assert_eq!(
+        payload.downcast_ref::<BlockingWorkPanicked>(),
+        Some(&BlockingWorkPanicked(3))
+    );
+}
+
 // ---------------------------------------------------------------- the pace of long computations
 
 #[tokio::test]
