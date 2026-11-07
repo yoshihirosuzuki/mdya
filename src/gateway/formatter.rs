@@ -8,7 +8,8 @@
 //! characters that change the direction of text; and what is passed to the
 //! MCP library keeps its strings as they are, as the MCP library escapes
 //! what JSON requires. The callers write or pass on what it makes without
-//! changing it. It writes nothing itself.
+//! changing it. It writes nothing itself. The logs do not go through it:
+//! `log_progress` writes them, and uses the rules on characters from here.
 //!
 //! A number that breaks the rules is a bug in mdya: the functions return it
 //! as an error, and the caller treats it as an unexpected failure.
@@ -29,13 +30,13 @@ mod numbers;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use chars::replace_controls;
+pub(crate) use chars::{escape_direction_characters, replace_controls};
 pub(crate) use numbers::UnsafeNumber;
 
 /// `value` as the command line's JSON: one line, without a final line break.
 pub(crate) fn cli_json<T: Serialize + ?Sized>(value: &T) -> Result<String, UnsafeNumber> {
     let json = numbers::to_json_string(value)?;
-    Ok(chars::escape_direction_characters(json))
+    Ok(chars::escape_direction_characters(&json).into_owned())
 }
 
 /// `value` as an MCP tool's result, to pass to the MCP library.
