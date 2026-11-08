@@ -33,10 +33,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-22.04-arm, windows-latest, macos-latest, macos-15-intel]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
 
-      # `@stable` is a channel ref by design (tracks latest stable Rust),
-      # so it is intentionally not SHA-pinned unlike the actions above.
+      # `@stable` is a branch of the action; `actions.lock` pins it to a
+      # commit, and `gh actions-lock --relock` moves the pin forward. The Rust
+      # toolchain itself comes from `rust-toolchain.toml`.
       - uses: dtolnay/rust-toolchain@stable
 
       # `lance-encoding`'s build script invokes `protoc`; the runners do not

@@ -20,9 +20,9 @@
 # `verify.yml` and is intentionally workflow_dispatch-only — the manual gate
 # is run before a release.
 #
-# Third-party actions are SHA-pinned, except `dtolnay/rust-toolchain@stable`
-# which is a channel ref by design (tracks latest stable Rust), matching
-# `verify.yml`.
+# `.github/workflows/actions.lock` pins every action to a commit, including
+# `dtolnay/rust-toolchain@stable`. Run `gh actions-lock` after changing any
+# `uses:`.
 
 name: ci
 
@@ -62,10 +62,11 @@ jobs:
     # useful while leaving room for a genuinely cold clippy-plus-test pass.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
 
-      # `@stable` is a channel ref by design (tracks latest stable Rust),
-      # intentionally not SHA-pinned, matching `verify.yml`.
+      # `@stable` is a branch of the action; `actions.lock` pins it to a
+      # commit, and `gh actions-lock --relock` moves the pin forward. The Rust
+      # toolchain itself comes from `rust-toolchain.toml`.
       # `dtolnay/rust-toolchain` uses the `minimal` rustup profile, which does
       # NOT include `rustfmt` or `clippy`; they must be listed explicitly so
       # the fmt-check and clippy steps below succeed.
@@ -73,7 +74,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: Swatinem/rust-cache@v2.9.3
 
       # `lance-encoding`'s build script invokes `protoc`; the runner does not
       # ship it. `lld` (the LLVM linker) is installed alongside it for the

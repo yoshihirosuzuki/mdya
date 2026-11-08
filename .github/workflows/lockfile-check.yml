@@ -1,0 +1,45 @@
+# Fails when `.github/workflows/actions.lock` is out of sync with the workflows,
+# or when a locked commit no longer verifies against its upstream tag or branch.
+#
+# The lockfile pins every action the workflows use, including the actions those
+# actions use, to a commit and to the identity of the action's repository.
+# `gh actions-lock` generates it, and it is never edited by hand: run
+# `gh actions-lock` after adding a workflow or changing any `uses:`, and commit
+# the workflows and the lockfile together. This job runs the same checks
+# without writing anything. It follows the example workflow in
+# github/gh-actions-lock, with the extension pinned to a release.
+
+name: lockfile-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Same group/cancel policy as ci.yml: a re-push to a PR cancels its own earlier
+# run; pushes to main cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege default; this workflow only reads the repository.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: actions.lock up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install gh-actions-lock
+        run: gh extension install github/gh-actions-lock --pin v0.4.1
+
+      - name: Verify the lockfile
+        run: gh actions-lock --verify

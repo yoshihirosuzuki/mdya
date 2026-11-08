@@ -11,7 +11,8 @@
 # (e.g. on the Dependabot bump itself) instead of at `git push --tags`. The fix
 # is then to mirror the bump into `dist-workspace.toml` and re-run `dist generate`.
 #
-# Third-party actions are SHA-pinned for supply-chain safety, matching `ci.yml`.
+# `.github/workflows/actions.lock` pins every action to a commit. Run
+# `gh actions-lock` after changing any `uses:`.
 
 name: release-workflow-check
 
@@ -46,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
 
       # `dist generate --check` runs `cargo metadata`, so it needs cargo. No
       # toolchain action is set up: the ubuntu-latest runner ships rustup, and
