@@ -2207,6 +2207,29 @@ async fn a_status_that_cannot_be_read_after_a_put_is_returned_and_logged() {
 }
 
 #[tokio::test]
+async fn truncated_chunks_after_a_put_are_warned_about() {
+    let doubles = Doubles::new()
+        .collections(TestCollections::with(vec![memos()]))
+        .index(TestIndex::new().on_status(|_, _, _| {
+            let mut status = status_with(DimensionResult::NotChecked);
+            status.collections =
+                BTreeMap::from([(name("memos"), vec![model_status("all-minilm", 2)])]);
+            Ok(status)
+        }));
+    let content = TestContentReader::returning(b"# A");
+    let operations = doubles.operations();
+
+    let (outcome, logs) = capture_async(operations.put_document(put_into("memos", &content))).await;
+
+    outcome.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].level, tracing::Level::WARN);
+    assert_eq!(logs[0].message, TRUNCATED_CHUNKS);
+    assert_eq!(field(&logs[0], "collection"), "memos");
+    assert_eq!(field(&logs[0], "chunks"), "2");
+}
+
+#[tokio::test]
 async fn putting_while_another_write_is_in_progress_reads_nothing() {
     let doubles = Doubles::new()
         .collections(TestCollections::with(vec![memos()]))
@@ -3422,6 +3445,46 @@ async fn updating_a_collection_while_another_write_is_in_progress_reads_nothing(
     assert_eq!(doubles.collections.calls(), []);
     assert_eq!(doubles.index.calls(), []);
     assert_eq!(progress.events(), []);
+}
+
+#[tokio::test]
+async fn a_status_that_cannot_be_read_after_updating_a_collection_is_returned_and_logged() {
+    let doubles = Doubles::new()
+        .collections(TestCollections::with(vec![notes()]))
+        .index(TestIndex::new().on_status(|_, _, _| Err(IndexError::RebuildIncomplete)));
+    let progress = Arc::new(TestProgress::new());
+    let operations = doubles.operations();
+
+    let (outcome, logs) =
+        capture_async(operations.update_collection(update_input("notes", &progress))).await;
+
+    assert!(matches!(
+        outcome.unwrap().status_error,
+        Some(IndexError::RebuildIncomplete)
+    ));
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].level, tracing::Level::WARN);
+    assert_rebuild_incomplete_is_the_cause(&logs[0]);
+    assert_eq!(logs[0].message, STATUS_UNREADABLE);
+}
+
+#[tokio::test]
+async fn updating_a_collection_without_optimizing_does_not_maintain() {
+    let doubles = Doubles::new().collections(TestCollections::with(vec![notes()]));
+    let progress = Arc::new(TestProgress::new());
+    let input = UpdateInput {
+        optimize: false,
+        ..update_input("notes", &progress)
+    };
+
+    doubles.operations().update_collection(input).await.unwrap();
+
+    assert!(!doubles.index.calls().contains(&IndexCall::Maintain));
+    assert!(
+        !progress
+            .events()
+            .contains(&ProgressEvent::MaintenanceStarted)
+    );
 }
 
 /// Checks that the warning gives `IndexError::RebuildIncomplete` as its cause.

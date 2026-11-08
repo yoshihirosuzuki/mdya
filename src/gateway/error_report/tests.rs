@@ -15,6 +15,7 @@ use crate::types::{CollectionName, CollectionType, EmbeddingModel, Key};
 
 use super::super::cli::CliError;
 use super::super::entry::EntryError;
+use super::super::formatter::UnsafeNumber;
 use super::super::log_progress::InvalidLogLevel;
 use super::super::mcp::McpError;
 use super::super::operations::{
@@ -1411,4 +1412,21 @@ fn a_collection_that_cannot_be_updated_without_a_name_is_not_named() {
             .starts_with("Error: the collection is of a type that cannot be updated\n")
     );
     assert_codes(&error, 1, "internal");
+}
+
+/// Compiles only for an error that can be sent to another thread, shared
+/// between threads, and kept as the cause of another error.
+fn is_an_error_to_send_share_and_keep<E: std::error::Error + Send + Sync + 'static>() {}
+
+#[test]
+fn the_errors_of_the_gateway_can_be_sent_shared_and_kept_as_causes() {
+    is_an_error_to_send_share_and_keep::<GatewayError>();
+    is_an_error_to_send_share_and_keep::<EntryError>();
+    is_an_error_to_send_share_and_keep::<OperationError>();
+    is_an_error_to_send_share_and_keep::<ModelCacheDirUndetermined>();
+    is_an_error_to_send_share_and_keep::<CliError>();
+    is_an_error_to_send_share_and_keep::<McpError>();
+    is_an_error_to_send_share_and_keep::<WriteLockError>();
+    is_an_error_to_send_share_and_keep::<InvalidLogLevel>();
+    is_an_error_to_send_share_and_keep::<UnsafeNumber>();
 }
