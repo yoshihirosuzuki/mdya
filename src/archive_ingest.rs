@@ -7,6 +7,10 @@ use crate::index::Index;
 use crate::ingest::{Ingest, IngestError};
 use crate::types::TypeAttributes;
 
+mod tar;
+mod transfer;
+mod zip;
+
 /// Creates the component.
 pub fn create(format: Arc<dyn Format>, index: Arc<dyn Index>) -> Arc<dyn Ingest> {
     let _ = (format, index);

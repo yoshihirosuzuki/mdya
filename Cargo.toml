@@ -66,6 +66,12 @@ candle-transformers = { version = "0.11.1", default-features = false }
 # Without `env`: the environment variables are read where the components are
 # assembled, not by the argument parser.
 clap = { version = "4.6.7", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
+# Inflates the deflate data in zip files and the gzip members of tar.gz files,
+# and computes the CRC-32 of zip entries. `archive_ingest` reads the zip and tar
+# formats itself; this is only for the compression and the checksum. The tar
+# reader relies on where the gzip decoder stops at the end of a member, which
+# was checked against 1.1.10.
+flate2 = "1.1.10"
 # The shared ingest flow processes several documents at once within one task
 # (`FuturesUnordered`), because what it borrows (the progress sink) keeps it
 # from spawning a task per document, and catches the panics of the futures it

@@ -4038,6 +4038,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "clap",
+ "flate2",
  "futures",
  "lancedb",
  "libc",
