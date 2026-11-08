@@ -39,8 +39,15 @@ fn the_replaced_panic_hook_writes_the_version_the_location_the_message_and_the_b
     );
     assert!(stderr.contains("tests.rs:"), "{stderr}");
     assert!(stderr.contains(":\na bug\\u{1b}\nBacktrace:\n"), "{stderr}");
-    assert!(stderr.contains(CHILD), "{stderr}");
+    // On Windows, the backtrace of the release build does not name mdya's
+    // functions (the release profile in `Cargo.toml`).
+    if !cfg!(windows) {
+        assert!(stderr.contains(PANICKING_FUNCTION), "{stderr}");
+    }
 }
+
+/// The function that the test in a process of its own panics in.
+const PANICKING_FUNCTION: &str = "panics_in_a_function_of_its_own";
 
 #[test]
 #[ignore = "run in a process of its own by the test above"]
@@ -53,6 +60,13 @@ fn replaces_the_panic_hook_and_panics_in_a_process_of_its_own() {
         return;
     }
     replace_panic_hook();
+    panics_in_a_function_of_its_own();
+}
+
+/// Panics in a function of its own, which the release build might otherwise
+/// put inside its caller.
+#[inline(never)]
+fn panics_in_a_function_of_its_own() {
     panic!("a bug\u{1b}");
 }
 
@@ -74,9 +88,14 @@ fn backtrace_captured_here() -> String {
 }
 
 /// The release build keeps the symbols, so that the backtrace that the panic
-/// hook writes names the functions. `verify.yml` runs this test with the
-/// release settings on each operating system that mdya is built for.
+/// hook writes names the functions on Linux and macOS. `verify.yml` runs this
+/// test with the release settings on each of them.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "on Windows, the backtrace of the release build does not name mdya's functions \
+              (the release profile in Cargo.toml)"
+)]
 fn a_backtrace_names_the_functions_it_went_through() {
     let backtrace = backtrace_captured_here();
 

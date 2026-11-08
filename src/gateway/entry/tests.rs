@@ -30,6 +30,20 @@ use super::super::test_double::watchdog::{TestWatchdog, WatchdogState};
 use super::super::{Factories, Io, LogSettings, run_with};
 use super::{Environment, hf_token, progress_terminal, size_limit};
 
+/// The home directory that the tests give, an absolute path on the operating
+/// system that runs them.
+#[cfg(windows)]
+const HOME: &str = r"C:\Users\user";
+#[cfg(not(windows))]
+const HOME: &str = "/home/user";
+
+/// The working directory that the tests give, an absolute path on the
+/// operating system that runs them.
+#[cfg(windows)]
+const WORK: &str = r"C:\work";
+#[cfg(not(windows))]
+const WORK: &str = "/work";
+
 /// What a run is given, besides the arguments.
 struct Setup {
     config: TestConfig,
@@ -47,7 +61,7 @@ impl Setup {
         Self {
             config: TestConfig::new(),
             collections: TestCollections::new(),
-            dirs: test_dir_lookup(Some("/home/user"), Ok("/work")),
+            dirs: test_dir_lookup(Some(HOME), Ok(WORK)),
             env: Vec::new(),
             stdin: Vec::new(),
             stderr_is_terminal: false,
@@ -248,12 +262,12 @@ fn a_log_level_that_is_not_valid_is_a_usage_error_before_anything_is_assembled()
 fn the_default_settings_and_index_directory_is_under_the_home_directory() {
     let outcome = run(&["config", "list"], Setup::new());
 
-    let data_dir = Path::new("/home/user/.mdya");
+    let data_dir = Path::new(HOME).join(".mdya");
     assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.stderr);
-    assert_eq!(outcome.records.config_dirs, [data_dir]);
+    assert_eq!(outcome.records.config_dirs, [data_dir.as_path()]);
     assert_eq!(
         outcome.records.environment,
-        [crate::index::process_environment(data_dir)]
+        [crate::index::process_environment(&data_dir)]
     );
 }
 
@@ -261,13 +275,13 @@ fn the_default_settings_and_index_directory_is_under_the_home_directory() {
 fn a_relative_settings_and_index_directory_is_resolved_from_the_working_directory() {
     let outcome = run(&["--data-dir", "data", "config", "list"], Setup::new());
 
-    assert_eq!(outcome.records.config_dirs, [Path::new("/work/data")]);
+    assert_eq!(outcome.records.config_dirs, [Path::new(WORK).join("data")]);
 }
 
 #[test]
 fn a_settings_and_index_directory_that_cannot_be_determined_ends_before_anything_is_assembled() {
     let mut setup = Setup::new();
-    setup.dirs = test_dir_lookup(None, Ok("/work"));
+    setup.dirs = test_dir_lookup(None, Ok(WORK));
 
     let outcome = run(&["config", "list"], setup);
 
@@ -337,7 +351,7 @@ fn embedding_gets_the_model_the_token_and_the_default_model_cache_directory() {
         [EmbeddingRecord {
             model: "cl-nagoya/ruri-v3-30m".to_owned(),
             hf_token: Some("hf_secret".to_owned()),
-            model_cache_dir: Ok(PathBuf::from("/home/user/.mdya-models")),
+            model_cache_dir: Ok(Path::new(HOME).join(".mdya-models")),
         }]
     );
 }
@@ -351,14 +365,14 @@ fn a_relative_model_cache_directory_is_resolved_from_the_working_directory() {
 
     assert_eq!(
         outcome.records.embeddings[0].model_cache_dir,
-        Ok(PathBuf::from("/work/models"))
+        Ok(Path::new(WORK).join("models"))
     );
 }
 
 #[test]
 fn a_model_cache_directory_that_cannot_be_determined_is_an_error_only_when_it_is_asked_for() {
     let mut setup = Setup::new();
-    setup.dirs = test_dir_lookup(Some("/home/user"), Err(std::io::ErrorKind::NotFound));
+    setup.dirs = test_dir_lookup(Some(HOME), Err(std::io::ErrorKind::NotFound));
 
     let outcome = run(&["--model-cache-dir", "models", "config", "list"], setup);
 

@@ -187,7 +187,11 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 [profile.release]
 lto = "thin"
 # Strip the debug information but keep the symbols, so that the backtrace that
-# mdya writes on an unexpected failure names the functions it went through.
+# mdya writes on an unexpected failure names the functions it went through on
+# Linux and macOS. On Windows, rustc does not use this setting. The backtrace
+# looks for the names in a `.pdb` file there, which mdya is shipped without;
+# even beside the `.pdb` file that the release settings make, it does not name
+# mdya's functions.
 strip = "debuginfo"
 opt-level = 3
 codegen-units = 1
