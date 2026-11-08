@@ -469,6 +469,8 @@ enum LanceCall {
     ReadDictionary,
     /// Reading a document's rows, or the rows of many documents.
     ReadRows(TableName),
+    /// Reading the state of both tables' vector columns.
+    ReadColumns,
     /// Upserting, updating some columns of, or deleting the rows of
     /// documents.
     WriteRows(TableName),
@@ -682,7 +684,13 @@ struct LanceDbIndex {
     /// The lock makes concurrent first writes read it once; a failed or
     /// panicking read leaves it unread, and the next write reads it again.
     dictionary_read: tokio::sync::Mutex<bool>,
-    /// Makes the functions that write to the tables write one at a time.
+    /// Makes the functions that write to the tables run one at a time. Each
+    /// of them takes it before its first read and keeps it until it returns,
+    /// so that nothing else this component writes changes what it read
+    /// before it has written. Registering is the exception: it takes it to
+    /// prepare the tables, to open them again, and to write each bulk,
+    /// checking the vector columns again first. Other processes are kept out
+    /// by the lock `gateway` holds for each write operation.
     writing: tokio::sync::Mutex<()>,
     /// Always [`KEY_BATCH_LEN`]; a field so that the unit tests can make the
     /// batches small.
@@ -1012,7 +1020,7 @@ impl LanceDbIndex {
             StatusScope::Collections(names) if names.is_empty() => return Ok(Counts::default()),
             StatusScope::Collections(names) => Some(collections_filter(names)),
         };
-        let columns = Columns::read(tables).await?;
+        let columns = self.read_columns(tables).await?;
         // Partway through switching the vector columns, a table lacks the
         // column it reads, or the two tables' columns name different models,
         // and no chunk counts as having a vector.
@@ -1088,7 +1096,7 @@ impl LanceDbIndex {
         let Some(tables) = self.store.tables_to_read().await? else {
             return Ok(());
         };
-        let columns = Columns::read(&tables).await?;
+        let columns = self.read_columns(&tables).await?;
         let configured = self.embedding.model().await;
         let ready = !columns.mid_switch()
             && columns
@@ -1104,6 +1112,15 @@ impl LanceDbIndex {
         }
         let checked = self.check_columns(&tables, columns, &configured).await;
         checked.map(|_| ())
+    }
+
+    /// The state of the vector columns of `tables`.
+    async fn read_columns(&self, tables: &Tables) -> Result<Columns, IndexError> {
+        self.hooks
+            .before(LanceCall::ReadColumns)
+            .await
+            .map_err(read_error)?;
+        Columns::read(tables).await
     }
 
     /// Checks, before documents are written, that the vector columns hold
@@ -1227,7 +1244,7 @@ impl LanceDbIndex {
         };
         let model = self.embedding.model().await;
         let model = model.map_err(IndexError::Embedding)?;
-        let mut columns = Columns::read(&tables).await?;
+        let mut columns = self.read_columns(&tables).await?;
         let mut kept = self.open_rebuild_table().await?;
         self.drop_other_models(&tables, &mut columns, &mut kept, &model)
             .await?;
@@ -2132,7 +2149,7 @@ impl LanceDbIndex {
         let Some(tables) = tables else {
             return Err(tables_not_created(configured));
         };
-        let columns = Columns::read(&tables).await?;
+        let columns = self.read_columns(&tables).await?;
         let model = self.check_columns(&tables, columns, &configured).await?;
         Ok(Prepared { tables, model })
     }
@@ -2513,7 +2530,7 @@ impl LanceDbIndex {
     /// while the vectors are made, so a rebuild may have changed the columns
     /// since the first check.
     async fn check_columns_again(&self, prepared: &Prepared) -> Result<(), IndexError> {
-        let columns = Columns::read(&prepared.tables).await?;
+        let columns = self.read_columns(&prepared.tables).await?;
         let made_for = Ok(prepared.model.clone());
         let checked = self.check_columns(&prepared.tables, columns, &made_for);
         checked.await.map(|_| ())
