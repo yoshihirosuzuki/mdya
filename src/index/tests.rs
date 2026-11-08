@@ -453,6 +453,73 @@ async fn a_failed_connect_to_read_is_an_error_reading() {
 }
 
 #[tokio::test]
+async fn a_relative_data_directory_beginning_with_db_opens_the_lancedb_in_it() {
+    prepare_full_text_search().await;
+    // LanceDB takes a path that begins with "db" for a LanceDB server. Tests
+    // run in the package's directory, so the data directory is made there,
+    // and is named relative to it.
+    let data_dir = tempfile::Builder::new()
+        .prefix("db")
+        .tempdir_in(".")
+        .unwrap();
+    let relative = PathBuf::from(data_dir.path().file_name().unwrap());
+    let store = Store::new(relative, Arc::new(TestHooks::default()));
+
+    let tables = store.tables_to_write(Some(&model(8))).await;
+
+    assert!(tables.unwrap().is_some());
+    assert!(data_dir.path().join(LANCEDB_DIR).is_dir());
+}
+
+#[tokio::test]
+async fn errors_with_a_cause_give_it_as_their_source() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    let (papers, keep_none) = (name("papers"), HashSet::new());
+    register_all(
+        &index,
+        &[document("a.md", ASCII_BODY), document_in("papers", "b.md")],
+    )
+    .await;
+    let unavailable = Arc::new(
+        TestEmbedding::new(MODEL_NAME, 8).failing_with(EmbeddingFailure::ModelUnavailable),
+    );
+    let without_model = index_in(data_dir.path(), unavailable, &hooks);
+
+    hooks.plan(LanceCall::ReadRows(TableName::Document), Plan::Fail);
+    let unreadable = index.has_document(&name(COLLECTION), &key("a.md")).await;
+    hooks.plan(LanceCall::WriteRows(TableName::Chunk), Plan::Fail);
+    let unwritable = index.delete_document(&name(COLLECTION), &key("a.md")).await;
+    hooks.plan(LanceCall::WriteRows(TableName::Chunk), Plan::Fail);
+    let stopped = index.delete_others(&papers, &keep_none, &[]).await;
+    let embedding = register(&without_model, &document("c.md", MIXED_BODY)).await;
+
+    let source = |error: &dyn std::error::Error| error.source().map(ToString::to_string);
+    let unreadable = unreadable.unwrap_err();
+    let unwritable = unwritable.unwrap_err();
+    assert!(matches!(unreadable, IndexError::CannotRead { .. }));
+    assert!(matches!(unwritable, IndexError::CannotWrite { .. }));
+    for (error, call) in [(unreadable, "ReadRows"), (unwritable, "WriteRows")] {
+        let cause = source(&error).unwrap_or_default();
+        assert!(
+            cause.contains(&format!("planned failure of {call}")),
+            "{cause}"
+        );
+    }
+    // A stopped deletion gives the error it stopped at, which gives its own
+    // cause.
+    let stopped = stopped.unwrap_err();
+    let inner = std::error::Error::source(&stopped).expect("no source");
+    assert!(inner.downcast_ref::<IndexError>().is_some(), "{inner}");
+    assert!(source(inner).is_some_and(|cause| cause.contains("planned failure")));
+    let embedding = embedding.unwrap_err();
+    assert!(matches!(embedding, IndexError::Embedding(_)));
+    let cause = std::error::Error::source(&embedding).expect("no source");
+    assert!(cause.downcast_ref::<EmbeddingError>().is_some(), "{cause}");
+}
+
+#[tokio::test]
 async fn concurrent_first_calls_all_succeed_and_connect_once() {
     let hooks = Arc::new(TestHooks::default());
     let (_data_dir, store) = store_with(&hooks);
@@ -749,6 +816,30 @@ async fn both_tables_get_full_text_btree_and_vector_indexes() {
         indexed_columns(&tables.chunk).await,
         expected("text", "vector")
     );
+}
+
+#[tokio::test]
+async fn the_vector_indexes_measure_cosine_distance() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, store) = store_with(&hooks);
+
+    let tables = store
+        .tables_to_write(Some(&model(8)))
+        .await
+        .unwrap()
+        .unwrap();
+
+    for (table, column) in [(&tables.document, "vectors"), (&tables.chunk, "vector")] {
+        let indexes = table.list_indices().await.unwrap();
+        let index = indexes
+            .iter()
+            .find(|index| index.columns == [column])
+            .expect("no vector index");
+        let stats = table.index_stats(&index.name).await.unwrap();
+        let distance = stats.and_then(|stats| stats.distance_type);
+        assert_eq!(distance, Some(DistanceType::Cosine), "{column}");
+    }
 }
 
 #[tokio::test]
@@ -2315,6 +2406,52 @@ async fn registering_partway_through_switching_to_another_model_is_an_unfinished
     assert_eq!(index_versions(data_dir.path()).await, before);
 }
 
+/// Registers a stream of one new document, and returns what the registration
+/// returned and how many documents it asked the stream for.
+async fn register_counting_asks(
+    index: &LanceDbIndex,
+    hooks: &Arc<TestHooks>,
+) -> (Result<(), IndexError>, usize) {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let stream = counted_stream(vec![document("b.md", MIXED_BODY)], &asked);
+    let outcomes = RecordedOutcomes::new(hooks);
+    let registered = index.register_stream(stream, 1, &outcomes, None).await;
+    (registered, asked.load(Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn a_model_mismatch_and_an_unfinished_rebuild_are_returned_before_any_document_is_asked_for()
+{
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    register(&index, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    let mismatched = index_in(data_dir.path(), embedding_of("other-model", 8), &hooks);
+
+    let (mismatch, asked_mismatched) = register_counting_asks(&mismatched, &hooks).await;
+    // The chunk table reads vectors of another model.
+    let tables = open_tables(data_dir.path()).await;
+    add_new_columns_for(&tables.chunk, TableName::Chunk, &model(4)).await;
+    let switch = LanceDbIndex::new(
+        data_dir.path().to_path_buf(),
+        embedding_of(MODEL_NAME, 4),
+        Arc::new(TestHooks::default()),
+    );
+    let chunk = open_tables(data_dir.path()).await.chunk;
+    switch
+        .switch_to_new_columns(&chunk, TableName::Chunk, true)
+        .await
+        .unwrap();
+    let (unfinished, asked_unfinished) = register_counting_asks(&index, &hooks).await;
+
+    assert!(matches!(mismatch, Err(IndexError::ModelMismatch { .. })));
+    assert_eq!(asked_mismatched, 0);
+    assert!(matches!(unfinished, Err(IndexError::RebuildIncomplete)));
+    assert_eq!(asked_unfinished, 0);
+}
+
 #[tokio::test]
 async fn after_a_failed_write_the_next_registration_opens_lancedb_again() {
     prepare_full_text_search().await;
@@ -2381,6 +2518,33 @@ async fn versions_that_cannot_be_read_are_read_again_twice_after_opening_lancedb
         }
         assert_eq!(embed_calls(&embedding), 1, "{case}");
         assert_index_holds(data_dir.path(), &[&same], &embedding).await;
+    }
+}
+
+#[tokio::test]
+async fn a_registration_warns_each_time_it_reads_the_versions_again() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    let same = document("a.md", ASCII_BODY);
+    register(&index, &same).await.unwrap();
+    for _ in 0..2 {
+        hooks.plan(LanceCall::ReadRows(TableName::Document), Plan::Fail);
+    }
+
+    let (outcome, logs) = capture_async(register(&index, &same)).await;
+
+    assert_eq!(outcome.unwrap(), DocumentOutcome::Unchanged);
+    let warnings: Vec<_> = logs.iter().filter(|log| log.level == Level::WARN).collect();
+    assert_eq!(warnings.len(), 2, "{logs:?}");
+    for warning in warnings {
+        assert!(warning.message.contains("cannot be read"), "{warning:?}");
+        assert!(
+            warning
+                .fields
+                .contains(&("collection".to_owned(), COLLECTION.to_owned())),
+            "{warning:?}"
+        );
     }
 }
 
@@ -3007,6 +3171,64 @@ async fn a_failed_write_passes_no_outcome_of_the_documents_being_written() {
         assert_eq!(outcomes_again, expected, "{case}");
         let all: Vec<_> = documents.iter().collect();
         assert_index_holds(data_dir.path(), &all, &embedding).await;
+    }
+}
+
+#[tokio::test]
+async fn a_document_written_again_and_stopped_partway_is_left_as_the_rules_for_writing_say() {
+    use LanceCall::{AddRows, WriteRows};
+    use TableName::{Chunk, Document};
+    prepare_full_text_search().await;
+    // Between deleting and adding the chunk rows, the old document row stays
+    // and the document has no chunk rows. Between the two tables, the old
+    // document row stays beside the new chunk rows. Between deleting and
+    // adding the document rows, the document has no document row, so it is
+    // neither found nor counted.
+    let stops = [
+        (AddRows(Chunk), true, false),
+        (WriteRows(Document), true, true),
+        (AddRows(Document), false, true),
+    ];
+    for (stop, old_row_left, new_chunk_rows) in stops {
+        let hooks = Arc::new(TestHooks::default());
+        let (data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+        let old = document("a.md", ASCII_BODY);
+        register(&index, &old).await.unwrap();
+        let new = document("a.md", MIXED_BODY);
+        hooks.plan(stop, Plan::Fail);
+
+        let stopped = register(&index, &new).await;
+        let found = index.has_document(&old.collection, &old.key).await;
+        let counts = index.document_counts().await;
+
+        let case = format!("{stop:?}");
+        assert!(
+            matches!(stopped, Err(IndexError::CannotWrite { .. })),
+            "{case}"
+        );
+        let bodies: Vec<String> = document_rows(data_dir.path())
+            .await
+            .into_iter()
+            .map(|row| row.body)
+            .collect();
+        let expected_bodies: Vec<String> = match old_row_left {
+            true => vec![ASCII_BODY.to_owned()],
+            false => vec![],
+        };
+        assert_eq!(bodies, expected_bodies, "{case}");
+        let chunks = chunk_rows(data_dir.path()).await;
+        let expected_chunks = if new_chunk_rows { new.chunks.len() } else { 0 };
+        assert_eq!(chunks.len(), expected_chunks, "{case}");
+        for chunk in &chunks {
+            let range = chunk.range.start as usize..chunk.range.end as usize;
+            assert_eq!(chunk.text, MIXED_BODY[range], "{case}");
+        }
+        assert_eq!(found.unwrap(), old_row_left, "{case}");
+        let expected_counts = match old_row_left {
+            true => BTreeMap::from([(name(COLLECTION), 1)]),
+            false => BTreeMap::new(),
+        };
+        assert_eq!(counts.unwrap(), expected_counts, "{case}");
     }
 }
 
@@ -5271,6 +5493,48 @@ fn assert_error(expected: ExpectedError, result: &Result<u64, IndexError>, case:
         | (ExpectedError::CannotWrite, Err(IndexError::CannotWrite { .. })) => {}
         _ => panic!("{case}: {result:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_rebuild_takes_each_step_on_the_chunk_table_before_the_document_table() {
+    use LanceCall::{AddColumns, CreateIndex, DropColumns, RenameColumns};
+    use TableName::{Chunk, Document};
+    prepare_full_text_search().await;
+    let documents = documents_to_rebuild();
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) =
+        index_over_registered(&documents, embedding_of(OTHER_MODEL, 16), &hooks).await;
+    let calls_before = hooks.calls().len();
+
+    rebuild(&index, false, 1).await.unwrap();
+
+    let step = |call: &LanceCall| {
+        matches!(
+            call,
+            AddColumns(_) | CreateIndex(_) | DropColumns(_) | RenameColumns(_)
+        )
+    };
+    let steps: Vec<LanceCall> = hooks
+        .calls()
+        .split_off(calls_before)
+        .into_iter()
+        .filter(step)
+        .collect();
+    // Both tables' new columns are indexed before either table switches to
+    // them, so that a stop partway through switching needs no index.
+    assert_eq!(
+        steps,
+        [
+            AddColumns(Chunk),
+            AddColumns(Document),
+            CreateIndex(Chunk),
+            CreateIndex(Document),
+            DropColumns(Chunk),
+            RenameColumns(Chunk),
+            DropColumns(Document),
+            RenameColumns(Document),
+        ]
+    );
 }
 
 #[tokio::test]
