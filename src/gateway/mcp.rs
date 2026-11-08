@@ -2,11 +2,6 @@
 //! rmcp without changing it, and leaves turning it into JSON, and reading and
 //! writing the exchange, to rmcp.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the rest of `gateway` does not use these yet")
-)]
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -18,6 +13,7 @@ use tokio_util::task::TaskTracker;
 use crate::types::BoxError;
 
 use super::error_report::ErrorReport;
+use super::log_progress::Console;
 use super::operations::Operations;
 
 mod http;
@@ -35,6 +31,9 @@ pub(crate) struct McpServerParts {
     /// The MCP output size limit in bytes. `None` applies none.
     pub(crate) size_limit: Option<u64>,
     pub(crate) error_report: Arc<dyn ErrorReport>,
+    /// Where the name of a tool whose call panicked is written, after what
+    /// the panic hook wrote.
+    pub(crate) console: Arc<dyn Console>,
 }
 
 /// Runs the MCP server over the given reader and writer. Once the exchange

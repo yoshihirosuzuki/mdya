@@ -14,7 +14,7 @@ use serde_json::json;
 use tokio_util::task::TaskTracker;
 
 use super::super::error_report::GatewayError;
-use super::super::formatter::{self, McpToolError, UnsafeNumber};
+use super::super::formatter::{self, FailurePlace, McpToolError, UnsafeNumber};
 use super::super::operations::{OperationError, VersionOutput, version};
 use super::tools::{self, Tool};
 use super::{McpError, McpServerParts};
@@ -82,8 +82,19 @@ impl ServerHandler for McpServer {
         let result = match call.await {
             Ok(result) => result,
             // A panic, or the runtime shutting down under the call: either way
-            // an unexpected failure.
-            Err(_) => unexpected_failure(&self.parts),
+            // an unexpected failure. A panic also has the tool's name written
+            // after what the panic hook wrote, so that a bug report says which
+            // call it was.
+            Err(error) => {
+                if error.is_panic() {
+                    self.parts
+                        .console
+                        .write_stderr(&formatter::human_failure_place(FailurePlace::McpTool(
+                            tool.name(),
+                        )));
+                }
+                unexpected_failure(&self.parts)
+            }
         };
         Ok(result.into())
     }

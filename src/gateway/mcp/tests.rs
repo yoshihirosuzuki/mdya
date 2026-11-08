@@ -24,6 +24,7 @@ use crate::types::{CollectionName, Key};
 use super::super::error_report::test_double::{ReportCall, TestErrorReport};
 use super::super::error_report::{Explanation, GatewayError, McpErrorCode};
 use super::super::formatter;
+use super::super::log_progress::test_double::TestConsole;
 use super::super::operations::test_double::TestOperations;
 use super::super::operations::{
     CollectionEntry, CollectionList, DocumentText, OperationError, SafeInteger, SafeJsonObject,
@@ -37,22 +38,26 @@ use super::{McpError, McpServerParts, serve_stdio, socket_address};
 struct Doubles {
     operations: Arc<TestOperations>,
     error_report: Arc<TestErrorReport>,
+    console: Arc<TestConsole>,
 }
 
 fn parts(operations: TestOperations) -> (McpServerParts, Doubles) {
     let operations = Arc::new(operations);
     let error_report = Arc::new(TestErrorReport::new());
+    let console = Arc::new(TestConsole::new());
     let parts = McpServerParts {
         operations: operations.clone(),
         show_version: true,
         size_limit: Some(1024),
         error_report: error_report.clone(),
+        console: console.clone(),
     };
     (
         parts,
         Doubles {
             operations,
             error_report,
+            console,
         },
     )
 }
@@ -530,6 +535,10 @@ async fn a_tool_call_that_panics_fails_alone_and_the_server_goes_on() {
     assert!(calls.contains(&ReportCall::McpPanicError));
     assert!(calls.contains(&ReportCall::PanicExplanation));
     assert_eq!(next["isError"], json!(false));
+    assert_eq!(
+        doubles.console.stderr(),
+        "It happened in the MCP tool list_collections.\n"
+    );
 }
 
 #[tokio::test]

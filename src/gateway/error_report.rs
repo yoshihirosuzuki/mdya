@@ -2,11 +2,6 @@
 //! code and details, and what the explanation shown to the user holds, in one
 //! place. Laying the explanation out is left to whatever writes it.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the rest of `gateway` does not use these yet")
-)]
-
 use std::error::Error;
 use std::sync::Arc;
 
@@ -312,6 +307,12 @@ fn entry(error: &EntryError) -> Shown<'_> {
             1,
             "the settings and index directory cannot be determined".to_owned(),
             &DATA_DIR_FIX,
+        )
+        .causes_of(error),
+        EntryError::ResourcesUnavailable(_) => Shown::new(
+            1,
+            "mdya cannot get the system resources it needs to run".to_owned(),
+            &[RESOURCES_FIX],
         )
         .causes_of(error),
     }
@@ -801,6 +802,8 @@ const DATA_DIR_FIX: [&str; 2] = [
     "Give an absolute path with --data-dir.",
     "If the working directory cannot be read, you can also move to a working directory that mdya can read, and run the command again.",
 ];
+
+const RESOURCES_FIX: &str = "Close programs that you no longer need, or raise the limits on open files and threads, then run the operation again.";
 
 const MCP_START_FIX: &str =
     "Check the MCP client's settings, then start the MCP server again from the MCP client.";

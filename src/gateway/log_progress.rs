@@ -3,8 +3,6 @@
 //! it. Also writes what the libraries that mdya uses write to the process's
 //! stdout as warnings in the logs.
 
-#![expect(dead_code, reason = "the rest of `gateway` does not use these yet")]
-
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

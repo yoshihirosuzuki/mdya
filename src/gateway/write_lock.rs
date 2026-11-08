@@ -16,11 +16,6 @@
 //!
 //! Two spellings of one directory reach the same file, so they share the lock.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the rest of `gateway` does not use these yet")
-)]
-
 use std::fs::{File, TryLockError};
 use std::io;
 use std::path::PathBuf;

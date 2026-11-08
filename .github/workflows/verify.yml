@@ -13,7 +13,9 @@
 #   - macos-latest     : macOS aarch64 (Apple Silicon)
 #   - macos-15-intel         : macOS x86_64 (Intel)
 # The link check enforces the structural requirement that the binary must
-# NOT dynamically link ORT / libtokenizers / libsqlite.
+# NOT dynamically link ORT / libtokenizers / libsqlite. Each runner also
+# shows the executable's size and runs the tests of how mdya starts with the
+# release settings.
 # `onig_sys` (C oniguruma, via candle's tokenizers) is statically linked and
 # is a known exception, so it is not in the forbidden set.
 
@@ -55,6 +57,20 @@ jobs:
 
       - name: Build release
         run: cargo build --release --verbose
+
+      # The size of the executable as it is distributed, with its symbols
+      # kept so that a backtrace names the functions on Linux and macOS.
+      - name: Executable size
+        shell: bash
+        run: ls -l target/release/mdya target/release/mdya.exe 2>/dev/null || true
+
+      # The tests of how mdya starts, with the release settings, on each
+      # platform: a backtrace names the functions on Linux and macOS, and the
+      # pipe that mdya puts on its stdout takes what Rust and the C runtime
+      # write there. `ci.yml` runs the tests on Linux only, and not with the
+      # release settings.
+      - name: Test how mdya starts, with the release settings
+        run: cargo test --release --lib gateway::entry
 
       - name: Link check (Linux)
         if: runner.os == 'Linux'

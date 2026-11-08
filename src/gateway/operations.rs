@@ -1,8 +1,6 @@
 //! Carries out each operation by calling the components in order, for both
 //! the command line and the MCP server.
 
-#![expect(dead_code, reason = "the rest of `gateway` does not use these yet")]
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;

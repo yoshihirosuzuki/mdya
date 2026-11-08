@@ -1251,6 +1251,27 @@ fn a_settings_and_index_directory_that_cannot_be_determined_gives_the_reason() {
     );
 }
 
+// System resources that mdya cannot get
+
+#[test]
+fn system_resources_that_cannot_be_had_give_the_reason() {
+    assert_shown(
+        GatewayError::Entry(EntryError::ResourcesUnavailable(std::io::Error::other(
+            "too many open files",
+        ))),
+        1,
+        "Error: mdya cannot get the system resources it needs to run\n\
+         \n\
+         Caused by:\n    \
+         0: too many open files\n\
+         \n\
+         How to fix:\n    \
+         Close programs that you no longer need, or raise the limits on open files and threads, then run the operation again.",
+        "internal",
+        json!({}),
+    );
+}
+
 // Exchange with the MCP client that cannot be started
 
 #[test]

@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use super::lock;
 
@@ -53,7 +54,26 @@ impl StdoutLogging {
         let _ = self.reader.join();
         let _ = self.writer.join();
     }
+
+    /// Waits as [`Self::finish`] does, but for at most `limit`, as writing
+    /// the logs may wait on a stderr that nobody reads. Returns whether both
+    /// threads ended; if not, they are left running.
+    pub(crate) fn finish_within(self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while !(self.reader.is_finished() && self.writer.is_finished()) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(FINISH_POLL);
+        }
+        self.finish();
+        true
+    }
 }
+
+/// How often [`StdoutLogging::finish_within`] looks whether the threads
+/// ended.
+const FINISH_POLL: Duration = Duration::from_millis(10);
 
 /// How much is kept.
 #[derive(Clone, Copy, Debug)]
@@ -671,6 +691,38 @@ mod tests {
                 Some(Err(error)) => Err(error),
             }
         }
+    }
+
+    #[test]
+    fn finishing_within_a_limit_waits_until_everything_is_written() {
+        let reads = Reads(VecDeque::from([Ok(b"a\n".to_vec())]));
+        let (written, write) = recorder();
+
+        let finished = start(reads, LIMITS, write)
+            .unwrap()
+            .finish_within(Duration::from_secs(60));
+
+        assert!(finished);
+        assert_eq!(*written.lock().unwrap(), [Written::Wrote("a".to_owned())]);
+    }
+
+    #[test]
+    fn finishing_within_a_limit_stops_waiting_for_logs_that_cannot_be_written() {
+        let reads = Reads(VecDeque::from([Ok(b"a\n".to_vec())]));
+        let (release, released) = mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        // Waits, as a write to a stderr that nobody reads does, until the
+        // test lets it go.
+        let write = move |_: Notice| {
+            let _ = released.lock().unwrap().recv();
+        };
+
+        let finished = start(reads, LIMITS, write)
+            .unwrap()
+            .finish_within(Duration::from_millis(50));
+
+        assert!(!finished);
+        drop(release);
     }
 
     #[test]

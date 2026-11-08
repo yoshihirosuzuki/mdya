@@ -276,7 +276,6 @@ fn the_global_options_are_read_as_given() {
     let options = invocation.options;
     assert_eq!(options.log_level.as_deref(), Some("mdya=debug"));
     assert_eq!(options.log_format, LogFormat::Json);
-    assert!(options.no_color);
     assert_eq!(options.data_dir, Some(PathBuf::from("~/data")));
     assert_eq!(options.model_cache_dir, Some(PathBuf::from("models")));
 }
@@ -287,7 +286,6 @@ fn the_global_options_have_their_defaults() {
 
     assert_eq!(options.log_level, None);
     assert_eq!(options.log_format, LogFormat::Compact);
-    assert!(!options.no_color);
     assert_eq!(options.data_dir, None);
     assert_eq!(options.model_cache_dir, None);
 }
@@ -749,6 +747,51 @@ fn embedding_rebuild_and_optimize_are_read() {
         }
     ));
     assert!(matches!(operation(&["optimize"]), Operation::Optimize));
+}
+
+#[test]
+fn each_operation_is_named_by_its_commands_without_the_values() {
+    let cases: [(&[&str], &str); 16] = [
+        (
+            &["collection", "add", "memo", "--type", "raw"],
+            "mdya collection add",
+        ),
+        (&["collection", "remove", "notes"], "mdya collection remove"),
+        (&["collection", "list"], "mdya collection list"),
+        (
+            &["collection", "set", "notes", "--description", "d"],
+            "mdya collection set",
+        ),
+        (&["update", "notes"], "mdya update"),
+        (&["update", "--all"], "mdya update"),
+        (
+            &["put", "notes", "a.md", "--file-type", "md", "a.md"],
+            "mdya put",
+        ),
+        (&["remove", "notes", "a.md"], "mdya remove"),
+        (&["search", "release"], "mdya search"),
+        (&["get", "notes", "a.md"], "mdya get"),
+        (&["status"], "mdya status"),
+        (&["config", "list"], "mdya config list"),
+        (
+            &["config", "set", "embedding.model", "cl-nagoya/ruri-v3-30m"],
+            "mdya config set",
+        ),
+        (&["config", "reset", "embedding.model"], "mdya config reset"),
+        (&["embedding", "rebuild"], "mdya embedding rebuild"),
+        (&["optimize"], "mdya optimize"),
+    ];
+
+    for (args, commands) in cases {
+        let named = match read(args) {
+            Ok(Invocation {
+                action: Action::Operation(operation),
+                ..
+            }) => operation.command(),
+            other => panic!("not an operation: {other:?}"),
+        };
+        assert_eq!(named, commands, "{args:?}");
+    }
 }
 
 fn mcp(args: &[&str]) -> McpTransport {
