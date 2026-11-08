@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 
 use serde_json::{Value, json};
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadBuf,
+    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadBuf,
 };
 use tokio::sync::oneshot;
 
@@ -644,6 +644,140 @@ async fn the_server_waits_for_the_tool_calls_in_progress_before_it_returns() {
 
     assert!(ended.is_ok());
     assert_eq!(doubles.operations.received().search.len(), 1);
+}
+
+#[tokio::test]
+async fn a_tool_call_goes_on_to_its_end_when_the_client_cancels_it() {
+    let (release, released) = oneshot::channel::<()>();
+    let released = Arc::new(tokio::sync::Mutex::new(Some(released)));
+    let (started, has_started) = oneshot::channel::<()>();
+    let started = Arc::new(Mutex::new(Some(started)));
+    let (finished, has_finished) = oneshot::channel::<()>();
+    let finished = Arc::new(Mutex::new(Some(finished)));
+    let (parts, _) = parts(TestOperations::new().on_search_async(move |_| {
+        let released = released.clone();
+        let started = started.clone();
+        let finished = finished.clone();
+        Box::pin(async move {
+            if let Some(started) = started.lock().unwrap().take() {
+                started.send(()).unwrap();
+            }
+            if let Some(released) = released.lock().await.take() {
+                released.await.unwrap();
+            }
+            if let Some(finished) = finished.lock().unwrap().take() {
+                finished.send(()).unwrap();
+            }
+            Ok(search_output())
+        })
+    }));
+    let (mut client, _server) = start(parts);
+    client.initialize().await;
+    client
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "search", "arguments": { "query": "q" } }
+        }))
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), has_started)
+        .await
+        .unwrap()
+        .unwrap();
+
+    client
+        .send(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 1 }
+        }))
+        .await;
+    // rmcp handles the client's messages in the order they come, so the
+    // answer to a ping sent after the cancellation means that rmcp has
+    // handled the cancellation, which it does by cancelling the request's
+    // token only. The while after it is for anything that the token woke to
+    // run: a wait cannot show that nothing will.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.request(2, "ping", json!({})),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Had the call been dropped, the end that waits for this would have gone
+    // with it.
+    assert!(
+        release.send(()).is_ok(),
+        "the tool call was dropped when the client cancelled it"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), has_finished)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// Takes no byte: every write fails, as it does on a stdout that cannot be
+/// written.
+struct FailingWriter;
+
+impl AsyncWrite for FailingWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::Error::other("the disk is full")))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn the_exchange_cannot_start_when_stdout_cannot_be_written() {
+    let (parts, _) = parts(TestOperations::new());
+    let (mut client_stdin, server_reader) = tokio::io::duplex(1 << 16);
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "0" }
+        }
+    });
+    client_stdin
+        .write_all(format!("{initialize}\n").as_bytes())
+        .await
+        .unwrap();
+    let (end, ended) = oneshot::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = end.send(runtime.block_on(serve_stdio(parts, server_reader, FailingWriter)));
+    });
+
+    // The client keeps stdin open, so that only writing the answer fails.
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(10), ended)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        matches!(ended, Err(McpError::Transport { .. })),
+        "{ended:?}"
+    );
+    drop(client_stdin);
 }
 
 /// A text with characters that the human-readable output would replace: ESC,

@@ -9,21 +9,26 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
+use tokio::runtime::RuntimeFlavor;
 
-use crate::config::{Config, ConfigError};
-use crate::embedding::EmbeddingSettings;
+use crate::collection::CollectionInfo;
+use crate::config::{Config, ConfigError, Settings};
 use crate::embedding::test_double::TestEmbedding;
+use crate::embedding::{Embedding, EmbeddingSettings};
+use crate::format::Format;
 use crate::format::test_double::TestFormat;
+use crate::index::Index;
 use crate::index::test_double::TestIndex;
 use crate::ingest::Ingest;
 use crate::types::test_double::test_dir_lookup;
-use crate::types::{CollectionType, DirLookup};
+use crate::types::{BoxError, CollectionName, CollectionType, DirLookup, TypeAttributes};
 
 use super::super::cli::LogFormat;
+use super::super::log_progress::{LogFilter, log_filter};
 use super::super::operations::version;
 use super::super::test_double::captured::CapturedOutput;
 use super::super::test_double::collections::TestCollections;
-use super::super::test_double::config::TestConfig;
+use super::super::test_double::config::{ConfigCall, TestConfig};
 use super::super::test_double::ingest::TestIngest;
 use super::super::test_double::query::TestQuery;
 use super::super::test_double::watchdog::{TestWatchdog, WatchdogState};
@@ -48,6 +53,7 @@ const WORK: &str = "/work";
 struct Setup {
     config: TestConfig,
     collections: TestCollections,
+    query: TestQuery,
     dirs: DirLookup,
     env: Vec<(&'static str, &'static str)>,
     stdin: Vec<u8>,
@@ -61,6 +67,7 @@ impl Setup {
         Self {
             config: TestConfig::new(),
             collections: TestCollections::new(),
+            query: TestQuery::new(),
             dirs: test_dir_lookup(Some(HOME), Ok(WORK)),
             env: Vec::new(),
             stdin: Vec::new(),
@@ -73,11 +80,27 @@ impl Setup {
 /// What the factories received.
 #[derive(Default)]
 struct Records {
+    /// Each factory called, in the order they were called.
+    calls: Vec<FactoryCall>,
     /// Whether to color, and the log format, of each log receiver set.
     log_settings: Vec<(bool, LogFormat)>,
+    /// Which logs each log receiver set writes.
+    log_filters: Vec<LogFilter>,
     environment: Vec<Vec<(OsString, OsString)>>,
     config_dirs: Vec<PathBuf>,
     embeddings: Vec<EmbeddingRecord>,
+    /// The function for the model cache directory of each `embedding`.
+    model_cache_dirs: Vec<ModelCacheDir>,
+    /// What the factories of the other components were given and made, by
+    /// the address that each component has.
+    components: Vec<ComponentRecord>,
+}
+
+/// A factory that was called, and the runtime that it was called in.
+#[derive(Debug, PartialEq)]
+struct FactoryCall {
+    factory: &'static str,
+    runtime: Option<RuntimeFlavor>,
 }
 
 /// What an `embedding` was created with.
@@ -85,8 +108,42 @@ struct Records {
 struct EmbeddingRecord {
     model: String,
     hf_token: Option<String>,
+    ollama_endpoint: String,
     /// What its function for the model cache directory gave.
     model_cache_dir: Result<PathBuf, String>,
+}
+
+type ModelCacheDir = Arc<dyn Fn() -> Result<PathBuf, BoxError> + Send + Sync>;
+
+/// A component that a factory made, and the components and the directory it
+/// was made with, each component by its address.
+#[derive(Debug, PartialEq)]
+enum ComponentRecord {
+    Embedding(usize),
+    Index {
+        made: usize,
+        data_dir: PathBuf,
+        embedding: usize,
+    },
+    Collections {
+        data_dir: PathBuf,
+        index: usize,
+    },
+    Query {
+        embedding: usize,
+        index: usize,
+    },
+    Format(usize),
+    Ingests {
+        format: usize,
+        index: usize,
+    },
+}
+
+/// The address of what `arc` holds, which two `Arc`s of the same component
+/// share.
+fn address<T: ?Sized>(arc: &Arc<T>) -> usize {
+    Arc::as_ptr(arc).cast::<()>().addr()
 }
 
 struct Outcome {
@@ -95,29 +152,54 @@ struct Outcome {
     stderr: String,
     records: Records,
     watchdog: WatchdogState,
+    config_calls: Vec<ConfigCall>,
 }
 
 fn run(args: &[&str], setup: Setup) -> Outcome {
     let records = Arc::new(Mutex::new(Records::default()));
+    let record_call = {
+        let records = Arc::clone(&records);
+        move |factory: &'static str| {
+            let runtime = tokio::runtime::Handle::try_current()
+                .ok()
+                .map(|handle| handle.runtime_flavor());
+            records
+                .lock()
+                .unwrap()
+                .calls
+                .push(FactoryCall { factory, runtime });
+        }
+    };
     let watchdog = TestWatchdog::new();
     let config = Arc::new(setup.config);
     let collections = Arc::new(setup.collections);
+    let query = Arc::new(setup.query);
     let format_panics = setup.format_panics;
     let factories = Factories {
         set_log_receiver: {
             let records = Arc::clone(&records);
+            let record_call = record_call.clone();
             Box::new(move |settings: LogSettings| {
-                let recorded = (settings.color, settings.format);
-                records.lock().unwrap().log_settings.push(recorded);
+                record_call("log receiver");
+                let mut records = records.lock().unwrap();
+                records.log_settings.push((settings.color, settings.format));
+                records.log_filters.push(settings.filter);
             })
         },
         set_process_environment: {
             let records = Arc::clone(&records);
-            Box::new(move |variables| records.lock().unwrap().environment.push(variables))
+            let record_call = record_call.clone();
+            Box::new(move |variables| {
+                record_call("environment");
+                records.lock().unwrap().environment.push(variables);
+            })
         },
         config: {
             let records = Arc::clone(&records);
+            let config = Arc::clone(&config);
+            let record_call = record_call.clone();
             Box::new(move |data_dir| {
+                record_call("config");
                 records.lock().unwrap().config_dirs.push(data_dir);
                 Arc::clone(&config) as Arc<dyn Config>
             })
@@ -125,29 +207,111 @@ fn run(args: &[&str], setup: Setup) -> Outcome {
         start_watchdog: watchdog.start_fn(),
         embedding: {
             let records = Arc::clone(&records);
+            let record_call = record_call.clone();
             Box::new(move |settings: EmbeddingSettings| {
-                records.lock().unwrap().embeddings.push(EmbeddingRecord {
+                record_call("embedding");
+                let embedding: Arc<dyn Embedding> =
+                    Arc::new(TestEmbedding::new("cl-nagoya/ruri-v3-30m", 256));
+                let mut records = records.lock().unwrap();
+                records.embeddings.push(EmbeddingRecord {
                     model: settings.model.clone(),
                     hf_token: settings.hf_token.clone(),
+                    ollama_endpoint: settings.ollama_endpoint.clone(),
                     model_cache_dir: (settings.model_cache_dir)()
                         .map_err(|error| error.to_string()),
                 });
-                Arc::new(TestEmbedding::new("cl-nagoya/ruri-v3-30m", 256))
+                records
+                    .model_cache_dirs
+                    .push(Arc::clone(&settings.model_cache_dir));
+                records
+                    .components
+                    .push(ComponentRecord::Embedding(address(&embedding)));
+                embedding
             })
         },
-        index: Box::new(|_, _| Arc::new(TestIndex::new())),
-        collections: Box::new(move |_, _| Arc::clone(&collections) as _),
-        query: Box::new(|_, _| Arc::new(TestQuery::new())),
-        format: Box::new(move || {
-            assert!(!format_panics, "a bug in creating format");
-            Arc::new(TestFormat::new())
-        }),
-        ingests: Box::new(|_, _| {
-            BTreeMap::from([(
-                CollectionType("raw".to_owned()),
-                Arc::new(TestIngest::new()) as Arc<dyn Ingest>,
-            )])
-        }),
+        index: {
+            let records = Arc::clone(&records);
+            let record_call = record_call.clone();
+            Box::new(move |data_dir, embedding| {
+                record_call("index");
+                let index: Arc<dyn Index> = Arc::new(TestIndex::new());
+                records
+                    .lock()
+                    .unwrap()
+                    .components
+                    .push(ComponentRecord::Index {
+                        made: address(&index),
+                        data_dir,
+                        embedding: address(&embedding),
+                    });
+                index
+            })
+        },
+        collections: {
+            let records = Arc::clone(&records);
+            let record_call = record_call.clone();
+            Box::new(move |data_dir, index| {
+                record_call("collections");
+                records
+                    .lock()
+                    .unwrap()
+                    .components
+                    .push(ComponentRecord::Collections {
+                        data_dir,
+                        index: address(&index),
+                    });
+                Arc::clone(&collections) as _
+            })
+        },
+        query: {
+            let records = Arc::clone(&records);
+            let record_call = record_call.clone();
+            Box::new(move |embedding, index| {
+                record_call("query");
+                records
+                    .lock()
+                    .unwrap()
+                    .components
+                    .push(ComponentRecord::Query {
+                        embedding: address(&embedding),
+                        index: address(&index),
+                    });
+                Arc::clone(&query) as _
+            })
+        },
+        format: {
+            let records = Arc::clone(&records);
+            let record_call = record_call.clone();
+            Box::new(move || {
+                record_call("format");
+                assert!(!format_panics, "a bug in creating format");
+                let format: Arc<dyn Format> = Arc::new(TestFormat::new());
+                records
+                    .lock()
+                    .unwrap()
+                    .components
+                    .push(ComponentRecord::Format(address(&format)));
+                format
+            })
+        },
+        ingests: {
+            let records = Arc::clone(&records);
+            Box::new(move |format, index| {
+                record_call("ingests");
+                records
+                    .lock()
+                    .unwrap()
+                    .components
+                    .push(ComponentRecord::Ingests {
+                        format: address(&format),
+                        index: address(&index),
+                    });
+                BTreeMap::from([(
+                    CollectionType("raw".to_owned()),
+                    Arc::new(TestIngest::new()) as Arc<dyn Ingest>,
+                )])
+            })
+        },
         dirs: setup.dirs,
     };
     let stdout = CapturedOutput::new();
@@ -179,7 +343,77 @@ fn run(args: &[&str], setup: Setup) -> Outcome {
         stderr: stderr.text(),
         records,
         watchdog: watchdog.state(),
+        config_calls: config.calls(),
     }
+}
+
+/// The names of the factories called, in order.
+fn factories_called(outcome: &Outcome) -> Vec<&'static str> {
+    outcome
+        .records
+        .calls
+        .iter()
+        .map(|call| call.factory)
+        .collect()
+}
+
+/// A collection of the given name, of the type that the tests' factories
+/// make an ingest implementation for.
+fn raw_collection(name: &str) -> CollectionInfo {
+    CollectionInfo {
+        name: CollectionName(name.to_owned()),
+        collection_type: CollectionType("raw".to_owned()),
+        attributes: TypeAttributes::default(),
+        description: None,
+    }
+}
+
+/// The settings that the configuration test double gives, changed by `change`.
+fn settings_with(change: impl FnOnce(&mut Settings)) -> Settings {
+    let mut settings = TestConfig::default_settings();
+    change(&mut settings);
+    settings
+}
+
+/// The lines that an MCP client writes to start the exchange, and then to
+/// make the calls given as `(id, tool, arguments)`.
+fn mcp_requests(calls: &[(u64, &str, serde_json::Value)]) -> Vec<u8> {
+    let start = [
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0" }
+            }
+        }),
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    ];
+    let calls = calls.iter().map(|(id, tool, arguments)| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments }
+        })
+    });
+    start
+        .into_iter()
+        .chain(calls)
+        .map(|request| format!("{request}\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// The answer of the given id among the lines that the MCP server wrote.
+fn mcp_answer(stdout: &str, id: u64) -> serde_json::Value {
+    stdout
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|answer| answer["id"] == json!(id))
+        .unwrap()
 }
 
 fn nothing_assembled(outcome: &Outcome) -> bool {
@@ -296,7 +530,131 @@ fn a_settings_and_index_directory_that_cannot_be_determined_ends_before_anything
     assert!(nothing_assembled(&outcome));
 }
 
+#[test]
+fn a_relative_data_dir_without_a_working_directory_ends_before_anything_is_assembled() {
+    let mut setup = Setup::new();
+    setup.dirs = test_dir_lookup(Some(HOME), Err(std::io::ErrorKind::NotFound));
+
+    let outcome = run(&["--data-dir", "data", "config", "list"], setup);
+
+    assert_eq!(outcome.code, ExitCode::from(1));
+    assert!(
+        outcome
+            .stderr
+            .starts_with("Error: the settings and index directory cannot be determined"),
+        "{}",
+        outcome.stderr
+    );
+    assert!(nothing_assembled(&outcome));
+}
+
+#[test]
+fn the_version_and_the_help_need_no_settings_and_index_directory() {
+    for args in [&["--version"][..], &["--help"][..]] {
+        let mut setup = Setup::new();
+        setup.dirs = test_dir_lookup(None, Err(std::io::ErrorKind::NotFound));
+
+        let outcome = run(args, setup);
+
+        assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.stderr);
+    }
+}
+
 // Assembling
+
+#[test]
+fn the_environment_and_the_log_receiver_are_set_before_the_multi_thread_runtime_starts() {
+    let outcome = run(&["config", "list"], Setup::new());
+
+    let calls = &outcome.records.calls;
+    assert_eq!(
+        calls[..3],
+        [
+            FactoryCall {
+                factory: "environment",
+                runtime: None,
+            },
+            FactoryCall {
+                factory: "log receiver",
+                runtime: None,
+            },
+            FactoryCall {
+                factory: "config",
+                runtime: Some(RuntimeFlavor::MultiThread),
+            },
+        ]
+    );
+    assert!(
+        calls[3..]
+            .iter()
+            .all(|call| call.runtime == Some(RuntimeFlavor::MultiThread)),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn settings_that_cannot_be_read_end_before_the_index_is_created_so_nothing_is_maintained() {
+    let mut setup = Setup::new();
+    setup.config = TestConfig::new().on_current(|| {
+        Err(ConfigError::CannotRead {
+            source: "the file is broken".into(),
+        })
+    });
+
+    let outcome = run(&["optimize"], setup);
+
+    assert_eq!(outcome.code, ExitCode::from(1));
+    assert_eq!(
+        factories_called(&outcome),
+        ["environment", "log receiver", "config"]
+    );
+}
+
+#[test]
+fn each_component_is_created_with_the_directory_and_the_components_it_uses() {
+    let outcome = run(&["config", "list"], Setup::new());
+
+    let data_dir = Path::new(HOME).join(".mdya");
+    let components = &outcome.records.components;
+    let [
+        ComponentRecord::Format(format),
+        ComponentRecord::Embedding(embedding),
+        ComponentRecord::Index {
+            made: index,
+            data_dir: index_data_dir,
+            embedding: index_embedding,
+        },
+        collections,
+        query,
+        ingests,
+    ] = &components[..]
+    else {
+        panic!("{components:?}");
+    };
+    assert_eq!(index_data_dir, &data_dir);
+    assert_eq!(index_embedding, embedding);
+    assert_eq!(
+        collections,
+        &ComponentRecord::Collections {
+            data_dir,
+            index: *index,
+        }
+    );
+    assert_eq!(
+        query,
+        &ComponentRecord::Query {
+            embedding: *embedding,
+            index: *index,
+        }
+    );
+    assert_eq!(
+        ingests,
+        &ComponentRecord::Ingests {
+            format: *format,
+            index: *index,
+        }
+    );
+}
 
 #[test]
 fn settings_that_cannot_be_read_end_before_the_watchdog_starts() {
@@ -351,6 +709,7 @@ fn embedding_gets_the_model_the_token_and_the_default_model_cache_directory() {
         [EmbeddingRecord {
             model: "cl-nagoya/ruri-v3-30m".to_owned(),
             hf_token: Some("hf_secret".to_owned()),
+            ollama_endpoint: "http://127.0.0.1:11434".to_owned(),
             model_cache_dir: Ok(Path::new(HOME).join(".mdya-models")),
         }]
     );
@@ -402,7 +761,95 @@ fn the_operation_runs_on_the_assembled_components() {
     assert_eq!(settings["embedding.model"], json!("cl-nagoya/ruri-v3-30m"));
 }
 
+#[test]
+fn embedding_gets_the_ollama_endpoint_of_the_settings() {
+    let mut setup = Setup::new();
+    setup.config = TestConfig::new().on_current(|| {
+        Ok(settings_with(|settings| {
+            settings.embedding_ollama_endpoint = "http://192.0.2.1:11434".to_owned();
+        }))
+    });
+
+    let outcome = run(&["config", "list"], setup);
+
+    assert_eq!(
+        outcome.records.embeddings[0].ollama_endpoint,
+        "http://192.0.2.1:11434"
+    );
+}
+
+#[test]
+fn a_relative_model_cache_directory_is_resolved_from_the_working_directory_when_it_is_asked_for() {
+    let working_dir = Arc::new(Mutex::new(PathBuf::from(WORK)));
+    let mut setup = Setup::new();
+    setup.dirs = DirLookup {
+        home_dir: Arc::new(|| Some(PathBuf::from(HOME))),
+        current_dir: {
+            let working_dir = Arc::clone(&working_dir);
+            Arc::new(move || Ok(working_dir.lock().unwrap().clone()))
+        },
+    };
+    let outcome = run(&["--model-cache-dir", "models", "config", "list"], setup);
+    // The working directory changes later, as it can while the MCP server
+    // runs.
+    let moved = Path::new(WORK).join("moved");
+    *working_dir.lock().unwrap() = moved.clone();
+
+    let model_cache_dir = &outcome.records.model_cache_dirs[0];
+
+    assert_eq!(model_cache_dir().unwrap(), moved.join("models"));
+}
+
+#[test]
+fn the_cli_output_size_limit_of_the_settings_applies_to_the_document_got() {
+    let mut setup = Setup::new();
+    setup.config = TestConfig::new()
+        .on_current(|| Ok(settings_with(|settings| settings.get_cli_limit_bytes = 4)));
+    setup.collections = TestCollections::with(vec![raw_collection("notes")]);
+    setup.query = TestQuery::new().on_get_document(|_, _, _| Ok("12345".to_owned()));
+
+    let outcome = run(&["get", "notes", "a.md"], setup);
+
+    assert_eq!(outcome.code, ExitCode::from(1));
+    assert!(
+        outcome.stderr.contains("over the limit of 4 bytes"),
+        "{}",
+        outcome.stderr
+    );
+}
+
 // The logs and the colors
+
+#[test]
+fn the_log_receiver_gets_the_log_level() {
+    let outcome = run(
+        &["--log-level", "mdya=debug", "config", "list"],
+        Setup::new(),
+    );
+
+    let (filter, _) = log_filter(Some("mdya=debug"), None).unwrap();
+    assert_eq!(outcome.records.log_filters, [filter]);
+}
+
+#[test]
+fn a_message_is_written_to_stderr_whatever_the_log_level() {
+    // A directory of its own: the operation takes the lock on write
+    // operations in the settings and index directory.
+    let home = tempfile::tempdir().unwrap();
+    let mut setup = Setup::new();
+    setup.dirs = test_dir_lookup(Some(home.path().to_str().unwrap()), Ok(WORK));
+
+    // The log receiver of the tests writes nothing, so the message reaches
+    // stderr without the logs.
+    let outcome = run(&["--log-level", "error", "optimize"], setup);
+
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.stderr);
+    assert!(
+        outcome.stderr.contains("Maintained the index."),
+        "{}",
+        outcome.stderr
+    );
+}
 
 #[test]
 fn the_log_receiver_gets_the_log_format() {
@@ -560,6 +1007,67 @@ fn the_mcp_server_answers_over_the_given_stdin_and_stdout_and_ends_when_stdin_en
         serde_json::from_str(outcome.stdout.lines().next().unwrap()).unwrap();
     assert_eq!(answer["id"], json!(0));
     assert_eq!(answer["result"]["serverInfo"]["name"], json!("mdya"));
+}
+
+#[test]
+fn the_mcp_server_assembles_the_components_and_reads_the_settings_once_for_all_its_calls() {
+    let mut setup = Setup::new();
+    setup.stdin = mcp_requests(&[
+        (1, "list_collections", json!({})),
+        (2, "list_collections", json!({})),
+    ]);
+
+    let outcome = run(&["mcp"], setup);
+
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.stderr);
+    for id in [1, 2] {
+        let answer = mcp_answer(&outcome.stdout, id);
+        assert_eq!(answer["result"]["isError"], json!(false), "{answer}");
+    }
+    assert_eq!(outcome.config_calls, [ConfigCall::Current]);
+    assert_eq!(
+        factories_called(&outcome),
+        [
+            "environment",
+            "log receiver",
+            "config",
+            "format",
+            "embedding",
+            "index",
+            "collections",
+            "query",
+            "ingests",
+        ]
+    );
+}
+
+#[test]
+fn the_mcp_settings_apply_to_the_mcp_server() {
+    let mut setup = Setup::new();
+    setup.config = TestConfig::new().on_current(|| {
+        Ok(settings_with(|settings| {
+            settings.mcp_show_version = false;
+            settings.get_mcp_limit_bytes = 4;
+        }))
+    });
+    setup.collections = TestCollections::with(vec![raw_collection("notes")]);
+    setup.query = TestQuery::new().on_get_document(|_, _, _| Ok("12345".to_owned()));
+    setup.stdin = mcp_requests(&[(
+        1,
+        "get_document",
+        json!({ "collection": "notes", "key": "a.md" }),
+    )]);
+
+    let outcome = run(&["mcp"], setup);
+
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.stderr);
+    assert_eq!(
+        mcp_answer(&outcome.stdout, 0)["result"]["serverInfo"]["version"],
+        json!("mdya")
+    );
+    let error = &mcp_answer(&outcome.stdout, 1)["result"]["structuredContent"];
+    assert_eq!(error["code"], json!("output_too_large"), "{error}");
+    assert_eq!(error["details"]["limit_bytes"], json!(4), "{error}");
 }
 
 #[test]
