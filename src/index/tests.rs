@@ -2234,6 +2234,59 @@ async fn registering_checks_the_vector_columns_again_just_before_writing() {
 }
 
 #[tokio::test]
+async fn registering_an_unchanged_document_reads_the_vector_columns_once() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    let same = document("a.md", ASCII_BODY);
+    register(&index, &same).await.unwrap();
+    let reads_before = hooks.count(LanceCall::ReadColumns);
+
+    let outcome = register(&index, &same).await;
+
+    assert_eq!(outcome.unwrap(), DocumentOutcome::Unchanged);
+    // To prepare the tables. With nothing to write, they are not read again.
+    assert_eq!(hooks.count(LanceCall::ReadColumns) - reads_before, 1);
+}
+
+#[tokio::test]
+async fn registering_a_changed_document_reads_the_vector_columns_again_before_writing_it() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    register(&index, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    // The versions cannot be read once, so LanceDB is opened again.
+    hooks.plan(LanceCall::ReadRows(TableName::Document), Plan::Fail);
+    let reads_before = hooks.count(LanceCall::ReadColumns);
+    let connects_before = hooks.count(LanceCall::Connect);
+
+    let outcome = register(&index, &document("a.md", MIXED_BODY)).await;
+
+    assert_eq!(outcome.unwrap(), DocumentOutcome::Changed);
+    assert_eq!(hooks.count(LanceCall::Connect) - connects_before, 1);
+    // To prepare the tables, and again just before writing the document.
+    // Opening LanceDB again reads none.
+    assert_eq!(hooks.count(LanceCall::ReadColumns) - reads_before, 2);
+}
+
+#[tokio::test]
+async fn a_registration_that_cannot_read_the_vector_columns_cannot_read_the_index() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    register(&index, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    hooks.plan(LanceCall::ReadColumns, Plan::Fail);
+
+    let outcome = register(&index, &document("b.md", ASCII_BODY)).await;
+
+    assert!(matches!(outcome, Err(IndexError::CannotRead { .. })));
+}
+
+#[tokio::test]
 async fn registering_partway_through_switching_to_another_model_is_an_unfinished_rebuild() {
     prepare_full_text_search().await;
     let (data_dir, index) =
@@ -3377,6 +3430,43 @@ fn writes(hooks: &TestHooks) -> Vec<LanceCall> {
     calls.into_iter().filter(write).collect()
 }
 
+/// Registers a new document, holds its first write to the chunk table until
+/// `call` has had 300 ms to run, and then lets both finish. Returns the calls
+/// into LanceDB that `call` made while the registration was held, and what
+/// `call` returned.
+async fn calls_while_a_registration_writes<T>(
+    index: &LanceDbIndex,
+    hooks: &TestHooks,
+    call: impl Future<Output = T>,
+) -> (Vec<LanceCall>, T) {
+    let pause = Arc::new(Pause::default());
+    hooks.plan(
+        LanceCall::WriteRows(TableName::Chunk),
+        Plan::Pause(pause.clone()),
+    );
+    let added = document("added.md", MIXED_BODY);
+    let registering = register(index, &added);
+    let meanwhile = async {
+        pause.reached.notified().await;
+        let before = hooks.calls().len();
+        tokio::pin!(call);
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut call).await;
+        let made = hooks.calls().split_off(before);
+        pause.resume.notify_one();
+        (early.is_ok(), made, call.await)
+    };
+    let both = async { tokio::join!(registering, meanwhile) };
+    let both = tokio::time::timeout(Duration::from_secs(30), both).await;
+    let (registered, (finished_early, made, returned)) =
+        both.expect("the functions did not finish");
+    registered.unwrap();
+    assert!(
+        !finished_early,
+        "the call finished while the registration wrote"
+    );
+    (made, returned)
+}
+
 // ---------------------------------------------------------------- reading and deleting documents
 
 #[tokio::test]
@@ -3979,6 +4069,85 @@ async fn registering_and_deleting_at_once_write_one_function_at_a_time() {
     deleted_one.unwrap();
     assert_eq!(deleted_others.unwrap(), 1);
     assert_index_holds(data_dir.path(), &[&kept, &added], &embedding).await;
+}
+
+// Deleting documents, rebuilding the embedding vectors, maintaining the
+// tables, and checking that documents can be ingested take the write lock
+// before their first read, so that nothing else the component writes changes
+// what they read before they return. Each of them first reads something the
+// hooks see: the state of the vector columns, the keys or the row of a
+// document, or whether the rebuild table is there.
+
+#[tokio::test]
+async fn deleting_other_documents_reads_only_after_a_registration_has_written() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    register_all(&index, &[document_in("papers", "other.md")]).await;
+    let (papers, keep_none) = (name("papers"), HashSet::new());
+
+    let deleting = index.delete_others(&papers, &keep_none, &[]);
+    let (made, deleted) = calls_while_a_registration_writes(&index, &hooks, deleting).await;
+
+    assert_eq!(made, []);
+    assert_eq!(deleted.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn deleting_a_document_reads_only_after_a_registration_has_written() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    let deleted = document("deleted.md", ASCII_BODY);
+    register_all(&index, std::slice::from_ref(&deleted)).await;
+
+    let deleting = index.delete_document(&deleted.collection, &deleted.key);
+    let (made, deleted_one) = calls_while_a_registration_writes(&index, &hooks, deleting).await;
+
+    assert_eq!(made, []);
+    deleted_one.unwrap();
+}
+
+#[tokio::test]
+async fn rebuilding_reads_only_after_a_registration_has_written() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    register_all(&index, &[document("a.md", ASCII_BODY)]).await;
+
+    let rebuilding = rebuild(&index, false, 1);
+    let (made, rebuilt) = calls_while_a_registration_writes(&index, &hooks, rebuilding).await;
+
+    assert_eq!(made, []);
+    assert_eq!(rebuilt.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn maintaining_reads_only_after_a_registration_has_written() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    register_all(&index, &[document("a.md", ASCII_BODY)]).await;
+
+    let maintaining = index.maintain();
+    let (made, maintained) = calls_while_a_registration_writes(&index, &hooks, maintaining).await;
+
+    assert_eq!(made, []);
+    maintained.unwrap();
+}
+
+#[tokio::test]
+async fn checking_ingestable_reads_only_after_a_registration_has_written() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    register_all(&index, &[document("a.md", ASCII_BODY)]).await;
+
+    let checking = index.check_ingestable();
+    let (made, checked) = calls_while_a_registration_writes(&index, &hooks, checking).await;
+
+    assert_eq!(made, []);
+    checked.unwrap();
 }
 
 // ---------------------------------------------------------------- the tables for `query`
