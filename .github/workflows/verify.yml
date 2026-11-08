@@ -94,17 +94,24 @@ jobs:
           fi
           echo "OK: no ORT / libtokenizers / libsqlite dynamic link"
 
-      # dumpbin ships with MSVC but is not on PATH by default; this action
-      # loads the developer environment so `dumpbin` resolves.
-      - name: Set up MSVC dev environment
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-
+      # dumpbin ships with MSVC but is not on PATH by default. `vswhere`, at
+      # the fixed location where the Visual Studio installer puts it, finds the
+      # latest Visual Studio with the x64 MSVC tools, and the toolset version
+      # in its `Microsoft.VCToolsVersion.default.txt` names the directory that
+      # holds dumpbin.
       - name: Link check (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          dumpbin /dependents target\release\mdya.exe | Tee-Object deps.txt
+          $vswhere = "${Env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) {
+            Write-Error "no Visual Studio with the x64 MSVC tools found"
+            exit 1
+          }
+          $toolset = (Get-Content "$vs\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt" -Raw).Trim()
+          $dumpbin = "$vs\VC\Tools\MSVC\$toolset\bin\HostX64\x64\dumpbin.exe"
+          & $dumpbin /dependents target\release\mdya.exe | Tee-Object deps.txt
           if (Select-String -Path deps.txt -Pattern 'onnxruntime|tokenizers|sqlite' -Quiet) {
             Write-Error "forbidden dynamic library linked (ORT/libtokenizers/libsqlite)"
             exit 1
