@@ -684,10 +684,10 @@ struct LanceDbIndex {
     /// The lock makes concurrent first writes read it once; a failed or
     /// panicking read leaves it unread, and the next write reads it again.
     dictionary_read: tokio::sync::Mutex<bool>,
-    /// Makes the functions that write to the tables run one at a time. Each
-    /// of them takes it before its first read and keeps it until it returns,
-    /// so that nothing else this component writes changes what it read
-    /// before it has written. Registering is the exception: it takes it to
+    /// Makes the functions that write to the tables write one at a time. Each
+    /// of them but registering takes it before its first read and keeps it
+    /// until it returns, so that nothing else this component writes changes
+    /// what it read before it has written. Registering takes it only to
     /// prepare the tables, to open them again, and to write each bulk,
     /// checking the vector columns again first. Other processes are kept out
     /// by the lock `gateway` holds for each write operation.
