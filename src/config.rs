@@ -178,13 +178,19 @@ pub fn check_setting(name: &str, value: Option<&str>) -> Result<SettingName, Con
     Ok(setting)
 }
 
+/// The largest value a number setting accepts. In its JSON output, the
+/// settings operation writes these values as numbers, and JSON
+/// implementations agree exactly on the value of an integer up to 2^53 − 1
+/// (RFC 8259, section 6).
+const MAX_NUMBER: u64 = 9_007_199_254_740_991;
+
 /// The kinds of values the user writes when changing a setting.
 #[derive(Clone, Copy)]
 enum ValueKind {
     /// `true` or `false`.
     TrueOrFalse,
-    /// An integer from 0 to `u64::MAX`, in decimal digits only. Leading zeros
-    /// are allowed; a sign, white space, and other characters are not.
+    /// An integer from 0 to [`MAX_NUMBER`], in decimal digits only. Leading
+    /// zeros are allowed; a sign, white space, and other characters are not.
     Number,
     /// A value that `embedding` says names a supported model.
     EmbeddingModel,
@@ -207,7 +213,7 @@ impl ValueKind {
     fn accepted(self) -> &'static str {
         match self {
             Self::TrueOrFalse => "true or false",
-            Self::Number => "an integer from 0 to 18446744073709551615, in decimal digits",
+            Self::Number => "an integer from 0 to 9007199254740991, in decimal digits",
             Self::EmbeddingModel => {
                 "the Hugging Face repository of a supported model, or ollama: followed by a model name"
             }
@@ -220,7 +226,10 @@ fn is_decimal_number(value: &str) -> bool {
     // `u64::from_str` also takes a leading `+`, so the digits are checked
     // first.
     let only_digits = !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
-    only_digits && value.parse::<u64>().is_ok()
+    only_digits
+        && value
+            .parse::<u64>()
+            .is_ok_and(|number| number <= MAX_NUMBER)
 }
 
 fn is_http_url(value: &str) -> bool {
@@ -418,9 +427,19 @@ mod tests {
     }
 
     #[test]
-    fn number_settings_accept_decimal_integers_from_0_to_the_largest_u64() {
+    fn number_settings_accept_decimal_integers_from_0_to_9007199254740991() {
         for setting in NUMBER_SETTINGS {
-            assert_accepts(setting, &["0", "8", "1024", "0008", "18446744073709551615"]);
+            assert_accepts(
+                setting,
+                &[
+                    "0",
+                    "8",
+                    "1024",
+                    "0008",
+                    "9007199254740991",
+                    "009007199254740991",
+                ],
+            );
         }
     }
 
@@ -440,6 +459,9 @@ mod tests {
                     "0x10",
                     "1_000",
                     "８",
+                    "9007199254740992",
+                    "009007199254740992",
+                    "18446744073709551615",
                     "18446744073709551616",
                     "100000000000000000000",
                 ],
@@ -529,7 +551,7 @@ mod tests {
             (
                 SettingName::ResourcesMemoryLimitMb,
                 "-1",
-                "an integer from 0 to 18446744073709551615, in decimal digits",
+                "an integer from 0 to 9007199254740991, in decimal digits",
             ),
         ] {
             assert!(
