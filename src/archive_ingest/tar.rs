@@ -1,8 +1,5 @@
 //! Reads tar files, plain or compressed with gzip.
 
-// The driver is the only user of these, and it is not written yet.
-#![allow(dead_code)]
-
 mod gzip;
 mod header;
 mod items;

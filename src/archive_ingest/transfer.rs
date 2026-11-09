@@ -1,10 +1,6 @@
 //! What the part that drives an ingest and the parts that read zip and tar
 //! files hand to each other.
 
-// Nothing outside the tests uses these until the driver and the readers are
-// written.
-#![allow(dead_code)]
-
 use crate::types::BoxError;
 
 /// The size of the list inside an archive: a running total and its limit.

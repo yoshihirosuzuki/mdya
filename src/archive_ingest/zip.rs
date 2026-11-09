@@ -2,9 +2,6 @@
 //! headers are read here, following PKWARE's APPNOTE.TXT; only the deflate data
 //! and the CRC-32 are left to flate2.
 
-// The driver is the only user of these, and it is not written yet.
-#![allow(dead_code)]
-
 use std::fs::File;
 
 use self::content::read_content;

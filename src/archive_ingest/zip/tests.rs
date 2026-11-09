@@ -304,6 +304,14 @@ fn bytes_after_the_comment_are_accepted_within_the_search_range() {
 }
 
 #[test]
+fn an_end_record_at_the_far_end_of_the_search_range_is_read() {
+    let mut bytes = one_entry().build().bytes;
+    bytes.extend_from_slice(&vec![0; 65_535]);
+
+    assert_eq!(names(&bytes), vec![b"a.md".to_vec()]);
+}
+
+#[test]
 fn of_two_zips_joined_together_the_first_is_read() {
     let mut bytes = one_entry().build().bytes;
     let second = TestZip::of(vec![TestEntry::stored("b.md", b"beta")]);
@@ -388,6 +396,16 @@ fn the_unicode_path_is_not_used_otherwise() {
 }
 
 #[test]
+fn a_unicode_path_only_in_the_local_header_is_not_used() {
+    let mut entry = TestEntry::stored("cp932.md", b"alpha");
+    entry.local_extra = unicode_path(1, crc32(b"cp932.md"), "日本語.md");
+    let bytes = TestZip::of(vec![entry]).build().bytes;
+
+    assert_eq!(names(&bytes), vec![b"cp932.md".to_vec()]);
+    assert_eq!(content_at(&bytes, 0), b"alpha");
+}
+
+#[test]
 fn a_data_descriptor_leaves_the_local_header_empty_of_sizes() {
     let mut entry = TestEntry::deflated("a.md", REPEATED);
     entry.flags = FLAG_DATA_DESCRIPTOR;
@@ -430,6 +448,24 @@ fn a_name_ending_with_a_slash_is_not_regular() {
 }
 
 // Sources that cannot be read: the end records.
+
+#[cfg(unix)]
+#[test]
+fn a_file_that_cannot_be_read_is_unreadable() {
+    use std::os::fd::OwnedFd;
+
+    let pipe_end = || {
+        let (reader, _writer) = std::io::pipe().unwrap();
+        File::from(OwnedFd::from(reader))
+    };
+    let mut size = ListSize::new(NO_LIMIT);
+
+    assert!(matches!(
+        zip_listing(pipe_end()).next(&mut size),
+        Err(ListError::SourceUnreadable(_))
+    ));
+    assert!(zip_contents(pipe_end(), NO_LIMIT).is_err());
+}
 
 #[test]
 fn a_file_without_an_end_record_is_unreadable() {
@@ -662,6 +698,19 @@ fn a_zip64_extra_that_is_too_short_is_unreadable() {
     }
 
     assert_source_unreadable(&built.bytes);
+}
+
+#[test]
+fn values_after_the_ones_needed_in_the_zip64_extra_are_not_read() {
+    let mut entry = TestEntry::stored("a.md", b"alpha");
+    let mut values = (entry.data.len() as u64).to_le_bytes().to_vec();
+    values.extend_from_slice(&[0xFF; 8]);
+    entry.extra = extra_field(0x0001, &values);
+    let mut built = TestZip::of(vec![entry]).build();
+    let at = built.central_headers[0] + 20;
+    built.put_u32(at, u32::MAX);
+
+    assert_eq!(content_at(&built.bytes, 0), b"alpha");
 }
 
 #[test]

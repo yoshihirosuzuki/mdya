@@ -137,10 +137,6 @@ impl SparseRecords {
         self.present
     }
 
-    pub(super) fn name_len(&self) -> u64 {
-        self.name.as_ref().map_or(0, |name| name.len() as u64)
-    }
-
     /// Takes in one record, whose keyword started with `GNU.sparse.`.
     pub(super) fn take_record(
         &mut self,
