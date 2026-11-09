@@ -4,14 +4,14 @@
 use std::any::Any;
 use std::collections::HashSet;
 use std::error::Error;
-use std::future::{Future, poll_fn};
+use std::future::poll_fn;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::pin::pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
 use futures::FutureExt;
-use futures::stream::{self, FuturesUnordered, Stream, StreamExt};
+use futures::future::BoxFuture;
+use futures::stream::{self, BoxStream, FuturesUnordered, StreamExt};
 use tokio::task::JoinError;
 
 use super::{
@@ -19,31 +19,36 @@ use super::{
     UpdateStopped,
 };
 use crate::format::{Extracted, FileType, Format, FormatError};
-use crate::index::{DocumentToRegister, Index, IndexError, PartialDelete};
-use crate::types::{BoxError, DocumentOutcome, Key, Progress, ProgressSink};
+use crate::index::{DocumentToRegister, Index, IndexError, PartialDelete, RegistrationSink};
+use crate::types::{BoxError, CollectionName, DocumentOutcome, Key, Progress, ProgressSink};
 
 #[cfg(test)]
 mod tests;
 
 /// The ingest flow shared by the implementations that walk a source.
 ///
-/// For each item with a key, in order, it takes the content from `contents`,
-/// has `format` extract the body and chunks (on a blocking thread, since
-/// extracting can take long), and has `index` register the document, with
-/// `progress`. Up to `instruction.parallelism` documents (at least one) are in
-/// process at once, and the next content is asked for only when one more can
-/// start. A document whose content cannot be read, whose body cannot be
-/// extracted, or whose content `contents` did not hand over before it ended is
-/// warned about, counted as failed, and skipped, as is an item without a key.
-/// When `items` asks for it, the documents of the collection other than the
-/// items with a key, and other than those under the unreadable directories,
-/// are deleted at the end.
+/// It has `index` register the documents of the items with a key, passed as
+/// one stream, with `progress`. For each item, in order, the stream takes the
+/// content from `contents` and has `format` extract the body and chunks (on a
+/// blocking thread, since extracting can take long). `index` asks for the next
+/// document when it needs one. Up to `instruction.parallelism` documents (at
+/// least one) are in process at once, from the content's arrival until the
+/// document is passed to `index`, and the next content is asked for only when
+/// one more can start. A document whose content cannot be read, whose body
+/// cannot be extracted, or whose content `contents` did not hand over before
+/// it ended is warned about, counted as failed, and skipped, as is an item
+/// without a key. The others are counted when `index` passes their outcomes,
+/// that is, once they are written. When `items` asks for it, the documents of
+/// the collection other than the items with a key, and other than those under
+/// the unreadable directories, are deleted at the end.
 ///
-/// When `index` fails, no further document starts, and the error is returned
-/// with the counts once the documents already in process end. A panic, in the
-/// flow or in anything it calls, stops the flow the same way and is passed on
-/// once those documents end. A call to `contents.next` is always awaited until
-/// it returns, even when stopping.
+/// When `index` stops, the documents not yet passed to it are not passed, and
+/// its error is returned with the counts once the documents in process end. A
+/// panic in `index` is passed on the same way. A panic on this side (in
+/// `contents`, `format`, reporting progress, or logging) ends the stream, and
+/// is passed on once `index` has returned and the documents in process end. A
+/// call to `contents.next` is always awaited until it returns, even when
+/// stopping.
 pub async fn ingest_items(
     instruction: &UpdateInstruction,
     items: IngestItems,
@@ -66,14 +71,13 @@ pub async fn ingest_items(
         tally.failed();
     }
     let keep: HashSet<Key> = items.iter().map(|item| item.key.clone()).collect();
-    let documents = Documents {
-        instruction,
-        format,
-        index: index.as_ref(),
-        progress,
-    };
-    if let Some(error) = documents.process(items, contents, &mut tally).await {
-        return Err(tally.stopped(error));
+    let shared = Shared::new(tally);
+    let mut documents = Documents::new(instruction, items, contents, format, &shared);
+    let registered = documents.register_with(index.as_ref(), progress).await;
+    drop(documents);
+    let mut tally = shared.finish();
+    if let Err(error) = registered {
+        return Err(tally.stopped(IngestError::Index(error)));
     }
     if let Some(unreadable_dirs) = delete_except_unreadable_dirs {
         let deleted = index
@@ -166,211 +170,301 @@ type Panic = Box<dyn Any + Send>;
 /// The result of `contents.next`, or the panic it raised.
 type NextContent = Result<Option<Result<Vec<u8>, BoxError>>, Panic>;
 
-/// How one document in process ended.
-enum Finished {
-    Registered(DocumentOutcome),
+/// How preparing one document in process ended.
+enum Extraction {
+    Document(DocumentToRegister),
     /// Its body could not be extracted.
     Unreadable {
         key: Key,
         cause: FormatError,
     },
-    IndexFailed(IndexError),
 }
 
-/// Why the flow stops before the end. A panic wins over an error, since it
-/// has to reach the caller.
-enum Stop {
-    Error(IngestError),
-    Panic(Panic),
-}
-
-/// What the flow waits for next.
+/// What the stream of documents waits for next.
 enum Event {
     Content(IngestItem, NextContent),
-    Finished(Result<Finished, Panic>),
+    Extraction(Result<Extraction, Panic>),
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("the ingest implementation handed over no content for it")]
 struct NoContent;
 
-/// What processing the documents needs.
-struct Documents<'a> {
-    instruction: &'a UpdateInstruction,
-    format: Arc<dyn Format>,
-    index: &'a dyn Index,
-    progress: &'a dyn ProgressSink,
+/// What the stream of documents and `index` both reach: `index` passes the
+/// outcomes through a shared reference while it holds the stream.
+struct Shared<'p> {
+    tally: Mutex<Tally<'p>>,
+    /// The first panic, which has to reach the caller and wins over an error.
+    panic: Mutex<Option<Panic>>,
 }
 
-impl Documents<'_> {
-    /// Processes the items with a key. Returns the error that stopped it, if
-    /// any, after the documents in process have finished.
-    async fn process(
-        &self,
+impl<'p> Shared<'p> {
+    fn new(tally: Tally<'p>) -> Self {
+        Self {
+            tally: Mutex::new(tally),
+            panic: Mutex::new(None),
+        }
+    }
+
+    fn tally(&self) -> MutexGuard<'_, Tally<'p>> {
+        lock(&self.tally)
+    }
+
+    fn note_panic(&self, panic: Panic) {
+        lock(&self.panic).get_or_insert(panic);
+    }
+
+    fn panicked(&self) -> bool {
+        lock(&self.panic).is_some()
+    }
+
+    /// The counts, unless a panic has to reach the caller instead.
+    fn finish(self) -> Tally<'p> {
+        let panic = self.panic.into_inner();
+        if let Some(panic) = panic.unwrap_or_else(PoisonError::into_inner) {
+            resume_unwind(panic);
+        }
+        let tally = self.tally.into_inner();
+        tally.unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl RegistrationSink for Shared<'_> {
+    /// A panic while counting is one on this side, so it ends the stream
+    /// rather than unwinding through `index`, which writes what it has
+    /// finished before it returns.
+    fn registered(&self, _collection: &CollectionName, _key: &Key, outcome: DocumentOutcome) {
+        let counted = catch_unwind(AssertUnwindSafe(|| self.tally().count(outcome)));
+        if let Err(panic) = counted {
+            self.note_panic(panic);
+        }
+    }
+}
+
+/// A panic while counting poisons the lock. The flow carries on, to pass that
+/// panic to the caller once what it started has ended.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The documents of the items with a key, prepared as `index` asks for them.
+/// Everything under way is kept here rather than in the stream's future, so
+/// that it can still be waited for after `index` has dropped the stream.
+struct Documents<'a, 'p> {
+    instruction: &'a UpdateInstruction,
+    format: Arc<dyn Format>,
+    shared: &'a Shared<'p>,
+    contents: BoxStream<'a, NextContent>,
+    waiting: std::vec::IntoIter<IngestItem>,
+    /// The item whose content has been asked for and has not arrived.
+    asked: Option<IngestItem>,
+    in_process: FuturesUnordered<BoxFuture<'a, Result<Extraction, Panic>>>,
+    parallelism: usize,
+    index_returned: bool,
+}
+
+impl<'a, 'p> Documents<'a, 'p> {
+    fn new(
+        instruction: &'a UpdateInstruction,
         items: Vec<IngestItem>,
-        contents: &mut dyn ItemContents,
-        tally: &mut Tally<'_>,
-    ) -> Option<IngestError> {
+        contents: &'a mut dyn ItemContents,
+        format: Arc<dyn Format>,
+        shared: &'a Shared<'p>,
+    ) -> Self {
         // A call to `next` in progress lives inside the stream, so that it
-        // can be polled until it returns across the loop's turns. The call
-        // itself is inside `catch_unwind` too, since an implementation may
-        // panic before it returns its future.
-        let mut contents = pin!(stream::unfold(contents, |contents| async move {
+        // can be polled until it returns, also after `index` has returned.
+        // The call itself is inside `catch_unwind` too, since an
+        // implementation may panic before it returns its future.
+        let contents = stream::unfold(contents, |contents| async move {
             let next = AssertUnwindSafe(async { contents.next().await })
                 .catch_unwind()
                 .await;
             Some((next, contents))
-        }));
-        let parallelism = self.instruction.parallelism.max(1);
-        let mut waiting = items.into_iter();
-        let mut in_process = FuturesUnordered::new();
-        let mut asked: Option<IngestItem> = None;
-        let mut stop: Option<Stop> = None;
-        loop {
-            if stop.is_none() && asked.is_none() && in_process.len() < parallelism {
-                asked = waiting.next();
-            }
-            if asked.is_none() && in_process.is_empty() {
-                break;
-            }
-            let event = poll_fn(|context| {
-                if asked.is_some()
-                    && let Poll::Ready(Some(next)) = contents.as_mut().poll_next(context)
-                    && let Some(item) = asked.take()
-                {
-                    return Poll::Ready(Event::Content(item, next));
-                }
-                match in_process.poll_next_unpin(context) {
-                    Poll::Ready(Some(finished)) => Poll::Ready(Event::Finished(finished)),
-                    _ => Poll::Pending,
-                }
-            })
-            .await;
-            // Reporting progress and logging can panic too. Such a panic
-            // stops the flow like the others, so that the documents in
-            // process and a pending `next` are not dropped.
-            let handled = catch_unwind(AssertUnwindSafe(|| {
-                self.handle(event, &mut waiting, &mut stop, tally)
-            }));
-            match handled {
-                Ok(Some(document)) => in_process.push(document),
-                Ok(None) => {}
-                Err(panic) => stop_with_panic(&mut stop, panic),
-            }
-        }
-        match stop {
-            None => None,
-            Some(Stop::Error(error)) => Some(error),
-            Some(Stop::Panic(panic)) => resume_unwind(panic),
+        });
+        Self {
+            instruction,
+            format,
+            shared,
+            contents: contents.boxed(),
+            waiting: items.into_iter(),
+            asked: None,
+            in_process: FuturesUnordered::new(),
+            parallelism: instruction.parallelism.max(1),
+            index_returned: false,
         }
     }
 
-    /// Handles what the flow waited for. Returns the document to process, if
-    /// any.
-    fn handle(
-        &self,
-        event: Event,
-        waiting: &mut std::vec::IntoIter<IngestItem>,
-        stop: &mut Option<Stop>,
-        tally: &mut Tally<'_>,
-    ) -> Option<impl Future<Output = Result<Finished, Panic>> + Send + '_> {
-        match event {
-            Event::Content(item, next) => self.take_content(item, next, waiting, stop, tally),
-            Event::Finished(finished) => {
-                self.finish(finished, stop, tally);
-                None
-            }
-        }
+    /// Has `index` register the documents as one stream. Returns its result
+    /// after the documents in process and a pending `next` have ended. A panic
+    /// of `index` is kept in `shared`, for the caller to pass on.
+    async fn register_with(
+        &mut self,
+        index: &dyn Index,
+        progress: &dyn ProgressSink,
+    ) -> Result<(), IndexError> {
+        let parallelism = self.parallelism;
+        let shared = self.shared;
+        let documents = stream::unfold(&mut *self, |documents| async move {
+            let document = documents.next_document().await?;
+            Some((document, documents))
+        });
+        let documents = documents.boxed();
+        // Inside `catch_unwind` too, since an implementation may panic before
+        // it returns its future.
+        let registered = AssertUnwindSafe(async move {
+            index
+                .register_stream(documents, parallelism, shared, Some(progress))
+                .await
+        })
+        .catch_unwind()
+        .await;
+        // Before waiting, since what is waited for can panic too, and the
+        // first panic is the one to pass on.
+        let registered = registered.unwrap_or_else(|panic| {
+            shared.note_panic(panic);
+            Ok(())
+        });
+        self.wait_for_what_started().await;
+        registered
     }
 
-    /// Handles the content handed over for `item`. Returns the document to
-    /// process, if any. Once stopped, what arrives is not processed.
-    fn take_content(
-        &self,
-        item: IngestItem,
-        next: NextContent,
-        waiting: &mut std::vec::IntoIter<IngestItem>,
-        stop: &mut Option<Stop>,
-        tally: &mut Tally<'_>,
-    ) -> Option<impl Future<Output = Result<Finished, Panic>> + Send + '_> {
-        let collection = self.instruction.collection.0.as_str();
-        match next {
-            Err(panic) => stop_with_panic(stop, panic),
-            Ok(_) if stop.is_some() => {}
-            Ok(None) => {
-                for item in std::iter::once(item).chain(waiting) {
-                    warn_unreadable(collection, &item.key, &NoContent);
-                    tally.failed();
-                }
+    /// The next document to pass to `index`. `None` ends the stream: after
+    /// the last item, or at once after a panic on this side.
+    async fn next_document(&mut self) -> Option<DocumentToRegister> {
+        while !self.shared.panicked() {
+            if self.asked.is_none() && self.in_process.len() < self.parallelism {
+                self.asked = self.waiting.next();
             }
-            Ok(Some(Err(cause))) => {
-                warn_unreadable(collection, &item.key, cause.as_ref());
-                tally.failed();
+            if self.asked.is_none() && self.in_process.is_empty() {
+                return None;
             }
-            Ok(Some(Ok(content))) => return Some(self.document(item, content)),
+            let event = self.next_event().await;
+            let document = self.handle(event);
+            if document.is_some() {
+                return document;
+            }
         }
         None
     }
 
-    /// Extracts and registers one document.
-    fn document(
+    /// Waits for the documents in process and a pending `next`, passing on
+    /// nothing, so that neither is dropped before it ends.
+    async fn wait_for_what_started(&mut self) {
+        self.index_returned = true;
+        while self.asked.is_some() || !self.in_process.is_empty() {
+            let event = self.next_event().await;
+            self.handle(event);
+        }
+    }
+
+    async fn next_event(&mut self) -> Event {
+        poll_fn(|context| {
+            if self.asked.is_some()
+                && let Poll::Ready(Some(next)) = self.contents.poll_next_unpin(context)
+                && let Some(item) = self.asked.take()
+            {
+                return Poll::Ready(Event::Content(item, next));
+            }
+            match self.in_process.poll_next_unpin(context) {
+                Poll::Ready(Some(extraction)) => Poll::Ready(Event::Extraction(extraction)),
+                _ => Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    /// Handles what the stream waited for. Returns the document to pass to
+    /// `index`, if any. Reporting progress and logging can panic too. Such a
+    /// panic stops the flow like the others, so that the documents in process
+    /// and a pending `next` are not dropped.
+    fn handle(&mut self, event: Event) -> Option<DocumentToRegister> {
+        let handled = catch_unwind(AssertUnwindSafe(|| match event {
+            Event::Content(item, next) => {
+                self.take_content(item, next);
+                None
+            }
+            Event::Extraction(extraction) => self.finish_extraction(extraction),
+        }));
+        handled.unwrap_or_else(|panic| {
+            self.shared.note_panic(panic);
+            None
+        })
+    }
+
+    fn stopping(&self) -> bool {
+        self.index_returned || self.shared.panicked()
+    }
+
+    /// Handles the content handed over for `item`. Once stopping, what arrives
+    /// is not processed.
+    fn take_content(&mut self, item: IngestItem, next: NextContent) {
+        match next {
+            Err(panic) => self.shared.note_panic(panic),
+            Ok(_) if self.stopping() => {}
+            Ok(None) => self.fail_with_the_rest(item),
+            Ok(Some(Err(cause))) => self.fail(&item.key, cause.as_ref()),
+            Ok(Some(Ok(content))) => self.in_process.push(self.extraction(item, content)),
+        }
+    }
+
+    fn fail_with_the_rest(&mut self, item: IngestItem) {
+        let mut items = vec![item];
+        items.extend(self.waiting.by_ref());
+        for item in items {
+            self.fail(&item.key, &NoContent);
+        }
+    }
+
+    fn fail(&self, key: &Key, cause: &(dyn Error + 'static)) {
+        warn_unreadable(self.instruction.collection.0.as_str(), key, cause);
+        self.shared.tally().failed();
+    }
+
+    /// Extracts the body and chunks of one document.
+    fn extraction(
         &self,
         item: IngestItem,
         content: Vec<u8>,
-    ) -> impl Future<Output = Result<Finished, Panic>> + Send + '_ {
+    ) -> BoxFuture<'a, Result<Extraction, Panic>> {
         let format = self.format.clone();
-        let document = async move {
-            let extracted = match extract(format, content, item.file_type).await {
-                Ok(extracted) => extracted,
-                Err(cause) => {
-                    return Finished::Unreadable {
-                        key: item.key,
-                        cause,
-                    };
-                }
-            };
-            let document = DocumentToRegister {
-                collection: self.instruction.collection.clone(),
-                key: item.key,
-                time: Some(item.time),
-                body: extracted.body,
-                chunks: extracted.chunks,
-                overwrite: self.instruction.overwrite,
-            };
-            match self.index.register(document, Some(self.progress)).await {
-                Ok(outcome) => Finished::Registered(outcome),
-                Err(error) => Finished::IndexFailed(error),
+        let instruction = self.instruction;
+        let extraction = async move {
+            match extract(format, content, item.file_type).await {
+                Ok(extracted) => Extraction::Document(DocumentToRegister {
+                    collection: instruction.collection.clone(),
+                    key: item.key,
+                    time: Some(item.time),
+                    body: extracted.body,
+                    chunks: extracted.chunks,
+                    overwrite: instruction.overwrite,
+                }),
+                Err(cause) => Extraction::Unreadable {
+                    key: item.key,
+                    cause,
+                },
             }
         };
-        AssertUnwindSafe(document).catch_unwind()
+        AssertUnwindSafe(extraction).catch_unwind().boxed()
     }
 
-    /// Counts a document that finished, or notes why the flow stops.
-    fn finish(
+    /// Returns the document to pass to `index`, if any. Once stopping, a
+    /// document that is ready is not passed.
+    fn finish_extraction(
         &self,
-        finished: Result<Finished, Panic>,
-        stop: &mut Option<Stop>,
-        tally: &mut Tally<'_>,
-    ) {
-        match finished {
-            Err(panic) => stop_with_panic(stop, panic),
-            Ok(Finished::Registered(outcome)) => tally.count(outcome),
-            Ok(Finished::Unreadable { key, cause }) => {
-                warn_unreadable(self.instruction.collection.0.as_str(), &key, &cause);
-                tally.failed();
+        extraction: Result<Extraction, Panic>,
+    ) -> Option<DocumentToRegister> {
+        match extraction {
+            Err(panic) => {
+                self.shared.note_panic(panic);
+                None
             }
-            Ok(Finished::IndexFailed(error)) => {
-                if stop.is_none() {
-                    *stop = Some(Stop::Error(IngestError::Index(error)));
-                }
+            Ok(Extraction::Unreadable { key, cause }) => {
+                self.fail(&key, &cause);
+                None
             }
+            Ok(Extraction::Document(_)) if self.stopping() => None,
+            Ok(Extraction::Document(document)) => Some(document),
         }
-    }
-}
-
-fn stop_with_panic(stop: &mut Option<Stop>, panic: Panic) {
-    if !matches!(stop, Some(Stop::Panic(_))) {
-        *stop = Some(Stop::Panic(panic));
     }
 }
 

@@ -1269,11 +1269,42 @@ fn chunk_texts(document: &DocumentToRegister) -> Vec<&str> {
         .collect()
 }
 
+/// Keeps the outcome that registering one document passes.
+#[derive(Default)]
+struct OneOutcome(Mutex<Option<DocumentOutcome>>);
+
+impl RegistrationSink for OneOutcome {
+    fn registered(&self, _collection: &CollectionName, _key: &Key, outcome: DocumentOutcome) {
+        *self.0.lock().unwrap() = Some(outcome);
+    }
+}
+
+impl OneOutcome {
+    fn passed(self) -> DocumentOutcome {
+        let outcome = self.0.into_inner().unwrap();
+        outcome.expect("a registration that returned no error passed the document's outcome")
+    }
+}
+
+/// Registers `document` alone, as a stream of one document.
 async fn register(
     index: &LanceDbIndex,
     document: &DocumentToRegister,
 ) -> Result<DocumentOutcome, IndexError> {
-    index.register(document.clone(), None).await
+    register_with_progress(index, document, None).await
+}
+
+async fn register_with_progress(
+    index: &LanceDbIndex,
+    document: &DocumentToRegister,
+    progress: Option<&dyn ProgressSink>,
+) -> Result<DocumentOutcome, IndexError> {
+    let outcome = OneOutcome::default();
+    let documents = futures::stream::iter([document.clone()]).boxed();
+    index
+        .register_stream(documents, 1, &outcome, progress)
+        .await?;
+    Ok(outcome.passed())
 }
 
 /// How many calls to make chunk vectors `embedding` got.
@@ -1742,8 +1773,7 @@ async fn chunks_go_to_embedding_in_order_a_limited_number_at_a_time_with_progres
     let texts: Vec<String> = chunk_texts(&added).into_iter().map(str::to_owned).collect();
     let progress = LoggedProgress { log: log.clone() };
 
-    index
-        .register(added.clone(), Some(&progress))
+    register_with_progress(&index, &added, Some(&progress))
         .await
         .unwrap();
 
@@ -2267,7 +2297,7 @@ async fn registering_drops_the_new_columns_a_rebuild_left_before_switching() {
 }
 
 #[tokio::test]
-async fn registering_checks_the_vector_columns_again_just_before_writing() {
+async fn registering_checks_the_vector_columns_again_for_each_bulk() {
     prepare_full_text_search().await;
     // A new document, and a document whose time alone changed.
     for only_the_time in [false, true] {
@@ -2281,13 +2311,6 @@ async fn registering_checks_the_vector_columns_again_just_before_writing() {
         // The rebuild stops with both tables' new columns filled, before
         // switching.
         rebuild_hooks.plan(LanceCall::CreateIndex(TableName::Chunk), Plan::Fail);
-        // The registration is held after its check, before reading the
-        // version.
-        let pause = Arc::new(Pause::default());
-        hooks.plan(
-            LanceCall::ReadRows(TableName::Document),
-            Plan::Pause(pause.clone()),
-        );
         let registered_now = match only_the_time {
             false => document("added.md", MIXED_BODY),
             true => DocumentToRegister {
@@ -2295,8 +2318,18 @@ async fn registering_checks_the_vector_columns_again_just_before_writing() {
                 ..documents[0].clone()
             },
         };
+        // The registration is held after its first check, when it asks for
+        // the document of its bulk.
+        let pause = Pause::default();
+        let streamed = registered_now.clone();
+        let stream = futures::stream::once(async {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+            streamed
+        });
+        let outcome = OneOutcome::default();
 
-        let registering = register(&index, &registered_now);
+        let registering = index.register_stream(stream.boxed(), 1, &outcome, None);
         let rebuilding_meanwhile = async {
             pause.reached.notified().await;
             rebuild(&rebuilder, false, 1).await.unwrap_err();
@@ -2325,7 +2358,7 @@ async fn registering_checks_the_vector_columns_again_just_before_writing() {
 }
 
 #[tokio::test]
-async fn registering_an_unchanged_document_reads_the_vector_columns_once() {
+async fn registering_an_unchanged_document_reads_the_vector_columns_again_for_its_bulk() {
     prepare_full_text_search().await;
     let hooks = Arc::new(TestHooks::default());
     let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
@@ -2336,12 +2369,12 @@ async fn registering_an_unchanged_document_reads_the_vector_columns_once() {
     let outcome = register(&index, &same).await;
 
     assert_eq!(outcome.unwrap(), DocumentOutcome::Unchanged);
-    // To prepare the tables. With nothing to write, they are not read again.
-    assert_eq!(hooks.count(LanceCall::ReadColumns) - reads_before, 1);
+    // To prepare the tables, and again once the bulk holds the write lock.
+    assert_eq!(hooks.count(LanceCall::ReadColumns) - reads_before, 2);
 }
 
 #[tokio::test]
-async fn registering_a_changed_document_reads_the_vector_columns_again_before_writing_it() {
+async fn opening_lancedb_again_for_the_versions_keeps_the_write_lock_and_reads_no_columns() {
     prepare_full_text_search().await;
     let hooks = Arc::new(TestHooks::default());
     let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
@@ -2357,7 +2390,7 @@ async fn registering_a_changed_document_reads_the_vector_columns_again_before_wr
 
     assert_eq!(outcome.unwrap(), DocumentOutcome::Changed);
     assert_eq!(hooks.count(LanceCall::Connect) - connects_before, 1);
-    // To prepare the tables, and again just before writing the document.
+    // To prepare the tables, and again once the bulk holds the write lock.
     // Opening LanceDB again reads none.
     assert_eq!(hooks.count(LanceCall::ReadColumns) - reads_before, 2);
 }
@@ -2375,6 +2408,26 @@ async fn a_registration_that_cannot_read_the_vector_columns_cannot_read_the_inde
     let outcome = register(&index, &document("b.md", ASCII_BODY)).await;
 
     assert!(matches!(outcome, Err(IndexError::CannotRead { .. })));
+}
+
+#[tokio::test]
+async fn a_bulk_that_cannot_read_the_vector_columns_again_reads_no_versions() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    register(&index, &document("a.md", ASCII_BODY))
+        .await
+        .unwrap();
+    // The check that prepares the tables passes, and the bulk's check fails.
+    hooks.plan(LanceCall::ReadColumns, Plan::Allow);
+    hooks.plan(LanceCall::ReadColumns, Plan::Fail);
+    let versions = LanceCall::ReadRows(TableName::Document);
+    let reads_before = hooks.count(versions);
+
+    let outcome = register(&index, &document("b.md", ASCII_BODY)).await;
+
+    assert!(matches!(outcome, Err(IndexError::CannotRead { .. })));
+    assert_eq!(hooks.count(versions), reads_before);
 }
 
 #[tokio::test]
@@ -2850,6 +2903,28 @@ fn outcome_of(key: &str, outcome: DocumentOutcome) -> (String, DocumentOutcome) 
 }
 
 #[tokio::test]
+async fn a_stream_that_ended_with_a_bulk_under_way_is_not_asked_again() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, index) = index_with(embedding.clone(), &hooks);
+    let added = document("a.md", ASCII_BODY);
+    // `unfold` panics when it is polled again after it has ended, as the
+    // `Stream` trait allows.
+    let documents = futures::stream::unfold(Some(added.clone()), |document| async move {
+        document.map(|document| (document, None))
+    });
+    let outcomes = RecordedOutcomes::new(&hooks);
+
+    let registered = index.register_stream(documents.boxed(), 1, &outcomes, None);
+    registered.await.unwrap();
+
+    let added_outcome = outcome_of("a.md", DocumentOutcome::Added);
+    assert_eq!(outcomes.outcomes(), [added_outcome]);
+    assert_index_holds(data_dir.path(), &[&added], &embedding).await;
+}
+
+#[tokio::test]
 async fn a_bulk_of_mixed_documents_is_read_once_and_written_once_per_kind_of_write() {
     use LanceCall::{AddRows, ReadRows, WriteRows};
     use TableName::{Chunk, Document};
@@ -2974,7 +3049,7 @@ async fn bulks_are_cut_at_their_number_of_documents_their_bytes_and_a_new_collec
         in_papers(document("9.md", &body(1))),
     ];
     let asked = Arc::new(AtomicUsize::new(0));
-    let mut stream = counted_stream(documents, &asked);
+    let mut stream = counted_stream(documents, &asked).fuse();
     let mut held = None;
     let mut bulks = Vec::new();
     loop {
@@ -3666,6 +3741,19 @@ async fn calls_while_a_registration_writes<T>(
         LanceCall::WriteRows(TableName::Chunk),
         Plan::Pause(pause.clone()),
     );
+    calls_while_a_registration_is_held(index, hooks, &pause, call).await
+}
+
+/// Registers a new document, which something in the test holds at `pause`
+/// until `call` has had 300 ms to run, and then lets both finish. Returns the
+/// calls into LanceDB that `call` made while the registration was held, and
+/// what `call` returned.
+async fn calls_while_a_registration_is_held<T>(
+    index: &LanceDbIndex,
+    hooks: &TestHooks,
+    pause: &Pause,
+    call: impl Future<Output = T>,
+) -> (Vec<LanceCall>, T) {
     let added = document("added.md", MIXED_BODY);
     let registering = register(index, &added);
     let meanwhile = async {
@@ -4291,6 +4379,73 @@ async fn registering_and_deleting_at_once_write_one_function_at_a_time() {
     deleted_one.unwrap();
     assert_eq!(deleted_others.unwrap(), 1);
     assert_index_holds(data_dir.path(), &[&kept, &added], &embedding).await;
+}
+
+#[tokio::test]
+async fn a_registration_holds_the_write_lock_from_reading_the_versions() {
+    prepare_full_text_search().await;
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding_of(MODEL_NAME, 8), &hooks);
+    let pause = Arc::new(Pause::default());
+    hooks.plan(
+        LanceCall::ReadRows(TableName::Document),
+        Plan::Pause(pause.clone()),
+    );
+    let (notes, nothing) = (name("notes"), Key("nothing.md".to_owned()));
+
+    let deleting = index.delete_document(&notes, &nothing);
+    let (made, _) = calls_while_a_registration_is_held(&index, &hooks, &pause, deleting).await;
+
+    assert_eq!(made, []);
+}
+
+#[tokio::test]
+async fn a_registration_holds_the_write_lock_while_it_makes_the_vectors() {
+    prepare_full_text_search().await;
+    let pause = Arc::new(Pause::default());
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let pausing = ScriptedEmbedding::new(embedding, 1, Then::Pause(pause.clone()));
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(Arc::new(pausing), &hooks);
+    let (notes, nothing) = (name("notes"), Key("nothing.md".to_owned()));
+
+    let deleting = index.delete_document(&notes, &nothing);
+    let (made, _) = calls_while_a_registration_is_held(&index, &hooks, &pause, deleting).await;
+
+    assert_eq!(made, []);
+}
+
+#[tokio::test]
+async fn a_registration_does_not_hold_the_write_lock_between_two_bulks() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let hooks = Arc::new(TestHooks::default());
+    let (data_dir, mut index) = index_with(embedding.clone(), &hooks);
+    index.bulk_documents = 1;
+    let first = document("first.md", ASCII_BODY);
+    let second = document("second.md", ASCII_BODY);
+    let (index, deleted, last_key) = (&index, &first, &second.key);
+    let outcomes = RecordedOutcomes::new(&hooks);
+    // The deletion needs the write lock, so it ends only if the registration
+    // does not hold it while it asks for the second bulk's document.
+    let documents = futures::stream::iter([first.clone(), second.clone()])
+        .then(|document| async move {
+            if &document.key == last_key {
+                let collection = &deleted.collection;
+                index
+                    .delete_document(collection, &deleted.key)
+                    .await
+                    .unwrap();
+            }
+            document
+        })
+        .boxed();
+
+    let registering = index.register_stream(documents, 1, &outcomes, None);
+    let registered = tokio::time::timeout(Duration::from_secs(30), registering).await;
+
+    registered.expect("the deletion waited").unwrap();
+    assert_index_holds(data_dir.path(), &[&second], &embedding).await;
 }
 
 // Deleting documents, rebuilding the embedding vectors, maintaining the
@@ -4945,12 +5100,14 @@ impl Embedding for GatedEmbedding {
 }
 
 /// What a [`ScriptedEmbedding`] does at its planned call.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Then {
     /// Never return.
     Stall,
     /// Fail as when the model cannot be used.
     Fail,
+    /// Tell the test it got there, and wait until the test lets it go.
+    Pause(Arc<Pause>),
 }
 
 /// Makes chunk vectors as `inner` does, except at its `at`th call (counting
@@ -5000,12 +5157,16 @@ impl Embedding for ScriptedEmbedding {
     async fn embed_chunks(&self, texts: &[&str]) -> Result<Vec<ChunkEmbedding>, EmbeddingError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if call == self.at {
-            match self.then {
+            match &self.then {
                 Then::Stall => std::future::pending::<()>().await,
                 Then::Fail => {
                     return Err(EmbeddingError::ModelUnavailable {
                         source: "a planned failure".into(),
                     });
+                }
+                Then::Pause(pause) => {
+                    pause.reached.notify_one();
+                    pause.resume.notified().await;
                 }
             }
         }

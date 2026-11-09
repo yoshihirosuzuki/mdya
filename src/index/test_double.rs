@@ -9,10 +9,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 
 use super::{
     DimensionCheck, DimensionResult, DocumentToRegister, Index, IndexError, IndexStatus,
-    PartialDelete, QueryTables, StatusScope,
+    PartialDelete, QueryTables, RegistrationSink, StatusScope,
 };
 use crate::embedding::Embedding;
 use crate::types::{CollectionName, DocumentOutcome, Key, ProgressSink};
@@ -32,11 +34,13 @@ type TablesFn = dyn Fn() -> Result<Option<QueryTables>, IndexError> + Send + Syn
 type UnitFn = dyn Fn() -> Result<(), IndexError> + Send + Sync;
 
 /// Answers every function from a handler and records every call. The default
-/// handlers stand for an empty index that accepts everything: `register`
-/// returns `Added`, the deletes delete nothing, `has_document` is false, the
-/// counts and the status are empty, `tables_for_query` is `None`, and
-/// `maintain` and `check_ingestable` succeed. Replace a handler with the
-/// `on_*` function of the same name.
+/// handlers stand for an empty index that accepts everything: each document
+/// of `register_stream` is `Added`, the deletes delete nothing, `has_document`
+/// is false, the counts and the status are empty, `tables_for_query` is
+/// `None`, and `maintain` and `check_ingestable` succeed. Replace a handler
+/// with the `on_*` function of the same name. `on_register` answers for each
+/// document of the stream, and `register_stream` records each as one
+/// `IndexCall::Register`, one at a time, stopping at the first error.
 pub(crate) struct TestIndex {
     register: Box<RegisterFn>,
     delete_others: Box<DeleteOthersFn>,
@@ -219,14 +223,20 @@ pub(crate) fn empty_status(compare_with: &dyn Embedding) -> IndexStatus {
 
 #[async_trait]
 impl Index for TestIndex {
-    async fn register(
+    async fn register_stream(
         &self,
-        document: DocumentToRegister,
+        mut documents: BoxStream<'_, DocumentToRegister>,
+        _parallelism: usize,
+        results: &dyn RegistrationSink,
         progress: Option<&dyn ProgressSink>,
-    ) -> Result<DocumentOutcome, IndexError> {
-        let result = (self.register)(&document, progress);
-        self.record(IndexCall::Register(document));
-        result
+    ) -> Result<(), IndexError> {
+        while let Some(document) = documents.next().await {
+            let result = (self.register)(&document, progress);
+            let (collection, key) = (document.collection.clone(), document.key.clone());
+            self.record(IndexCall::Register(document));
+            results.registered(&collection, &key, result?);
+        }
+        Ok(())
     }
 
     async fn delete_others(
@@ -313,9 +323,6 @@ impl Index for TestIndex {
 mod tests {
     use std::sync::Arc;
 
-    use futures::StreamExt;
-
-    use super::super::RegistrationSink;
     use super::*;
     use crate::embedding::test_double::TestEmbedding;
     use crate::types::Chunk;
@@ -331,6 +338,27 @@ mod tests {
         }
     }
 
+    /// Records the keys and outcomes passed to it, in order.
+    #[derive(Default)]
+    struct Outcomes(Mutex<Vec<(String, DocumentOutcome)>>);
+
+    impl RegistrationSink for Outcomes {
+        fn registered(&self, _collection: &CollectionName, key: &Key, outcome: DocumentOutcome) {
+            self.0.lock().unwrap().push((key.0.clone(), outcome));
+        }
+    }
+
+    async fn register_one(
+        index: &Arc<dyn Index>,
+        document: DocumentToRegister,
+    ) -> Result<DocumentOutcome, IndexError> {
+        let outcomes = Outcomes::default();
+        let documents = futures::stream::iter([document]).boxed();
+        index.register_stream(documents, 1, &outcomes, None).await?;
+        let outcome = outcomes.0.lock().unwrap()[0].1;
+        Ok(outcome)
+    }
+
     #[tokio::test]
     async fn answers_as_an_empty_index_by_default_and_records_the_calls() {
         let double = Arc::new(TestIndex::new());
@@ -338,7 +366,7 @@ mod tests {
         let embedding = TestEmbedding::new("test-model", 4);
         let notes = CollectionName("notes".to_owned());
 
-        let outcome = index.register(document("a.md"), None).await.unwrap();
+        let outcome = register_one(&index, document("a.md")).await.unwrap();
         let deleted = index
             .delete_others(&notes, &HashSet::new(), &[])
             .await
@@ -393,11 +421,11 @@ mod tests {
         let notes = CollectionName("notes".to_owned());
 
         assert_eq!(
-            index.register(document("same.md"), None).await.unwrap(),
+            register_one(&index, document("same.md")).await.unwrap(),
             DocumentOutcome::Unchanged
         );
         assert!(matches!(
-            index.register(document("other.md"), None).await,
+            register_one(&index, document("other.md")).await,
             Err(IndexError::CannotWrite { .. })
         ));
         let stopped = index
@@ -405,16 +433,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(stopped.deleted, 2);
-    }
-
-    /// Records the keys and outcomes passed to it, in order.
-    #[derive(Default)]
-    struct Outcomes(Mutex<Vec<(String, DocumentOutcome)>>);
-
-    impl RegistrationSink for Outcomes {
-        fn registered(&self, _collection: &CollectionName, key: &Key, outcome: DocumentOutcome) {
-            self.0.lock().unwrap().push((key.0.clone(), outcome));
-        }
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use futures::stream::{BoxStream, FuturesUnordered};
+use futures::stream::{BoxStream, Fuse, FuturesUnordered};
 use futures::{StreamExt, TryStreamExt};
 use lancedb::DistanceType;
 use lancedb::arrow::arrow_array::builder::StringBuilder;
@@ -136,14 +136,15 @@ pub enum IndexError {
     /// The document does not exist. Only `delete_document` returns it.
     #[error("the document does not exist")]
     DocumentNotFound,
-    /// The embedding model cannot be used. Only `register`,
+    /// The embedding model cannot be used. Only `register_stream`,
     /// `rebuild_embeddings`, and `check_ingestable` return it.
     #[error("the embedding model cannot be used")]
     Embedding(#[source] EmbeddingError),
     /// The configured embedding model differs from the one the index's vector
     /// columns were made with; rebuild the embedding vectors first. Only
-    /// `register` and `check_ingestable` return it. `configured_dimension` is
-    /// `None` when the configured model's dimension could not be checked.
+    /// `register_stream` and `check_ingestable` return it.
+    /// `configured_dimension` is `None` when the configured model's dimension
+    /// could not be checked.
     #[error("the configured embedding model differs from the one the index was made with")]
     ModelMismatch {
         configured_name: String,
@@ -152,8 +153,8 @@ pub enum IndexError {
     },
     /// A rebuild of the embedding vectors stopped partway through switching
     /// the vector columns, and a vector column is of another model than the
-    /// configured one; rebuild first. Only `register` and `check_ingestable`
-    /// return it.
+    /// configured one; rebuild first. Only `register_stream` and
+    /// `check_ingestable` return it.
     #[error("a rebuild of the embedding vectors has not finished")]
     RebuildIncomplete,
     #[error("the index cannot be read")]
@@ -179,33 +180,15 @@ pub trait Index: Send + Sync {
     /// document's embedding vectors fails, it starts no other document, and
     /// first writes the documents whose vectors are made and passes their
     /// outcomes. A document it has not finished is neither written nor
-    /// passed. It returns the first error that made it stop. The caller passes no document twice, in one stream
-    /// or in two calls at once.
-    ///
-    /// By default, the documents are registered one at a time with
-    /// `register`, which the test doubles of other components rely on; the
-    /// component itself reads and writes them a bulk at a time.
+    /// passed. It returns the first error that made it stop. The caller
+    /// passes no document twice, in one stream or in two calls at once.
     async fn register_stream(
         &self,
-        mut documents: BoxStream<'_, DocumentToRegister>,
-        _parallelism: usize,
+        documents: BoxStream<'_, DocumentToRegister>,
+        parallelism: usize,
         results: &dyn RegistrationSink,
         progress: Option<&dyn ProgressSink>,
-    ) -> Result<(), IndexError> {
-        while let Some(document) = documents.next().await {
-            let (collection, key) = (document.collection.clone(), document.key.clone());
-            let outcome = self.register(document, progress).await?;
-            results.registered(&collection, &key, outcome);
-        }
-        Ok(())
-    }
-    /// Registers one document, as `register_stream` does a stream of it
-    /// alone, and says what it did.
-    async fn register(
-        &self,
-        document: DocumentToRegister,
-        progress: Option<&dyn ProgressSink>,
-    ) -> Result<DocumentOutcome, IndexError>;
+    ) -> Result<(), IndexError>;
     /// Deletes the documents of the collection whose key is neither in `keep`
     /// nor under one of `unreadable_dirs` (key prefixes), and returns how many
     /// it deleted. A key is under a directory when it begins with the
@@ -2012,16 +1995,19 @@ impl LanceDbIndex {
     /// Registers the documents of `documents` a bulk at a time: it asks for
     /// the documents of a bulk, registers them, and only then asks for the
     /// next bulk's. The vector columns are checked before the first document
-    /// is asked for, and again just before each bulk is written.
+    /// is asked for, and again for each bulk.
     async fn register_documents(
         &self,
-        mut documents: BoxStream<'_, DocumentToRegister>,
+        documents: BoxStream<'_, DocumentToRegister>,
         parallelism: usize,
         results: &dyn RegistrationSink,
         progress: Option<&dyn ProgressSink>,
     ) -> Result<(), IndexError> {
         self.read_dictionary().await?;
         let mut prepared = self.prepare_to_write().await?;
+        // A bulk that the stream's end cut short is not empty, so the loop
+        // asks once more, which a stream that has ended need not allow.
+        let mut documents = documents.fuse();
         let mut held = None;
         loop {
             let bulk = self.next_bulk(&mut documents, &mut held, prepared.model.dimension);
@@ -2046,7 +2032,7 @@ impl LanceDbIndex {
     /// for the bulk after. Empty when the stream has ended.
     async fn next_bulk(
         &self,
-        documents: &mut BoxStream<'_, DocumentToRegister>,
+        documents: &mut Fuse<BoxStream<'_, DocumentToRegister>>,
         held: &mut Option<DocumentToRegister>,
         dimension: usize,
     ) -> Vec<DocumentToRegister> {
@@ -2085,12 +2071,20 @@ impl LanceDbIndex {
     /// once they are written. When making the vectors fails, the documents
     /// whose vectors are made are written all the same, and the first error is
     /// returned after.
+    ///
+    /// It holds the write lock from before it reads the versions until the
+    /// documents are written, also while the vectors are made: what it decides
+    /// rests on what it read, so no other function of this component may
+    /// change that in between. The lock is not held while the stream is asked
+    /// for the next bulk's documents.
     async fn register_bulk(
         &self,
         prepared: &mut Prepared,
         bulk: Vec<DocumentToRegister>,
         registering: &Registering<'_>,
     ) -> Result<(), IndexError> {
+        let _writing = self.writing.lock().await;
+        self.check_columns_again(prepared).await?;
         let decided = self.decide_bulk(prepared, bulk).await?;
         for skipped in decided.iter().filter(|done| done.action == Action::Skip) {
             let document = &skipped.document;
@@ -2286,11 +2280,11 @@ impl LanceDbIndex {
         Ok(versions)
     }
 
-    /// Drops the connection and the tables held, and opens them again, while
-    /// no other function of this component writes.
+    /// Drops the connection and the tables held, and opens them again. The
+    /// caller holds the write lock, so that no other function of this
+    /// component writes meanwhile.
     async fn reopen_tables(&self, model: &EmbeddingModel) -> Result<Tables, IndexError> {
         self.store.discard().await;
-        let _writing = self.writing.lock().await;
         let tables = self.store.tables_to_write(Some(model)).await?;
         tables.ok_or_else(|| write_error("the tables could not be opened again".into()))
     }
@@ -2409,8 +2403,6 @@ impl LanceDbIndex {
         if rows.written.is_empty() && rows.timed.is_empty() {
             return Ok(());
         }
-        let _writing = self.writing.lock().await;
-        self.check_columns_again(prepared).await?;
         let tables = &prepared.tables;
         if !rows.written.is_empty() {
             let keys: Vec<Key> = rows.written.iter().map(|(key, _)| key.clone()).collect();
@@ -2525,10 +2517,9 @@ impl LanceDbIndex {
     }
 
     /// Checks the vector columns again as [`Self::check_columns`] does, for
-    /// the model the rows were made for, just before writing them while no
-    /// other function of this component writes: the write lock is not held
-    /// while the vectors are made, so a rebuild may have changed the columns
-    /// since the first check.
+    /// the model the vectors are made for, with the write lock held for a
+    /// bulk: the lock is not held between bulks, so a rebuild may have changed
+    /// the columns since the check before.
     async fn check_columns_again(&self, prepared: &Prepared) -> Result<(), IndexError> {
         let columns = self.read_columns(&prepared.tables).await?;
         let made_for = Ok(prepared.model.clone());
@@ -2550,21 +2541,6 @@ impl Index for LanceDbIndex {
         let result = result.await;
         self.discard_after(&result).await;
         result
-    }
-
-    #[expect(clippy::expect_used)]
-    async fn register(
-        &self,
-        document: DocumentToRegister,
-        progress: Option<&dyn ProgressSink>,
-    ) -> Result<DocumentOutcome, IndexError> {
-        let outcome = OneOutcome::default();
-        let documents = futures::stream::iter([document]).boxed();
-        self.register_stream(documents, 1, &outcome, progress)
-            .await?;
-        let outcome = outcome.0.into_inner();
-        let outcome = outcome.unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(outcome.expect("a registration that returned no error passed the document's outcome"))
     }
 
     async fn delete_others(
@@ -2771,20 +2747,6 @@ impl BulkRows {
             }
         }
         Ok(rows)
-    }
-}
-
-/// Collects the one outcome of `register`'s stream of one document.
-#[derive(Default)]
-struct OneOutcome(std::sync::Mutex<Option<DocumentOutcome>>);
-
-impl RegistrationSink for OneOutcome {
-    fn registered(&self, _collection: &CollectionName, _key: &Key, outcome: DocumentOutcome) {
-        let mut held = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *held = Some(outcome);
     }
 }
 
