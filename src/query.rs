@@ -8,10 +8,44 @@ use crate::embedding::{Embedding, EmbeddingError};
 use crate::index::{Index, IndexError};
 use crate::types::{BoxError, CollectionName, Key};
 
+mod document;
+#[cfg(test)]
+mod test_tables;
+
+use document::StoredDocument;
+
 /// Creates the component.
 pub fn create(embedding: Arc<dyn Embedding>, index: Arc<dyn Index>) -> Arc<dyn Query> {
-    let _ = (embedding, index);
-    todo!()
+    Arc::new(IndexedQuery { embedding, index })
+}
+
+struct IndexedQuery {
+    embedding: Arc<dyn Embedding>,
+    index: Arc<dyn Index>,
+}
+
+#[async_trait]
+impl Query for IndexedQuery {
+    async fn search(&self, request: SearchRequest) -> Result<SearchResult, QueryError> {
+        let _ = (&self.embedding, request);
+        todo!()
+    }
+
+    async fn get_document(
+        &self,
+        collection: &CollectionName,
+        key: &Key,
+        range: ChunkRangeRequest,
+    ) -> Result<String, QueryError> {
+        check_chunk_range(&range)?;
+        let tables = self.index.tables_for_query().await;
+        let Some(tables) = tables.map_err(QueryError::Index)? else {
+            return Err(QueryError::DocumentNotFound);
+        };
+        let document = StoredDocument::read(&tables.document, collection, key).await;
+        let document = document.map_err(|source| QueryError::CannotRead { source })?;
+        document.ok_or(QueryError::DocumentNotFound)?.text(range)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
