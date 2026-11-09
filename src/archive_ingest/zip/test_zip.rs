@@ -39,6 +39,8 @@ pub(super) struct TestEntry {
     pub(super) external_attributes: u32,
     /// The extra field of the central directory header.
     pub(super) extra: Vec<u8>,
+    /// The extra field of the local file header.
+    pub(super) local_extra: Vec<u8>,
     /// The fields to write as the maximum, with the value in the extra field.
     pub(super) in_zip64: Vec<Zip64Field>,
     pub(super) disk_start: u32,
@@ -55,6 +57,7 @@ impl TestEntry {
             uncompressed_size: content.len() as u64,
             external_attributes: 0,
             extra: Vec::new(),
+            local_extra: Vec::new(),
             in_zip64: Vec::new(),
             disk_start: 0,
         }
@@ -101,8 +104,9 @@ impl TestEntry {
             },
         );
         push_u16(bytes, self.name.len() as u16);
-        push_u16(bytes, 0);
+        push_u16(bytes, self.local_extra.len() as u16);
         bytes.extend_from_slice(&self.name);
+        bytes.extend_from_slice(&self.local_extra);
         bytes.extend_from_slice(&self.data);
         if descriptor {
             bytes.extend_from_slice(b"PK\x07\x08");

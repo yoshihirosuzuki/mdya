@@ -442,11 +442,29 @@ async fn a_key_uses_slashes_and_drops_empty_and_dot_segments() {
         document("docs\\a.md"),
         document("./docs//b.md"),
         document("../c.md"),
+        document("tab\there.md"),
     ]));
 
     let (items, _) = fixture.prepared(&path).await;
 
-    assert_eq!(keys_of(&items), ["docs/a.md", "docs/b.md", "../c.md"]);
+    assert_eq!(
+        keys_of(&items),
+        ["docs/a.md", "docs/b.md", "../c.md", "tab\there.md"]
+    );
+}
+
+#[tokio::test]
+async fn a_gitignore_inside_the_archive_is_not_used() {
+    let (_directory, path) = archive();
+    let fixture = fixture(TestReaders::new(vec![
+        document(".gitignore"),
+        document("a.md"),
+    ]));
+
+    let report = fixture.update(&path).await.unwrap();
+
+    assert_eq!(report.added, 1);
+    assert_eq!(fixture.readers.positions_read(), [Position(1)]);
 }
 
 #[tokio::test]

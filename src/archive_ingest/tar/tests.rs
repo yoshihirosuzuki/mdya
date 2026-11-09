@@ -2305,6 +2305,23 @@ fn stored_data_goes_to_the_data_blocks_in_order_and_the_gaps_are_zeros() {
 }
 
 #[test]
+fn an_old_sparse_map_that_fills_the_header_ends_with_it() {
+    let read = read_all(&old_sparse_document(
+        &[(0, 1), (100, 1), (200, 1), (300, 2)],
+        302,
+        b"abcde",
+    ));
+
+    let mut expected = vec![0u8; 302];
+    expected[0] = b'a';
+    expected[100] = b'b';
+    expected[200] = b'c';
+    expected[300..].copy_from_slice(b"de");
+    assert_eq!(read[0], ok("s.md", &expected));
+    assert_eq!(read[1], ok("after.md", b"after"));
+}
+
+#[test]
 fn data_blocks_whose_lengths_are_not_whole_blocks_are_read_as_packed() {
     let read = read_all(&old_sparse_document(&[(0, 3), (1000, 2)], 2000, b"abcde"));
 

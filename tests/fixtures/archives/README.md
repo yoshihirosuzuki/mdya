@@ -1,7 +1,8 @@
 # Archive test fixtures
 
-Used by the tests in `src/ingest/archive/` to check that mdya reads
-archives the way real archivers write them. Every fixture is written by
+Used by the tests in `src/archive_ingest/zip/` and
+`src/archive_ingest/tar/` to check that mdya reads archives the way real
+archivers write them. Every fixture is written by
 the tool named in its file name, not assembled by hand; forms that no
 archiver writes are built inside the tests instead.
 
