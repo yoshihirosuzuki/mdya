@@ -35,15 +35,13 @@ precise-builds = true
 # writes each value as is (`<name>@<value>`), and
 # `.github/workflows/actions.lock` pins each of them to a commit. Full version
 # tags match what `gh actions-lock` writes, so `dist generate --check` and the
-# lockfile agree. Tracks the latest of each major version that dist 0.32.0
-# generates by default. These name the same commits that were pinned here as
-# SHAs before the lockfile; later patch releases exist, and moving to them is
-# a separate change. After changing a value, run `dist generate` and then
+# lockfile agree. Keep each action at the version that the other workflows
+# use, if they use it. After changing a value, run `dist generate` and then
 # `gh actions-lock`.
 [dist.github-action-commits]
-"actions/checkout" = "v7.0.0"
-"actions/upload-artifact" = "v7.0.1"
-"actions/download-artifact" = "v8.0.1"
+"actions/checkout" = "v7.0.1"
+"actions/upload-artifact" = "v7.0.2"
+"actions/download-artifact" = "v8.0.2"
 
 # System dependencies installed on each runner before the cargo build.
 # lance-encoding's build script invokes `protoc` and the GitHub-hosted
