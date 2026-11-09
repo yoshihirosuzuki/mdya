@@ -4,31 +4,69 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use lancedb::index::scalar::FtsIndexBuilder;
+
 use crate::embedding::{Embedding, EmbeddingError};
-use crate::index::{Index, IndexError};
+use crate::index::{Index, IndexError, fts_index_params};
 use crate::types::{BoxError, CollectionName, Key};
 
 mod document;
+mod search;
+mod snippet;
 #[cfg(test)]
 mod test_tables;
 
 use document::StoredDocument;
+use snippet::Tokenizers;
 
 /// Creates the component.
 pub fn create(embedding: Arc<dyn Embedding>, index: Arc<dyn Index>) -> Arc<dyn Query> {
-    Arc::new(IndexedQuery { embedding, index })
+    Arc::new(IndexedQuery::new(embedding, index, fts_index_params))
 }
 
 struct IndexedQuery {
     embedding: Arc<dyn Embedding>,
     index: Arc<dyn Index>,
+    tokenizers: Tokenizers,
+}
+
+impl IndexedQuery {
+    fn new(
+        embedding: Arc<dyn Embedding>,
+        index: Arc<dyn Index>,
+        fts_settings: fn() -> FtsIndexBuilder,
+    ) -> Self {
+        Self {
+            embedding,
+            index,
+            tokenizers: Tokenizers::new(fts_settings),
+        }
+    }
+}
+
+/// Runs `work` where it does not hold up other asynchronous work, and waits
+/// for it. A panic in `work` reaches the caller as the same panic. The error
+/// is returned only when the task was cancelled before it started.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => Ok(value),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(error),
+    }
 }
 
 #[async_trait]
 impl Query for IndexedQuery {
     async fn search(&self, request: SearchRequest) -> Result<SearchResult, QueryError> {
-        let _ = (&self.embedding, request);
-        todo!()
+        search::run(
+            self.embedding.as_ref(),
+            self.index.as_ref(),
+            &self.tokenizers,
+            request,
+        )
+        .await
     }
 
     async fn get_document(
