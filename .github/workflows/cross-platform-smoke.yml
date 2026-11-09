@@ -14,8 +14,9 @@
 # `lance-encoding` invokes `protoc` from its build script, so it must be
 # present even for `cargo check`.
 #
-# Third-party actions are SHA-pinned, except `dtolnay/rust-toolchain@stable`
-# which is a channel ref by design (tracks latest stable Rust).
+# `.github/workflows/actions.lock` pins every action to a commit, including
+# `dtolnay/rust-toolchain@stable`. Run `gh actions-lock` after changing any
+# `uses:`.
 
 name: cross-platform-smoke
 
@@ -49,11 +50,11 @@ jobs:
           - macos-latest
           - macos-15-intel
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: Swatinem/rust-cache@v2.9.3
 
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'

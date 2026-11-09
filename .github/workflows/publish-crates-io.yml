@@ -27,10 +27,11 @@ jobs:
       # Mint the OIDC token consumed by crates.io Trusted Publishing.
       id-token: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
 
-      # `@stable` is a channel ref by design (tracks latest stable Rust), so it
-      # is intentionally not SHA-pinned unlike the actions around it.
+      # `@stable` is a branch of the action; `actions.lock` pins it to a
+      # commit, and `gh actions-lock --relock` moves the pin forward. The Rust
+      # toolchain itself comes from `rust-toolchain.toml`.
       - uses: dtolnay/rust-toolchain@stable
 
       # `lance-encoding`'s build script invokes `protoc` during the publish
@@ -40,7 +41,7 @@ jobs:
 
       - name: Authenticate to crates.io (Trusted Publishing)
         id: auth
-        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        uses: rust-lang/crates-io-auth-action@v1.0.6
 
       # `--locked` publishes against the committed Cargo.lock. The xtask
       # workspace members are `publish = false`, so only `mdya` is published.
