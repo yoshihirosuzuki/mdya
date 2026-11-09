@@ -15,11 +15,13 @@ use lancedb::arrow::arrow_buffer::{NullBuffer, OffsetBuffer};
 use lancedb::arrow::arrow_schema::{
     DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit,
 };
+use lancedb::index::Index as LanceIndex;
 use tempfile::TempDir;
 
 use crate::embedding::test_double::TestEmbedding;
-use crate::index::QueryTables;
 use crate::index::test_double::TestIndex;
+use crate::index::{QueryTables, fts_index_params};
+use crate::test_support::prepare_full_text_search;
 
 const MODEL_NAME: &str = "test-model";
 const DIMENSION: usize = 8;
@@ -53,11 +55,81 @@ impl TestDocument {
         }
     }
 
+    /// A document whose body is `chunks`, one right after the other.
+    pub(super) fn from_chunks(collection: &str, key: &str, chunks: &[&str]) -> Self {
+        let mut chunk_ranges = Vec::with_capacity(chunks.len());
+        let mut end = 0;
+        for chunk in chunks {
+            let start = end;
+            end += chunk.len() as u64;
+            chunk_ranges.push(start..end);
+        }
+        Self {
+            collection: collection.to_owned(),
+            key: key.to_owned(),
+            body: chunks.concat(),
+            chunk_ranges,
+        }
+    }
+
     fn chunk_text(&self, range: &Range<u64>) -> &str {
         self.body
             .get(range.start as usize..range.end as usize)
             .unwrap_or("")
     }
+}
+
+/// A row of the chunk table, which need not agree with the document table.
+#[derive(Clone)]
+pub(super) struct TestChunkRow {
+    collection: String,
+    key: String,
+    index: u32,
+    bytes: Range<u64>,
+    text: String,
+    has_vector: bool,
+}
+
+impl TestChunkRow {
+    pub(super) fn new(
+        collection: &str,
+        key: &str,
+        index: u32,
+        bytes: (u64, u64),
+        text: &str,
+    ) -> Self {
+        Self {
+            collection: collection.to_owned(),
+            key: key.to_owned(),
+            index,
+            bytes: bytes.0..bytes.1,
+            text: text.to_owned(),
+            has_vector: true,
+        }
+    }
+
+    /// The same row with no embedding vector yet.
+    pub(super) fn without_vector(mut self) -> Self {
+        self.has_vector = false;
+        self
+    }
+}
+
+/// The rows of the chunk table that agree with `documents`.
+pub(super) fn chunk_rows_of(documents: &[TestDocument]) -> Vec<TestChunkRow> {
+    let mut rows = Vec::new();
+    for document in documents {
+        for (index, range) in document.chunk_ranges.iter().enumerate() {
+            rows.push(TestChunkRow::new(
+                &document.collection,
+                &document.key,
+                index as u32,
+                (range.start, range.end),
+                document.chunk_text(range),
+            ));
+        }
+    }
+    rows
 }
 
 /// The document table and the chunk table, in a temporary directory that lasts
@@ -70,18 +142,61 @@ pub(super) struct TestTables {
 
 impl TestTables {
     pub(super) async fn create(documents: &[TestDocument]) -> Self {
+        Self::create_with(documents, &chunk_rows_of(documents), MODEL_NAME).await
+    }
+
+    async fn create_with(
+        documents: &[TestDocument],
+        chunk_rows: &[TestChunkRow],
+        chunk_model: &str,
+    ) -> Self {
         let directory = TempDir::new().unwrap();
         let connection = lancedb::connect(directory.path().to_str().unwrap());
         let connection = connection.execute().await.unwrap();
         let document = connection.create_table("document", document_rows(documents));
         let document = document.execute().await.unwrap();
-        let chunk = connection.create_table("chunk", chunk_rows(documents));
+        let chunk = connection.create_table("chunk", chunk_batch(chunk_rows, chunk_model));
         let chunk = chunk.execute().await.unwrap();
         Self {
             directory,
             document,
             chunk,
         }
+    }
+
+    /// Tables with their full-text search indexes, which every search needs.
+    pub(super) async fn searchable(documents: &[TestDocument]) -> Self {
+        Self::searchable_with(documents, &chunk_rows_of(documents), MODEL_NAME).await
+    }
+
+    /// Searchable tables whose chunk table holds `chunk_rows`, with vectors
+    /// marked as made by `chunk_model`.
+    pub(super) async fn searchable_with(
+        documents: &[TestDocument],
+        chunk_rows: &[TestChunkRow],
+        chunk_model: &str,
+    ) -> Self {
+        prepare_full_text_search().await;
+        let tables = Self::create_with(documents, chunk_rows, chunk_model).await;
+        let index = |table: &Table, column: &'static str| {
+            let table = table.clone();
+            async move {
+                let settings = LanceIndex::FTS(fts_index_params());
+                table
+                    .create_index(&[column], settings)
+                    .execute()
+                    .await
+                    .unwrap();
+            }
+        };
+        index(&tables.document, "body").await;
+        index(&tables.chunk, "text").await;
+        tables
+    }
+
+    pub(super) async fn add_chunk_rows(&self, rows: &[TestChunkRow]) {
+        let rows = chunk_batch(rows, MODEL_NAME);
+        self.chunk.add(rows).execute().await.unwrap();
     }
 
     /// The tables, not pinned to a version, for a test that does not depend on
@@ -154,8 +269,8 @@ fn chunk_range_item() -> FieldRef {
     ))
 }
 
-fn model_field(name: &str, data_type: DataType) -> Field {
-    let metadata = HashMap::from([(MODEL_METADATA_KEY.to_owned(), MODEL_NAME.to_owned())]);
+fn model_field(name: &str, data_type: DataType, model: &str) -> Field {
+    let metadata = HashMap::from([(MODEL_METADATA_KEY.to_owned(), model.to_owned())]);
     Field::new(name, data_type, true).with_metadata(metadata)
 }
 
@@ -168,11 +283,11 @@ fn document_schema() -> SchemaRef {
         Field::new("hash", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, false),
         Field::new("chunk_ranges", DataType::List(chunk_range_item()), false),
-        model_field("vectors", DataType::List(vectors_item())),
+        model_field("vectors", DataType::List(vectors_item()), MODEL_NAME),
     ]))
 }
 
-fn chunk_schema() -> SchemaRef {
+fn chunk_schema(model: &str) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("collection", DataType::Utf8, false),
         Field::new("key", DataType::Utf8, false),
@@ -180,7 +295,7 @@ fn chunk_schema() -> SchemaRef {
         Field::new("range_start", DataType::UInt64, false),
         Field::new("range_end", DataType::UInt64, false),
         Field::new("text", DataType::Utf8, false),
-        model_field("vector", vector_type()),
+        model_field("vector", vector_type(), model),
         Field::new("covers_whole", DataType::Boolean, true),
     ]))
 }
@@ -238,31 +353,27 @@ fn chunk_ranges_column(documents: &[TestDocument]) -> ArrayRef {
     Arc::new(ListArray::try_new(chunk_range_item(), offsets, Arc::new(items), None).unwrap())
 }
 
-fn chunk_rows(documents: &[TestDocument]) -> RecordBatch {
-    let rows: Vec<(&TestDocument, usize, &Range<u64>)> = documents
-        .iter()
-        .flat_map(|document| {
-            let ranges = document.chunk_ranges.iter().enumerate();
-            ranges.map(move |(index, range)| (document, index, range))
-        })
-        .collect();
-    let text = |row: &(&TestDocument, usize, &Range<u64>)| row.0.chunk_text(row.2).to_owned();
-    let texts: Vec<String> = rows.iter().map(text).collect();
+fn chunk_batch(rows: &[TestChunkRow], model: &str) -> RecordBatch {
+    let flat = vectors(rows.iter().map(|row| row.text.as_str()));
+    let (field, size, values, _) = flat.into_parts();
+    let has_vector = NullBuffer::from_iter(rows.iter().map(|row| row.has_vector));
+    let vector_column = FixedSizeListArray::try_new(field, size, values, Some(has_vector)).unwrap();
+    let covers_whole = rows.iter().map(|row| row.has_vector.then_some(true));
     let columns: Vec<ArrayRef> = vec![
-        strings(rows.iter().map(|row| row.0.collection.as_str())),
-        strings(rows.iter().map(|row| row.0.key.as_str())),
+        strings(rows.iter().map(|row| row.collection.as_str())),
+        strings(rows.iter().map(|row| row.key.as_str())),
         Arc::new(UInt32Array::from_iter_values(
-            rows.iter().map(|row| row.1 as u32),
+            rows.iter().map(|row| row.index),
         )),
         Arc::new(UInt64Array::from_iter_values(
-            rows.iter().map(|row| row.2.start),
+            rows.iter().map(|row| row.bytes.start),
         )),
         Arc::new(UInt64Array::from_iter_values(
-            rows.iter().map(|row| row.2.end),
+            rows.iter().map(|row| row.bytes.end),
         )),
-        strings(texts.iter().map(String::as_str)),
-        Arc::new(vectors(texts.iter().map(String::as_str))),
-        Arc::new(BooleanArray::from(vec![Some(true); rows.len()])),
+        strings(rows.iter().map(|row| row.text.as_str())),
+        Arc::new(vector_column),
+        Arc::new(BooleanArray::from_iter(covers_whole)),
     ];
-    RecordBatch::try_new(chunk_schema(), columns).unwrap()
+    RecordBatch::try_new(chunk_schema(model), columns).unwrap()
 }

@@ -302,7 +302,7 @@ fn list_of(items: ArrayRef) -> ArrayRef {
 }
 
 fn read_row(columns: Vec<(&str, ArrayRef)>) -> Result<StoredDocument, BoxError> {
-    StoredDocument::from_first_row(&RecordBatch::try_from_iter(columns).unwrap())
+    StoredDocument::from_row(&RecordBatch::try_from_iter(columns).unwrap(), 0)
 }
 
 #[test]

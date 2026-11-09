@@ -4040,6 +4040,8 @@ dependencies = [
  "clap",
  "flate2",
  "futures",
+ "lance-index",
+ "lance-tokenizer",
  "lancedb",
  "libc",
  "lindera",

@@ -78,6 +78,11 @@ flate2 = "1.1.10"
 # awaits (`FutureExt::catch_unwind`) so that it can finish the documents in
 # process before passing a panic on. Only `std` is needed for those.
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
+# Only for the traits of the tokenizer that the full-text search settings of
+# `index` build, so that `query` can find where the words of a search are in
+# a chunk. Pinned exactly to the versions lancedb uses, and moved with lancedb.
+lance-index = { version = "=14.0.2", default-features = false }
+lance-tokenizer = { version = "=14.0.2", default-features = false }
 # Pinned exactly: the components will rely on lancedb behaviour checked
 # against a specific version, so the version moves only on purpose. Used
 # without the `remote` feature (the client for a LanceDB server, which mdya
