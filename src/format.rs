@@ -3,6 +3,7 @@
 
 mod markdown;
 mod names;
+mod pdf;
 mod window;
 
 use std::sync::Arc;
@@ -55,7 +56,7 @@ impl Format for Formats {
     fn extract(&self, content: &[u8], file_type: &FileType) -> Result<Extracted, FormatError> {
         match &file_type.0 {
             Kind::Markdown => extract_markdown(content),
-            Kind::Pdf => todo!(),
+            Kind::Pdf => pdf::extract(content),
             #[expect(clippy::panic)]
             Kind::TestDouble(name) => {
                 panic!(

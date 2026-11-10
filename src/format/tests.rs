@@ -212,6 +212,15 @@ fn an_empty_markdown_document_has_an_empty_body_and_no_chunks() {
 }
 
 #[test]
+fn content_that_is_not_a_pdf_cannot_be_extracted_as_a_pdf() {
+    let error = create()
+        .extract(b"not a pdf at all", &pdf().unwrap())
+        .unwrap_err();
+
+    assert!(matches!(error, FormatError::CannotExtract { .. }));
+}
+
+#[test]
 fn a_markdown_document_gets_chunks_over_its_body() {
     let body = "# Title\n\nText.\n";
 
