@@ -109,6 +109,11 @@ lindera-ipadic = { version = "=3.0.7", default-features = false }
 # format that `gateway` writes itself. The same crate that tracing-subscriber
 # colors the rest with.
 nu-ansi-term = "0.50.3"
+# Finds the headings and blocks of a Markdown document and where they begin,
+# which is where `format` cuts it into chunks. The default features are left
+# off: `getopts` is only for its command line tool, and `html` only for
+# writing HTML. 0.13.6 or later for RUSTSEC-2026-0414 and RUSTSEC-2026-0433.
+pulldown-cmark = { version = "0.13.6", default-features = false }
 # The HTTP client for fetching models from Hugging Face and for handing
 # embedding to Ollama. 0.12 rather than the latest 0.13, with the same
 # features that lance's namespace client already uses (rustls with the ring
