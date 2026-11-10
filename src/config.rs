@@ -5,14 +5,90 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
 use crate::types::BoxError;
+
+use file::SettingsFile;
+use stored::StoredSettings;
+
+#[cfg(test)]
+mod component_tests;
+mod file;
+mod stored;
 
 /// Creates the component over the data directory. Nothing is read until a
 /// function first needs it.
 pub fn create(data_dir: PathBuf) -> Arc<dyn Config> {
-    let _ = data_dir;
-    todo!()
+    Arc::new(ConfigInFile {
+        file: SettingsFile::in_directory(data_dir),
+        changing: Mutex::new(()),
+    })
+}
+
+struct ConfigInFile {
+    file: SettingsFile,
+    /// Held from reading the file to writing it back, so that a change made at
+    /// the same time from another task is not lost. It waits rather than
+    /// fails, and a panic releases it. Other processes are kept apart by
+    /// `gateway`, which runs one write operation at a time.
+    changing: Mutex<()>,
+}
+
+impl ConfigInFile {
+    async fn read(&self) -> Result<StoredSettings, ConfigError> {
+        let content = self.file.read().await.map_err(cannot_read)?;
+        match content {
+            Some(content) => StoredSettings::parse(&content).map_err(cannot_read),
+            None => Ok(StoredSettings::nothing_decided()),
+        }
+    }
+
+    async fn change(
+        &self,
+        name: SettingName,
+        apply: impl FnOnce(&mut StoredSettings) + Send,
+    ) -> Result<SettingChange, ConfigError> {
+        let _changing = self.changing.lock().await;
+        let mut stored = self.read().await?;
+        let before = stored.settings().value_of(name);
+        apply(&mut stored);
+        self.file
+            .write(stored.to_file_content())
+            .await
+            .map_err(|error| ConfigError::CannotWrite {
+                source: Box::new(error),
+            })?;
+        Ok(SettingChange {
+            name,
+            before,
+            after: stored.settings().value_of(name),
+        })
+    }
+}
+
+fn cannot_read(error: impl Into<BoxError>) -> ConfigError {
+    ConfigError::CannotRead {
+        source: error.into(),
+    }
+}
+
+#[async_trait]
+impl Config for ConfigInFile {
+    async fn current(&self) -> Result<Settings, ConfigError> {
+        Ok(self.read().await?.into_settings())
+    }
+
+    async fn set(&self, name: &str, value: &str) -> Result<SettingChange, ConfigError> {
+        let setting = check_setting(name, Some(value))?;
+        self.change(setting, |stored| stored.set(setting, value))
+            .await
+    }
+
+    async fn reset(&self, name: &str) -> Result<SettingChange, ConfigError> {
+        let setting = check_setting(name, None)?;
+        self.change(setting, |stored| stored.reset(setting)).await
+    }
 }
 
 /// The name of a setting.
