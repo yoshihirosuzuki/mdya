@@ -184,6 +184,12 @@ tracing-log = { version = "0.2.0", default-features = false }
 # their logs are picked and written out in the same way. The log receiver test
 # double (src/test_support/log_receiver.rs) uses `registry` as well.
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "registry", "std", "tracing-log"] }
+# Reads the text of PDF documents for `format`. The default features are left
+# off: `ai` is for calling an outside AI service and adds an HTTP client,
+# `refine` only acts on Markdown output, and nothing in this version switches
+# on `fast-parse`. It also declares a `cdylib`, so a build leaves its dynamic
+# library in `target/`; mdya links the `rlib`.
+unpdf = { version = "0.54.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 # Puts a pipe on the process's stdout (fd 1), so that what the libraries write
