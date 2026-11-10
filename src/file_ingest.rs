@@ -1,6 +1,7 @@
 //! The `file_ingest` component: ingests a `directory` collection.
 
-use std::path::Path;
+use std::error::Error;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,10 +10,20 @@ use serde_json::Value;
 use crate::format::Format;
 use crate::index::Index;
 use crate::ingest::{
-    Ingest, IngestError, PutInstruction, UpdateInstruction, UpdateReport, UpdateStopped,
+    Ingest, IngestError, IngestItems, PutInstruction, UpdateInstruction, UpdateReport,
+    UpdateStopped, ingest_items,
 };
 use crate::path::make_path_absolute;
 use crate::types::{BoxError, DirLookup, DocumentOutcome, ProgressSink, TypeAttributes};
+
+use blocking::run_blocking;
+use contents::FileContents;
+use walk::walk;
+
+mod blocking;
+mod contents;
+mod names;
+mod walk;
 
 /// Creates the component.
 pub fn create(format: Arc<dyn Format>, index: Arc<dyn Index>) -> Arc<dyn Ingest> {
@@ -29,6 +40,28 @@ struct FileIngest {
 #[derive(Debug, thiserror::Error)]
 #[error("the absolute location is not valid UTF-8")]
 struct LocationNotUtf8;
+
+impl FileIngest {
+    /// Walks the directory, and gets ready to hand over the content.
+    async fn prepare(
+        &self,
+        instruction: &UpdateInstruction,
+    ) -> Result<(IngestItems, FileContents), UpdateStopped> {
+        let root = PathBuf::from(location_of(&instruction.attributes).map_err(stopped)?);
+        let collection = instruction.collection.0.clone();
+        let format = Arc::clone(&self.format);
+        let walked = run_blocking(move || walk(&root, &collection, format.as_ref())).await;
+        match walked {
+            Ok(walked) => Ok((walked.items, FileContents::new(walked.files))),
+            Err(cause) => {
+                warn_source_unreadable(&instruction.collection.0, &cause);
+                Err(stopped(IngestError::SourceUnreadable {
+                    source: cause.into(),
+                }))
+            }
+        }
+    }
+}
 
 #[async_trait]
 impl Ingest for FileIngest {
@@ -63,8 +96,16 @@ impl Ingest for FileIngest {
         instruction: UpdateInstruction,
         progress: &dyn ProgressSink,
     ) -> Result<UpdateReport, UpdateStopped> {
-        let _ = (&self.format, &self.index, instruction, progress);
-        todo!()
+        let (items, mut contents) = self.prepare(&instruction).await?;
+        ingest_items(
+            &instruction,
+            items,
+            &mut contents,
+            Arc::clone(&self.format),
+            Arc::clone(&self.index),
+            progress,
+        )
+        .await
     }
 
     async fn put(&self, _instruction: PutInstruction) -> Result<DocumentOutcome, IngestError> {
@@ -96,6 +137,33 @@ fn location_not_found(source: impl Into<BoxError>) -> IngestError {
     }
 }
 
+fn stopped(error: IngestError) -> UpdateStopped {
+    UpdateStopped {
+        counts: UpdateReport::default(),
+        error,
+    }
+}
+
+fn warn_source_unreadable(collection: &str, cause: &(dyn Error + 'static)) {
+    tracing::warn!(
+        collection,
+        cause = causes(cause).as_str(),
+        "the source cannot be read and the collection was not updated"
+    );
+}
+
+/// The error and its sources, joined with `: `.
+fn causes(error: &(dyn Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(next) = source {
+        text.push_str(": ");
+        text.push_str(&next.to_string());
+        source = next.source();
+    }
+    text
+}
+
 /// The name of the one type-specific attribute: where the directory is.
 const PATH_ATTRIBUTE: &str = "path";
 
@@ -118,19 +186,28 @@ pub fn check_attribute_names(attributes: &TypeAttributes) -> Result<(), IngestEr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::io;
+    use std::panic::AssertUnwindSafe;
     use std::path::Path;
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
 
+    use futures::FutureExt;
     use serde_json::{Value, json};
+    use tracing::Level;
 
     use super::*;
-    use crate::format::test_double::TestFormat;
-    use crate::index::test_double::TestIndex;
+    use crate::format::test_double::{TestFormat, whole_text};
+    use crate::format::{Extracted, FileType, FormatError};
+    use crate::index::IndexError;
+    use crate::index::test_double::{IndexCall, TestIndex};
     use crate::ingest::PutInstruction;
     use crate::path::MakePathAbsoluteError;
-    use crate::types::test_double::test_dir_lookup;
-    use crate::types::{CollectionName, Key};
+    use crate::test_support::log_receiver::capture_async;
+    use crate::types::test_double::{TestProgressSink, test_dir_lookup};
+    use crate::types::{CollectionName, Key, Progress};
 
     fn attributes(value: Value) -> TypeAttributes {
         TypeAttributes(value.as_object().unwrap().clone())
@@ -198,6 +275,348 @@ mod tests {
 
         assert!(matches!(result, Err(IngestError::PutNotSupported)));
         assert!(index.calls().is_empty());
+    }
+
+    // Updating from the directory.
+
+    const TIMEOUT: Duration = Duration::from_secs(30);
+
+    fn write_file(root: &Path, relative: &str, content: &[u8]) {
+        let file = root.join(relative);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, content).unwrap();
+    }
+
+    fn markdown() -> TestFormat {
+        TestFormat::new().with_extension("md", "markdown")
+    }
+
+    fn instruction(location: &Path) -> UpdateInstruction {
+        UpdateInstruction {
+            collection: CollectionName("notes".to_owned()),
+            attributes: attributes_at(location.to_str().unwrap()),
+            overwrite: false,
+            parallelism: 1,
+        }
+    }
+
+    fn updater(format: TestFormat, index: &Arc<TestIndex>) -> Arc<dyn Ingest> {
+        create(Arc::new(format), index.clone())
+    }
+
+    async fn update(
+        ingest: &Arc<dyn Ingest>,
+        location: &Path,
+    ) -> Result<UpdateReport, UpdateStopped> {
+        ingest
+            .update(instruction(location), &TestProgressSink::new())
+            .await
+    }
+
+    fn registered_keys(index: &TestIndex) -> Vec<String> {
+        index
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                IndexCall::Register(document) => Some(document.key.0),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn deletion(index: &TestIndex) -> Option<(HashSet<Key>, Vec<String>)> {
+        index.calls().into_iter().find_map(|call| match call {
+            IndexCall::DeleteOthers {
+                keep,
+                unreadable_dirs,
+                ..
+            } => Some((keep, unreadable_dirs)),
+            _ => None,
+        })
+    }
+
+    fn set_of_keys(names: &[&str]) -> HashSet<Key> {
+        names.iter().map(|name| Key((*name).to_owned())).collect()
+    }
+
+    #[tokio::test]
+    async fn an_update_registers_the_documents_and_deletes_the_others() {
+        let directory = tempfile::tempdir().unwrap();
+        write_file(directory.path(), "a.md", b"# A");
+        write_file(directory.path(), "sub/b.md", b"# B");
+        write_file(directory.path(), "c.txt", b"not a document");
+        let index = Arc::new(TestIndex::new().on_delete_others(|_, _, _| Ok(3)));
+        let ingest = updater(markdown(), &index);
+
+        let report = update(&ingest, directory.path()).await.unwrap();
+
+        assert_eq!(report.added, 2);
+        assert_eq!(report.deleted, 3);
+        assert_eq!(report.unreadable_places, 0);
+        assert_eq!(registered_keys(&index), ["a.md", "sub/b.md"]);
+        let (keep, unreadable_dirs) = deletion(&index).unwrap();
+        assert_eq!(keep, set_of_keys(&["a.md", "sub/b.md"]));
+        assert!(unreadable_dirs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_update_hands_each_files_content_to_format_in_order() {
+        let directory = tempfile::tempdir().unwrap();
+        write_file(directory.path(), "a.md", b"first");
+        write_file(directory.path(), "b.md", b"second");
+        let format = Arc::new(markdown());
+        let ingest = create(format.clone(), Arc::new(TestIndex::new()));
+
+        update(&ingest, directory.path()).await.unwrap();
+
+        let contents: Vec<Vec<u8>> = format
+            .extracted()
+            .into_iter()
+            .map(|(content, _)| content)
+            .collect();
+        assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn an_update_of_an_empty_directory_deletes_everything() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = Arc::new(TestIndex::new());
+        let ingest = updater(markdown(), &index);
+
+        update(&ingest, directory.path()).await.unwrap();
+
+        assert_eq!(deletion(&index), Some((HashSet::new(), Vec::new())));
+    }
+
+    #[tokio::test]
+    async fn progress_counts_the_documents_found() {
+        let directory = tempfile::tempdir().unwrap();
+        write_file(directory.path(), "a.md", b"# A");
+        write_file(directory.path(), "b.md", b"# B");
+        let ingest = updater(markdown(), &Arc::new(TestIndex::new()));
+        let progress = TestProgressSink::new();
+
+        ingest
+            .update(instruction(directory.path()), &progress)
+            .await
+            .unwrap();
+
+        let last = *progress.reports().last().unwrap();
+        assert_eq!(
+            last,
+            Progress {
+                done: 2,
+                total: Some(2)
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_that_cannot_be_read_stops_the_update_and_touches_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = Arc::new(TestIndex::new());
+        let ingest = updater(markdown(), &index);
+        let gone = directory.path().join("gone");
+
+        let (result, logs) = capture_async(update(&ingest, &gone)).await;
+
+        let stopped = result.unwrap_err();
+        let IngestError::SourceUnreadable { source } = stopped.error else {
+            panic!("{:?}", stopped.error);
+        };
+        assert!(source.downcast_ref::<io::Error>().is_some());
+        assert_eq!(stopped.counts, UpdateReport::default());
+        assert!(index.calls().is_empty());
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].level, Level::WARN);
+        assert!(
+            logs[0]
+                .fields
+                .contains(&("collection".to_owned(), "notes".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn attributes_without_a_path_stop_the_update_and_touch_nothing() {
+        let index = Arc::new(TestIndex::new());
+        let ingest = updater(markdown(), &index);
+        let mut instruction = instruction(Path::new("/unused"));
+        instruction.attributes = TypeAttributes::default();
+
+        let stopped = ingest
+            .update(instruction, &TestProgressSink::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            stopped.error,
+            IngestError::AttributesMissingOrExtra
+        ));
+        assert_eq!(stopped.counts, UpdateReport::default());
+        assert!(index.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_error_from_the_index_comes_back_with_the_counts_so_far() {
+        let directory = tempfile::tempdir().unwrap();
+        write_file(directory.path(), "a.md", b"# A");
+        write_file(directory.path(), "b.md", b"# B");
+        let index = Arc::new(TestIndex::new().on_register(|document, _| {
+            if document.key.0 == "a.md" {
+                return Ok(DocumentOutcome::Added);
+            }
+            Err(IndexError::CannotRead {
+                source: "the index is gone".into(),
+            })
+        }));
+        let ingest = updater(markdown(), &index);
+
+        let stopped = update(&ingest, directory.path()).await.unwrap_err();
+
+        assert!(matches!(stopped.error, IngestError::Index(_)));
+        assert_eq!(stopped.counts.added, 1);
+        assert_eq!(deletion(&index), None);
+    }
+
+    #[tokio::test]
+    async fn a_document_that_cannot_be_extracted_is_counted_as_failed_and_stays_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        write_file(directory.path(), "a.md", b"bad");
+        write_file(directory.path(), "b.md", b"good");
+        let format = markdown().on_extract(|content, _| {
+            if content == b"bad" {
+                return Err(FormatError::CannotExtract {
+                    source: "not text".into(),
+                });
+            }
+            Ok(whole_text(content))
+        });
+        let index = Arc::new(TestIndex::new());
+        let ingest = updater(format, &index);
+
+        let report = update(&ingest, directory.path()).await.unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.added, 1);
+        let (keep, _) = deletion(&index).unwrap();
+        assert_eq!(keep, set_of_keys(&["a.md", "b.md"]));
+    }
+
+    /// Holds each caller until `count` callers have arrived, so that a test
+    /// gets through only if that many run at once.
+    #[derive(Clone)]
+    struct Rendezvous {
+        arrived: Arc<(Mutex<usize>, Condvar)>,
+        count: usize,
+    }
+
+    impl Rendezvous {
+        fn new(count: usize) -> Self {
+            Self {
+                arrived: Arc::new((Mutex::new(0), Condvar::new())),
+                count,
+            }
+        }
+
+        fn arrive(&self) {
+            let (arrived, changed) = &*self.arrived;
+            let mut arrived = arrived.lock().unwrap();
+            *arrived += 1;
+            changed.notify_all();
+            let (arrived, _) = changed
+                .wait_timeout_while(arrived, TIMEOUT, |arrived| *arrived < self.count)
+                .unwrap();
+            assert!(*arrived >= self.count, "the documents did not run at once");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_parallelism_reaches_the_shared_flow() {
+        let directory = tempfile::tempdir().unwrap();
+        write_file(directory.path(), "a.md", b"# A");
+        write_file(directory.path(), "b.md", b"# B");
+        let rendezvous = Rendezvous::new(2);
+        let format = markdown().on_extract(move |content, _| {
+            rendezvous.arrive();
+            Ok(whole_text(content))
+        });
+        let ingest = updater(format, &Arc::new(TestIndex::new()));
+        let mut parallel = instruction(directory.path());
+        parallel.parallelism = 2;
+
+        let report = ingest
+            .update(parallel, &TestProgressSink::new())
+            .await
+            .unwrap();
+
+        assert_eq!(report.added, 2);
+    }
+
+    /// A `Format` that panics when asked about an extension, to reach the
+    /// blocking thread the walk runs on.
+    struct PanickingFormat;
+
+    impl Format for PanickingFormat {
+        fn file_type_from_extension(&self, _extension: &str) -> Option<FileType> {
+            panic!("the walk panicked")
+        }
+
+        fn file_type_from_mime_or_alias(&self, _value: &str) -> Option<FileType> {
+            None
+        }
+
+        fn extract(
+            &self,
+            _content: &[u8],
+            _file_type: &FileType,
+        ) -> Result<Extracted, FormatError> {
+            unreachable!("the walk panics first")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panic_during_the_walk_reaches_the_caller_as_a_panic() {
+        let directory = tempfile::tempdir().unwrap();
+        write_file(directory.path(), "a.md", b"# A");
+        let ingest = create(Arc::new(PanickingFormat), Arc::new(TestIndex::new()));
+
+        let panic = AssertUnwindSafe(update(&ingest, directory.path()))
+            .catch_unwind()
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"the walk panicked"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_subdirectory_is_kept_out_of_the_deletion_and_counted() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        write_file(directory.path(), "a.md", b"# A");
+        write_file(directory.path(), "locked/b.md", b"# B");
+        let locked = directory.path().join("locked");
+        fs::set_permissions(&locked, Permissions::from_mode(0o000)).unwrap();
+        let superuser_reads_anything = fs::read_dir(&locked).is_ok();
+        let index = Arc::new(TestIndex::new());
+        let ingest = updater(markdown(), &index);
+
+        let result = update(&ingest, directory.path()).await;
+
+        fs::set_permissions(&locked, Permissions::from_mode(0o700)).unwrap();
+        if superuser_reads_anything {
+            return;
+        }
+        let report = result.unwrap();
+        assert_eq!(report.added, 1);
+        assert_eq!(report.unreadable_places, 1);
+        assert_eq!(
+            deletion(&index),
+            Some((set_of_keys(&["a.md"]), vec!["locked".to_owned()]))
+        );
     }
 
     // Checking the type-specific attributes against the file system.
