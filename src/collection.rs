@@ -1,18 +1,28 @@
 //! The `collection` component: keeps the collections the user has made.
 
+mod store;
+#[cfg(test)]
+mod tests;
+
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lancedb::Table;
 
+use self::store::{Hooks, RealHooks, Store};
 use crate::index::{Index, IndexError};
 use crate::types::{BoxError, CollectionName, CollectionType, TypeAttributes};
 
 /// Creates the component over the LanceDB in the data directory. Nothing is
 /// opened until a function first needs it.
 pub fn create(data_dir: PathBuf, index: Arc<dyn Index>) -> Arc<dyn Collections> {
-    let _ = (data_dir, index);
-    todo!()
+    Arc::new(LanceDbCollections::new(
+        data_dir,
+        index,
+        Arc::new(RealHooks),
+    ))
 }
 
 /// A collection, as `list_collections` and `get_collection` return it and
@@ -89,46 +99,99 @@ pub fn check_collection_name(name: &CollectionName) -> Result<(), CollectionErro
     Err(CollectionError::NameInvalid)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+struct LanceDbCollections {
+    store: Store,
+    index: Arc<dyn Index>,
+    /// Held from reading whether a collection exists until the write that
+    /// depends on it is done, so that concurrent calls in this process cannot
+    /// act on what another call is about to change. A call waits for the one
+    /// holding it, and a call that panics releases it. Across processes,
+    /// `gateway` runs one write operation at a time.
+    writing: tokio::sync::Mutex<()>,
+}
 
-    fn check(name: &str) -> Result<(), CollectionError> {
-        check_collection_name(&CollectionName(name.to_owned()))
-    }
-
-    #[test]
-    fn accepts_ascii_letters_digits_hyphens_and_underscores() {
-        for name in ["a", "notes", "Work-Notes_2", "_", "-", "0"] {
-            assert!(check(name).is_ok(), "{name:?}");
+impl LanceDbCollections {
+    fn new(data_dir: PathBuf, index: Arc<dyn Index>, hooks: Arc<dyn Hooks>) -> Self {
+        Self {
+            store: Store::new(data_dir, hooks),
+            index,
+            writing: tokio::sync::Mutex::new(()),
         }
     }
 
-    #[test]
-    fn accepts_a_name_of_64_characters() {
-        assert!(check(&"a".repeat(64)).is_ok());
+    /// The table and the collection's row, for a function that needs the
+    /// collection to exist. Creates nothing.
+    async fn existing(
+        &self,
+        name: &CollectionName,
+    ) -> Result<(Table, CollectionInfo), CollectionError> {
+        let table = self.store.table_to_read().await?;
+        let table = table.ok_or(CollectionError::NotFound)?;
+        let collection = self.store.read_one(&table, name).await?;
+        Ok((table, collection.ok_or(CollectionError::NotFound)?))
     }
+}
 
-    #[test]
-    fn rejects_an_empty_name() {
-        assert!(matches!(check(""), Err(CollectionError::NameInvalid)));
-    }
-
-    #[test]
-    fn rejects_a_name_of_65_characters() {
-        assert!(matches!(
-            check(&"a".repeat(65)),
-            Err(CollectionError::NameInvalid)
-        ));
-    }
-
-    #[test]
-    fn rejects_other_characters() {
-        for name in ["my notes", "a.b", "a/b", "a\\b", "メモ", "é", "a\n"] {
-            assert!(
-                matches!(check(name), Err(CollectionError::NameInvalid)),
-                "{name:?}"
-            );
+#[async_trait]
+impl Collections for LanceDbCollections {
+    async fn create_collection(&self, collection: CollectionInfo) -> Result<(), CollectionError> {
+        check_collection_name(&collection.name)?;
+        let _writing = self.writing.lock().await;
+        let table = self.store.table_to_write().await?;
+        if self
+            .store
+            .read_one(&table, &collection.name)
+            .await?
+            .is_some()
+        {
+            return Err(CollectionError::AlreadyExists);
         }
+        self.store.add(&table, &collection).await
+    }
+
+    async fn delete_collection(&self, name: &CollectionName) -> Result<(), CollectionError> {
+        let _writing = self.writing.lock().await;
+        let (table, _) = self.existing(name).await?;
+        // The documents go first: an operation that stops partway leaves the
+        // collection, and deleting it again goes on with what is left. Keeping
+        // nothing deletes every document of the collection.
+        let deleted = self.index.delete_others(name, &HashSet::new(), &[]).await;
+        deleted.map_err(|partial| CollectionError::Index(partial.error))?;
+        self.store.delete(&table, name).await
+    }
+
+    async fn list_collections(&self) -> Result<Vec<CollectionInfo>, CollectionError> {
+        let Some(table) = self.store.table_to_read().await? else {
+            return Ok(Vec::new());
+        };
+        let mut collections = self.store.read_all(&table).await?;
+        collections.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(collections)
+    }
+
+    async fn get_collection(
+        &self,
+        name: &CollectionName,
+    ) -> Result<Option<CollectionInfo>, CollectionError> {
+        let Some(table) = self.store.table_to_read().await? else {
+            return Ok(None);
+        };
+        self.store.read_one(&table, name).await
+    }
+
+    async fn change_collection(
+        &self,
+        name: &CollectionName,
+        change: CollectionChange,
+    ) -> Result<CollectionInfo, CollectionError> {
+        let _writing = self.writing.lock().await;
+        let (table, current) = self.existing(name).await?;
+        let changed = CollectionInfo {
+            attributes: change.attributes.unwrap_or(current.attributes),
+            description: change.description.unwrap_or(current.description),
+            ..current
+        };
+        self.store.replace(&table, &changed).await?;
+        Ok(changed)
     }
 }
