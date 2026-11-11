@@ -215,6 +215,13 @@ libc = "0.2.186"
 # 0.61.2 with these features.
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }
 
+# Optimize the dependencies in the development and test builds, which the
+# `test` profile inherits. The integration tests run the real embedding model
+# on the CPU. Unoptimized, updating 40 short documents took 80 seconds rather
+# than 5. mdya's own code stays unoptimized, so that rebuilding it stays quick.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 # Strip the debug information but keep the symbols, so that the backtrace that
