@@ -105,6 +105,12 @@ lancedb = { version = "=0.41.0", default-features = false }
 lindera = { version = "=3.0.7", default-features = false, features = ["embed-ipadic"] }
 lindera-dictionary = { version = "=3.0.7", default-features = false }
 lindera-ipadic = { version = "=3.0.7", default-features = false }
+# How much memory this process has resident, for `watchdog`, on each of the
+# operating systems, without `unsafe` in mdya. With `always_use_statm`, Linux
+# reads `/proc/self/statm`: the default, `/proc/self/smaps`, gives a more exact
+# number but is much slower, and the watchdog measures several times a second.
+# Its libc and windows-sys 0.52 are already in the build.
+memory-stats = { version = "1.2.0", features = ["always_use_statm"] }
 # Colors the names of the values in the logs and the parts of the pretty log
 # format that `gateway` writes itself. The same crate that tracing-subscriber
 # colors the rest with.
