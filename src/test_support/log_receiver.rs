@@ -15,13 +15,32 @@
 
 use std::fmt;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use tracing::field::{Field, Visit};
 use tracing::instrument::WithSubscriber;
+use tracing::subscriber::NoSubscriber;
 use tracing::{Dispatch, Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::Registry;
+
+/// A receiver that is set nowhere and kept for the rest of the process.
+///
+/// `tracing` decides once per callsite, when a thread first reaches it,
+/// whether to pass the callsite's events on. Unless the last receiver created
+/// had another one alive at the time, it asks only the receiver set for that
+/// thread. A thread with none gets the answer "never" (unit tests set no
+/// global receiver), and the answer stays until the answers are rebuilt, as
+/// they are whenever a receiver is created. Until then, a capture on another
+/// thread loses the callsite's events
+/// (<https://github.com/tokio-rs/tracing/issues/3611>).
+///
+/// [`Records::dispatch`] creates this receiver before the first capture's, so
+/// every capture's receiver is created with this one alive, and `tracing`
+/// asks all the receivers alive instead. A callsite that another thread first
+/// reaches while the first capture of the process is creating its receiver
+/// can still get "never".
+static IDLE_RECEIVER: LazyLock<Dispatch> = LazyLock::new(|| Dispatch::new(NoSubscriber::new()));
 
 /// An event that the code under test logged.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +76,7 @@ struct Records(Arc<Mutex<Vec<LogRecord>>>);
 
 impl Records {
     fn dispatch(&self) -> Dispatch {
+        LazyLock::force(&IDLE_RECEIVER);
         Dispatch::new(Registry::default().with(self.clone()))
     }
 
@@ -357,6 +377,30 @@ mod tests {
         assert_eq!(
             second,
             vec![record(Level::WARN, "step", &[("name", "second")]); 3]
+        );
+    }
+
+    /// Stands for component code that one test reaches without a capture
+    /// while another test captures it. No other test reaches this callsite.
+    fn warn_from_two_threads() {
+        tracing::warn!("reached from two threads");
+    }
+
+    // Without the idle receiver, this test fails when it runs alone in its
+    // process (`cargo test --lib -- --exact
+    // test_support::log_receiver::tests::an_event_is_recorded_after_a_thread_without_a_receiver_reached_its_callsite_first`).
+    // Among the other tests, it can pass even then: their receivers, alive at
+    // the time, make `tracing` ask every receiver.
+    #[test]
+    fn an_event_is_recorded_after_a_thread_without_a_receiver_reached_its_callsite_first() {
+        let ((), records) = capture(|| {
+            std::thread::spawn(warn_from_two_threads).join().unwrap();
+            warn_from_two_threads();
+        });
+
+        assert_eq!(
+            records,
+            vec![record(Level::WARN, "reached from two threads", &[])]
         );
     }
 }
