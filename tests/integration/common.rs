@@ -8,14 +8,16 @@
 //! process, and setting environment variables while other test threads run is
 //! unsound.
 //!
-//! A test that runs the real default embedding model is ignored by default and
-//! run by hand with `just integration`. The first run needs the network: it
-//! fetches the model, about 150 MB, and keeps it under `target/`.
+//! Most tests are ignored by default and run by hand with `just integration`:
+//! each test that runs the real default embedding model, and the tests that do
+//! not but are left out to keep the default tests few. The first run of a test
+//! that runs the real model needs the network: it fetches the model, about
+//! 150 MB, and keeps it under `target/`.
 //!
-//! Every other test, except the one described below, must not prepare the
-//! model. Such a test gets a model cache directory of its own that is never
-//! created, and each run of mdya through `Workspace::run` or
-//! `Workspace::run_executable` checks that the directory still does not
+//! A test that does not run the real model, except the one described below,
+//! must not prepare it. Such a test gets a model cache directory of its own
+//! that is never created, and each run of mdya through a `Workspace` function
+//! whose name begins with `run` checks that the directory still does not
 //! exist. Preparing the default model, which runs on this PC, creates the
 //! directory before fetching anything, so a preparation that cannot fetch the
 //! model leaves it behind too. A preparation that fails before that leaves
@@ -38,11 +40,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output};
 use std::sync::{Arc, Mutex, Once};
 
+use mdya::collection::CollectionInfo;
+use mdya::embedding::EmbeddingSettings;
 use mdya::format::Format;
 use mdya::gateway::{Factories, Io, run_with};
 use mdya::index::Index;
 use mdya::ingest::Ingest;
-use mdya::types::{CollectionType, DirLookup};
+use mdya::types::{BoxError, CollectionName, CollectionType, DirLookup, TypeAttributes};
 use tempfile::TempDir;
 
 /// What one run of mdya ended with.
@@ -50,10 +54,6 @@ use tempfile::TempDir;
 pub struct Outcome {
     pub code: ExitCode,
     pub stdout: String,
-    #[expect(
-        dead_code,
-        reason = "no test reads it yet, but a failing assertion prints it through `Debug`"
-    )]
     pub stderr: String,
 }
 
@@ -113,13 +113,23 @@ impl Workspace {
 
     /// Runs mdya with the given arguments, and `stdin` as its standard input.
     pub fn run_with_stdin(&self, args: &[&str], stdin: &[u8]) -> Outcome {
+        self.run_with_io(args, stdin, false)
+    }
+
+    /// Runs mdya with the given arguments, as if its standard input were a
+    /// terminal where the user types `answer` to a confirmation.
+    pub fn run_answering(&self, args: &[&str], answer: &str) -> Outcome {
+        self.run_with_io(args, answer.as_bytes(), true)
+    }
+
+    fn run_with_io(&self, args: &[&str], stdin: &[u8], stdin_is_terminal: bool) -> Outcome {
         let stdout = Captured::default();
         let stderr = Captured::default();
         let io = Io {
             stdin: Box::new(Cursor::new(stdin.to_vec())),
             stdout: Box::new(stdout.clone()),
             stderr: Box::new(stderr.clone()),
-            stdin_is_terminal: false,
+            stdin_is_terminal,
             stdout_is_terminal: false,
             stderr_is_terminal: false,
         };
@@ -140,9 +150,52 @@ impl Workspace {
         output
     }
 
+    /// Runs the mdya executable as `run_executable` does, with `dir` as its
+    /// working directory.
+    pub fn run_executable_in(&self, dir: &Path, args: &[&str]) -> Output {
+        let output = self
+            .executable()
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        self.check_model_not_prepared(args);
+        output
+    }
+
+    /// Makes a collection of `collection_type`, a type that this mdya does not
+    /// know, with `attributes` (a JSON object) as its type-specific
+    /// attributes. It goes through the component that keeps the collections,
+    /// as a newer mdya that knows the type would: the command line makes only
+    /// collections of the types it knows. The embedding settings it gives are
+    /// never used, as making a collection embeds nothing.
+    pub fn add_collection_of_unknown_type(
+        &self,
+        name: &str,
+        collection_type: &str,
+        attributes: serde_json::Value,
+    ) {
+        let model_cache_dir = self.model_cache_dir();
+        let embedding = mdya::embedding::create(EmbeddingSettings {
+            model: "cl-nagoya/ruri-v3-30m".to_owned(),
+            model_cache_dir: Arc::new(move || Ok::<_, BoxError>(model_cache_dir.clone())),
+            hf_token: None,
+            ollama_endpoint: "http://127.0.0.1:11434".to_owned(),
+        });
+        let index = mdya::index::create(self.data_dir.clone(), embedding);
+        let collections = mdya::collection::create(self.data_dir.clone(), index);
+        let collection = CollectionInfo {
+            name: CollectionName(name.to_owned()),
+            collection_type: CollectionType(collection_type.to_owned()),
+            attributes: TypeAttributes(attributes.as_object().unwrap().clone()),
+            description: None,
+        };
+        block_on(collections.create_collection(collection)).unwrap();
+    }
+
     /// The mdya executable, given this test's directories. Running it this
-    /// way, unlike `run` and `run_executable`, does not check that the
-    /// embedding model was not prepared.
+    /// way, unlike the functions whose names begin with `run`, does not check
+    /// that the embedding model was not prepared.
     pub fn executable(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_mdya"));
         command.args(self.directory_arguments());
@@ -261,13 +314,17 @@ fn real_ingests(
 fn prepare_full_text_search() {
     static PREPARED: Once = Once::new();
     PREPARED.call_once(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(mdya::index::place_fts_dictionary_config(test_data_dir()))
-            .unwrap();
+        block_on(mdya::index::place_fts_dictionary_config(test_data_dir())).unwrap();
     });
+}
+
+/// Runs `future` to its end on a runtime of its own.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
 }
 
 /// A writer whose bytes can be read after the writer was given away.
