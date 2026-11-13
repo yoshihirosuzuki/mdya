@@ -30,14 +30,15 @@ lint:
 test:
     cargo test --workspace
 
-# The integration tests under tests/ that run the real embedding model are
-# ignored by default, and neither `check` nor CI runs them. `--test '*'`
-# selects the integration tests only, and leaves out the ignored tests and
-# doc examples in src/: some of those fetch up to 1.2 GB for each model or
-# need Ollama, and are run by hand as their modules describe. The first run
-# fetches the default embedding model, about 150 MB, into target/.
+# Most integration tests under tests/ are ignored by default, each one that
+# runs the real embedding model among them, and neither `check` nor CI runs
+# them. `--test '*'` selects the integration tests only, and leaves out the
+# ignored tests and doc examples in src/: some of those fetch up to 1.2 GB for
+# each model or need Ollama, and are run by hand as their modules describe.
+# The first run fetches the default embedding model, about 150 MB, into
+# target/.
 
-# Run the integration tests that run the real embedding model.
+# Run the integration tests that are ignored by default.
 integration:
     cargo test --test '*' -- --ignored
 
