@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Whether mdya's own code paths reach the affected functions was not analysed.
 
+- Bumped `quinn-udp` 0.5.14 → 0.5.16 in the lockfile; no manifest change was needed. This clears RUSTSEC-2026-0538 / GHSA-6pp4-4cxf-xf88: on the targets that receive one datagram per `recvmsg` call, such as Apple platforms when the `fast-apple-datapath` feature of `quinn-udp` is off, a datagram larger than the receive buffer could leave the receive loop spinning. `quinn-udp` sits in the lockfile under `reqwest`'s optional HTTP/3 support, as `quinn-proto` does. As far as `cargo tree` shows, nothing in the workspace enables that support, and no build of the workspace includes `quinn-udp`.
+
+  The `quinn-udp` entry moves to `windows-sys` 0.52.0, already in the lockfile. In the same update, cargo moves `dirs-sys`, `nu-ansi-term`, `socket2`, and `terminal_size` from `windows-sys` 0.60.2 to 0.61.2, which the Windows build already uses, and the lockfile drops `windows-sys` 0.60.2, `windows-targets` 0.53.5, and the eight `windows_*` 0.53.1 crates.
+
 ## [0.4.3] - 2026-10-31
 
 ### Changed
