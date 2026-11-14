@@ -2,6 +2,7 @@
 //! mdya into one executable rather than into one for each file.
 
 mod collection_operations;
+mod collection_sources;
 mod common;
 mod ingest_operations;
 mod shared_parts;
