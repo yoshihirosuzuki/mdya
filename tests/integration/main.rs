@@ -3,4 +3,5 @@
 
 mod collection_operations;
 mod common;
+mod ingest_operations;
 mod shared_parts;
