@@ -912,6 +912,37 @@ fn an_update_or_a_put_with_nothing_to_embed_goes_on_when_the_model_cannot_be_che
     assert!(stderr(&outputs[1]).contains("Skipped \"memo.md\""));
 }
 
+/// Unlike the test above, the index has no document or chunk table yet: they
+/// cannot be made without the embedding model's dimension.
+#[test]
+#[ignore = "left out of the default tests to keep them few; run it with `just integration`"]
+fn an_update_or_a_put_with_nothing_to_embed_fails_on_an_index_without_tables_when_the_model_cannot_be_used()
+ {
+    let workspace = Workspace::new();
+    directory_collection(&workspace, "notes", &[("empty.md", "")]);
+    raw_collection(&workspace, "memo");
+    let empty = file(&workspace, "empty.md", "");
+
+    let mut update = workspace.executable_without_the_model();
+    update.args(["update", "notes"]);
+    let mut put_empty = workspace.executable_without_the_model();
+    put_empty
+        .args(["put", "memo", "empty.md", "--file-type", "md"])
+        .arg(&empty);
+    let outputs = [update.output().unwrap(), put_empty.output().unwrap()];
+
+    for output in &outputs {
+        let stderr = stderr(output);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("the embedding model cannot be used"),
+            "{stderr}"
+        );
+    }
+    assert_eq!(got(&workspace, "notes", "empty.md"), None);
+    assert_eq!(got(&workspace, "memo", "empty.md"), None);
+}
+
 #[test]
 #[ignore = "runs a real embedding model, not the default one; run it with `just integration`"]
 fn an_update_and_a_put_warn_of_chunks_longer_than_the_model_context_length() {
