@@ -9,10 +9,12 @@
 //! unsound.
 //!
 //! Most tests are ignored by default and run by hand with `just integration`:
-//! each test that runs the real default embedding model, and the tests that do
-//! not but are left out to keep the default tests few. The first run of a test
-//! that runs the real model needs the network: it fetches the model, about
-//! 150 MB, and keeps it under `target/`.
+//! each test that runs a real embedding model, and the tests that do not but
+//! are left out to keep the default tests few. The first run of a test that
+//! runs a real model needs the network: it fetches the model and keeps it
+//! under `target/`. Most of these tests run the default model, about 150 MB.
+//! The test of chunks longer than the model's context length runs a second
+//! model, about 90 MB, as no chunk is longer than the default model's.
 //!
 //! A test that does not run the real model, except the one described below,
 //! must not prepare it. Such a test gets a model cache directory of its own
@@ -82,7 +84,8 @@ impl Workspace {
         Self::with_model_cache(|root| ModelCache::Unused(root.join("model-cache")))
     }
 
-    /// A workspace for a test that runs the real default embedding model.
+    /// A workspace for a test that runs a real embedding model: the default
+    /// one, or another that the test sets.
     pub fn with_real_model() -> Self {
         Self::with_model_cache(|_| ModelCache::Shared)
     }
@@ -104,6 +107,12 @@ impl Workspace {
         let dir = self.root.path().join(name);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// This test's settings and index directory, which mdya creates when it
+    /// first needs it.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     /// Runs mdya with the given arguments, on this test's directories.
@@ -207,12 +216,29 @@ impl Workspace {
     /// once, without the network.
     pub fn executable_that_cannot_fetch(&self) -> Command {
         let mut command = self.executable();
-        for name in ["NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"] {
-            command.env_remove(name);
-        }
+        refuse_fetching(&mut command);
         command
-            .env("HTTPS_PROXY", REFUSING_PROXY)
-            .env("https_proxy", REFUSING_PROXY);
+    }
+
+    /// The mdya executable, given this test's settings and index directory
+    /// and a model cache directory of its own that holds no model, with an
+    /// HTTPS proxy that refuses connections: the embedding model cannot be
+    /// prepared, even in a workspace whose model is already fetched. Running
+    /// it does not check that the embedding model was not prepared, and the
+    /// directory it fails to prepare the model in is not the one that the
+    /// functions whose names begin with `run` check.
+    pub fn executable_without_the_model(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mdya"));
+        command.args([
+            OsString::from("--data-dir"),
+            self.data_dir.clone().into_os_string(),
+            OsString::from("--model-cache-dir"),
+            self.root
+                .path()
+                .join("model-cache-without-models")
+                .into_os_string(),
+        ]);
+        refuse_fetching(&mut command);
         command
     }
 
@@ -261,6 +287,17 @@ impl Workspace {
 
 /// A proxy at a port that nothing listens on.
 const REFUSING_PROXY: &str = "http://127.0.0.1:1";
+
+/// Makes `command` fetch through a proxy that refuses connections, and
+/// through nothing else.
+fn refuse_fetching(command: &mut Command) {
+    for name in ["NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"] {
+        command.env_remove(name);
+    }
+    command
+        .env("HTTPS_PROXY", REFUSING_PROXY)
+        .env("https_proxy", REFUSING_PROXY);
+}
 
 /// The directory that `.cargo/config.toml` keeps the tests' data in.
 fn test_data_dir() -> &'static Path {
