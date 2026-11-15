@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Unsoundness in `zstd-safe`: RUSTSEC-2026-0395 to 0397, 0399 to 0402, and 0404 to 0406.
 
   Whether mdya's own code paths reach the affected functions was not analysed.
+- Bumped `rustix` 1.1.4 → 1.1.6 in the lockfile; only its `version` and `checksum` moved, and no manifest change was needed. This clears RUSTSEC-2026-0486 / GHSA-jh2m-fhpj-3vr7, an unsoundness: given a zero-length buffer, the extended-attribute functions in `rustix::fs` (`getxattr`, `lgetxattr`, `fgetxattr`, `listxattr`, `llistxattr` and `flistxattr`) marked bytes they had never written as initialized. Whether mdya's own code paths reach these functions was not analysed.
+- Bumped `quinn-udp` 0.5.14 → 0.5.16 in the lockfile; only its `version` and `checksum` moved, and no manifest change was needed. This clears RUSTSEC-2026-0538 / GHSA-6pp4-4cxf-xf88, a denial of service on targets that read one datagram per `recvmsg` call: Apple platforms without the `fast-apple-datapath` feature, OpenBSD, NetBSD, Solaris and illumos. There, after a datagram larger than the receive buffer arrived, the receive loop could keep issuing non-blocking receives, so a remote sender could keep the task that drives the socket busy before any QUIC packet authentication. Linux, Android, FreeBSD and Windows are not affected. Whether mdya's own code paths reach this receive loop was not analysed.
 
 ## [0.4.3] - 2026-10-31
 
