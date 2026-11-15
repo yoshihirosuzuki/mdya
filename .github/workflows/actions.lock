@@ -5,21 +5,17 @@ version: 'v0.0.3'
 workflows:
     '.github/workflows/audit.yml':
         - 'actions/checkout@v7.0.1'
-        - 'dtolnay/rust-toolchain@stable'
         - 'swatinem/rust-cache@v2.9.3'
     '.github/workflows/ci.yml':
         - 'actions/checkout@v7.0.1'
-        - 'dtolnay/rust-toolchain@stable'
         - 'swatinem/rust-cache@v2.9.3'
     '.github/workflows/cross-platform-smoke.yml':
         - 'actions/checkout@v7.0.1'
-        - 'dtolnay/rust-toolchain@stable'
         - 'swatinem/rust-cache@v2.9.3'
     '.github/workflows/lockfile-check.yml':
         - 'actions/checkout@v7.0.1'
     '.github/workflows/publish-crates-io.yml':
         - 'actions/checkout@v7.0.1'
-        - 'dtolnay/rust-toolchain@stable'
         - 'rust-lang/crates-io-auth-action@v1.0.6'
     '.github/workflows/release-workflow-check.yml':
         - 'actions/checkout@v7.0.1'
@@ -29,7 +25,6 @@ workflows:
         - 'actions/upload-artifact@v7.0.2'
     '.github/workflows/verify.yml':
         - 'actions/checkout@v7.0.1'
-        - 'dtolnay/rust-toolchain@stable'
 dependencies:
     'actions/checkout@v7.0.1':
         ref: 'v7.0.1'
@@ -46,11 +41,6 @@ dependencies:
         commit: 'sha1-cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         owner_id: 44036562
         repo_id: 192625955
-    'dtolnay/rust-toolchain@stable':
-        ref: 'stable'
-        commit: 'sha1-b725eda525362e7cf34af9a7243cac1e3f01a7ec'
-        owner_id: 1940490
-        repo_id: 260749683
     'rust-lang/crates-io-auth-action@v1.0.6':
         ref: 'v1.0.6'
         commit: 'sha1-3268eb413133e2960fa4ae0e963ca76380c54cd9'

@@ -20,9 +20,8 @@
 # `verify.yml` and is intentionally workflow_dispatch-only — the manual gate
 # is run before a release.
 #
-# `.github/workflows/actions.lock` pins every action to a commit, including
-# `dtolnay/rust-toolchain@stable`. Run `gh actions-lock` after changing any
-# `uses:`.
+# `.github/workflows/actions.lock` pins every action to a commit. Run
+# `gh actions-lock` after changing any `uses:`.
 
 name: ci
 
@@ -47,6 +46,12 @@ concurrency:
 permissions:
   contents: read
 
+# Cargo settings for every step. Incremental compilation only adds artifacts
+# that no later run reuses, and colors keep Cargo's output readable in the log.
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
 jobs:
   check:
     name: check (ubuntu-latest)
@@ -64,15 +69,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
-      # `@stable` is a branch of the action; `actions.lock` pins it to a
-      # commit, and `gh actions-lock --relock` moves the pin forward. The Rust
-      # toolchain itself comes from `rust-toolchain.toml`.
-      # `dtolnay/rust-toolchain` uses the `minimal` rustup profile, which does
-      # NOT include `rustfmt` or `clippy`; they must be listed explicitly so
-      # the fmt-check and clippy steps below succeed.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # `rust-toolchain.toml` names the toolchain, its profile, and its
+      # components (`rustfmt` and `clippy` for the steps below); with no
+      # argument, `rustup toolchain install` installs that toolchain. The
+      # runner images come with rustup.
+      - name: Install the Rust toolchain
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2.9.3
 
