@@ -7,5 +7,6 @@ mod command_line;
 mod common;
 mod index_and_settings;
 mod ingest_operations;
+mod mcp_server;
 mod query_operations;
 mod shared_parts;
