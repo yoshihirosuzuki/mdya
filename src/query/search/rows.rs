@@ -24,7 +24,7 @@ pub(super) enum Scoring {
 }
 
 impl Scoring {
-    fn column(self) -> &'static str {
+    pub(super) fn column(self) -> &'static str {
         match self {
             Self::Bm25 => "_score",
             Self::CosineSimilarity | Self::Nearness => "_distance",
