@@ -197,6 +197,49 @@ fn the_status_says_what_could_not_be_checked_and_what_is_not_there() {
     assert!(other.contains("(256 dimensions, not the configured one)"));
 }
 
+/// The status of an index whose configured embedding model cannot be used,
+/// with `warnings`.
+fn status_with_warnings(warnings: &[&str]) -> StatusOutput {
+    StatusOutput {
+        warnings: warnings.iter().map(|&warning| warning.to_owned()).collect(),
+        ..status(vec![index_model(None)], None)
+    }
+}
+
+// The example that the user approved: each warning on a line of its own,
+// after the items.
+#[test]
+fn a_status_whose_model_dimension_could_not_be_checked_ends_with_the_warning() {
+    let output = status_with_warnings(&[
+        "the dimension of the configured embedding model could not be checked: the embedding model cannot be used: Ollama is not running",
+    ]);
+
+    assert_eq!(
+        human_status(&output),
+        "version: mdya 1.0.0\nconfigured embedding model: cl-nagoya/ruri-v3-30m (dimensions unknown)\nindex embedding model: cl-nagoya/ruri-v3-30m (256 dimensions, unknown whether it is the configured one)\n  chunks with embeddings: 1534 (0 truncated)\nchunks without embeddings: 0\ncollections: 3\ndocuments: 120\nchunks: 1534\nwarning: the dimension of the configured embedding model could not be checked: the embedding model cannot be used: Ollama is not running\n"
+    );
+}
+
+#[test]
+fn each_status_warning_is_a_line_of_its_own_in_order() {
+    let text = human_status(&status_with_warnings(&["first", "second"]));
+
+    assert!(
+        text.ends_with("chunks: 1534\nwarning: first\nwarning: second\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_status_warning_has_its_controls_replaced() {
+    let text = human_status(&status_with_warnings(&["a\nb\u{1b}c\u{202e}d"]));
+
+    assert!(
+        text.ends_with("chunks: 1534\nwarning: a\\nb\\u{1b}c\\u{202e}d\n"),
+        "{text}"
+    );
+}
+
 fn setting(name: &str, value: serde_json::Value) -> (config::SettingName, SafeJsonValue) {
     (
         config::check_setting(name, None).unwrap(),
