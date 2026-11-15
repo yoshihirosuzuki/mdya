@@ -36,7 +36,7 @@ mod stdout_pipe;
 #[cfg(test)]
 mod tests;
 
-pub(super) use process::run;
+pub(super) use process::{run, run_replacing};
 
 /// An error found while assembling the components.
 #[derive(Debug, thiserror::Error)]
