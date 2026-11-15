@@ -13,8 +13,9 @@
 //! are left out to keep the default tests few. The first run of a test that
 //! runs a real model needs the network: it fetches the model and keeps it
 //! under `target/`. Most of these tests run the default model, about 150 MB.
-//! The test of chunks longer than the model's context length runs a second
-//! model, about 90 MB, as no chunk is longer than the default model's.
+//! The tests of a chunk and of a query longer than the model's context length
+//! run a second model, about 90 MB, whose context length, 256 tokens, is
+//! shorter than a chunk can be: no chunk is longer than the default model's.
 //!
 //! A test that does not run the real model, except the one described below,
 //! must not prepare it. Such a test gets a model cache directory of its own

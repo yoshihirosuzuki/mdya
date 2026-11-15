@@ -5,4 +5,5 @@ mod collection_operations;
 mod collection_sources;
 mod common;
 mod ingest_operations;
+mod query_operations;
 mod shared_parts;
