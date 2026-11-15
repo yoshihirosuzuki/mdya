@@ -378,6 +378,7 @@ chunks: 7
 - `index embedding model`: インデックスの埋め込みベクトルを作った埋め込みモデルと、それが設定の埋め込みモデルと同じかです。その下の行は、その埋め込みモデルで作った埋め込みベクトルを持つ chunk の数と、そのうち埋め込みベクトルが chunk の全体を表していない chunk の数 (`truncated`。[埋め込みモデルのコンテキスト長を超える chunk がある](errors.md#埋め込みモデルのコンテキスト長を超える-chunk-がある)) です。インデックスに chunk がないときは、`index embedding model: none` と出ます。
 - `chunks without embeddings`: 埋め込みベクトルを持たない chunk の数です。
 - `collections`、`documents`、`chunks`: インデックス全体の collection、文書、chunk の数です。
+- `warning`: 結果の警告です。設定の埋め込みモデルを使えずに次元を確かめられなかったときに、最後に、そのことと理由を 1 行で出します ([埋め込みモデルを使えない](errors.md#埋め込みモデルを使えない))。`--json` では `warnings` に入ります。
 
 `--json` を付けたときの形は、次のとおりです。
 

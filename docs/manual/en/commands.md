@@ -378,6 +378,7 @@ chunks: 7
 - `index embedding model`: The embedding model the index's embeddings were made with, and whether it is the same as the configured embedding model. The line below it shows the number of chunks that have embeddings made with that embedding model, and how many of those chunks have embeddings that do not represent the whole chunk (`truncated`; [Some chunks are longer than the embedding model's context length](errors.md#some-chunks-are-longer-than-the-embedding-models-context-length)). When the index has no chunks, `index embedding model: none` is shown.
 - `chunks without embeddings`: The number of chunks that have no embeddings.
 - `collections`, `documents`, `chunks`: The numbers of collections, documents, and chunks in the whole index.
+- `warning`: A warning in the result. When the configured embedding model could not be used and its number of dimensions could not be checked, a last line shows that, with the reason ([The embedding model cannot be used](errors.md#the-embedding-model-cannot-be-used)). With `--json`, it is in `warnings`.
 
 With `--json`, the output looks like this.
 
