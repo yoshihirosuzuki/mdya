@@ -3,6 +3,7 @@
 //! place. Laying the explanation out is left to whatever writes it.
 
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -309,6 +310,14 @@ fn entry(error: &EntryError) -> Shown<'_> {
             &DATA_DIR_FIX,
         )
         .causes_of(error),
+        EntryError::OldVersionData(places) => Shown::new(
+            1,
+            format!(
+                "mdya 0.4.x or earlier left its settings or index here, and this mdya does not use them: {}",
+                quoted_places(places)
+            ),
+            &OLD_VERSION_DATA_FIX,
+        ),
         EntryError::ResourcesUnavailable(_) => Shown::new(
             1,
             "mdya cannot get the system resources it needs to run".to_owned(),
@@ -316,6 +325,15 @@ fn entry(error: &EntryError) -> Shown<'_> {
         )
         .causes_of(error),
     }
+}
+
+/// `places`, each in double quotes, separated by commas.
+fn quoted_places(places: &[PathBuf]) -> String {
+    places
+        .iter()
+        .map(|place| format!("\"{}\"", place.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn cli(error: &CliError) -> Shown<'_> {
@@ -801,6 +819,11 @@ const REBUILD_FIX: &str =
 const DATA_DIR_FIX: [&str; 2] = [
     "Give an absolute path with --data-dir.",
     "If the working directory cannot be read, you can also move to a working directory that mdya can read, and run the command again.",
+];
+
+const OLD_VERSION_DATA_FIX: [&str; 2] = [
+    "Delete what is shown above, create the collections again, and ingest their documents again.",
+    "Set again the settings you had changed in mdya 0.4.x or earlier.",
 ];
 
 const RESOURCES_FIX: &str = "Close programs that you no longer need, or raise the limits on open files and threads, then run the operation again.";

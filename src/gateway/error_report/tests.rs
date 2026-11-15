@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::json;
@@ -1247,6 +1248,26 @@ fn a_settings_and_index_directory_that_cannot_be_determined_gives_the_reason() {
          How to fix:\n    \
          Give an absolute path with --data-dir.\n    \
          If the working directory cannot be read, you can also move to a working directory that mdya can read, and run the command again.",
+        "internal",
+        json!({}),
+    );
+}
+
+// What mdya 0.4.x or earlier left
+
+#[test]
+fn what_mdya_0_4_left_gives_its_places_and_what_to_do() {
+    assert_shown(
+        GatewayError::Entry(EntryError::OldVersionData(vec![
+            PathBuf::from("/home/user/.mdya/config.yml"),
+            PathBuf::from("/home/user/.mdya/lance-models"),
+        ])),
+        1,
+        "Error: mdya 0.4.x or earlier left its settings or index here, and this mdya does not use them: \"/home/user/.mdya/config.yml\", \"/home/user/.mdya/lance-models\"\n\
+         \n\
+         How to fix:\n    \
+         Delete what is shown above, create the collections again, and ingest their documents again.\n    \
+         Set again the settings you had changed in mdya 0.4.x or earlier.",
         "internal",
         json!({}),
     );

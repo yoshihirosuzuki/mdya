@@ -50,6 +50,11 @@ pub(crate) enum EntryError {
     /// absolute, before anything else is assembled.
     #[error("the settings and index directory cannot be determined")]
     DataDirUndetermined(#[source] MakePathAbsoluteError),
+    /// The settings and index directory holds the settings or the index that
+    /// mdya 0.4.x or earlier left there, at these places, in the order of
+    /// [`OLD_VERSION_NAMES`].
+    #[error("the settings and index directory holds what mdya 0.4.x or earlier left there")]
+    OldVersionData(Vec<PathBuf>),
     /// The runtime for the asynchronous work could not be created, or a
     /// thread that the MCP server (stdio) reads or writes on could not be
     /// started.
@@ -59,6 +64,11 @@ pub(crate) enum EntryError {
 
 /// The settings and index directory when `--data-dir` is not given.
 const DEFAULT_DATA_DIR: &str = "~/.mdya";
+
+/// What mdya 0.3.0 to 0.4.3 placed in the settings and index directory with
+/// `mdya init`: its settings, its index, and the settings of its full-text
+/// search dictionary. No component places anything of these names there.
+const OLD_VERSION_NAMES: [&str; 3] = ["config.yml", "index", "lance-models"];
 
 /// The embedding model cache directory when `--model-cache-dir` is not given.
 const DEFAULT_MODEL_CACHE_DIR: &str = "~/.mdya-models";
@@ -249,6 +259,13 @@ fn start(start: Start<'_>) -> u8 {
             );
         }
     };
+    let old_version_places = old_version_places(&data_dir);
+    if !old_version_places.is_empty() {
+        return report(
+            GatewayError::Entry(EntryError::OldVersionData(old_version_places)),
+            output,
+        );
+    }
     // Before any other thread starts: the runtime and the log receiver come
     // after this.
     (factories.set_process_environment)(crate::index::process_environment(&data_dir));
@@ -296,6 +313,18 @@ fn start(start: Start<'_>) -> u8 {
     // operation, or the MCP server, has ended.
     runtime.shutdown_background();
     code
+}
+
+/// The places in `data_dir` of what mdya 0.4.x or earlier left there: each of
+/// [`OLD_VERSION_NAMES`] that is there, whatever kind it is, a symbolic link
+/// not followed. A name that cannot be looked at, as in a directory that
+/// cannot be read, counts as not there.
+fn old_version_places(data_dir: &Path) -> Vec<PathBuf> {
+    OLD_VERSION_NAMES
+        .iter()
+        .map(|name| data_dir.join(name))
+        .filter(|place| place.symlink_metadata().is_ok())
+        .collect()
 }
 
 /// What [`assemble_and_run`] works with.
