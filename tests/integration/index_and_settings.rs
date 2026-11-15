@@ -287,6 +287,11 @@ fn without_the_embedding_model_the_status_and_the_model_setting_go_on_and_a_rebu
         for_people.contains("(256 dimensions, unknown whether it is the configured one)\n"),
         "{for_people}"
     );
+    // The warning of the result, with its reason, as the last line.
+    assert!(
+        for_people.ends_with(&format!("\nwarning: {warning}\n")),
+        "{for_people}"
+    );
     let message = stderr(&model_set);
     assert_eq!(model_set.status.code(), Some(0), "{message}");
     assert_eq!(stdout(&model_set), "");
