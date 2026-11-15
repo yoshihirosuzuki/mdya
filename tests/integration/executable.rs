@@ -690,7 +690,10 @@ fn stderr_on_a_terminal(mut command: Command) -> (std::process::ExitStatus, Stri
             &mut terminal,
             std::ptr::null_mut(),
             std::ptr::null_mut::<libc::termios>(),
-            &mut size,
+            // libc declares this pointer `*mut` on some systems, such as
+            // macOS, and `*const` on others, such as Linux, where clippy
+            // flags `&mut` as unneeded; a raw pointer fits either.
+            &raw mut size,
         )
     };
     assert_eq!(opened, 0, "{}", std::io::Error::last_os_error());
