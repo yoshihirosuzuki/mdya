@@ -63,6 +63,26 @@ pub unsafe fn run() -> ExitCode {
     unsafe { entry::run() }
 }
 
+/// Runs mdya as [`run`] does, with `args` as the arguments (the first one is
+/// the program name), and with the real components as `replace` leaves them.
+/// Like [`run`], it replaces the panic hook and puts a pipe on stdout when
+/// it can, which [`run_with`] does not. It is for tests that run mdya in a
+/// process of their own, to see what only [`run`] does, with components that
+/// misbehave.
+///
+/// The [`Factories::set_process_environment`] that `replace` gets sets no
+/// environment variable, and the real one never reaches `replace`, so that
+/// other threads may run meanwhile. Unless `replace` puts another one in its
+/// place, an operation that needs the variable that [`run`] sets
+/// (`LANCE_LANGUAGE_MODEL_HOME`, which tells LanceDB where the full-text
+/// search dictionary is) gets it only when the process already has it.
+///
+/// When `replace` panics, the panic is not caught, and stdout keeps the pipe
+/// if one was put on it.
+pub fn run_replacing(args: Vec<OsString>, replace: impl FnOnce(&mut Factories)) -> ExitCode {
+    entry::run_replacing(args, replace)
+}
+
 /// Runs mdya with the given arguments (the first one is the program name),
 /// environment variables, input and output, and functions that create the
 /// components. Tests call it with test doubles; [`run`] calls it with the real

@@ -30,6 +30,44 @@ use super::stdout_pipe::{self, AttachedPipe};
 /// sets the process's environment variables before it starts any thread of
 /// its own.
 pub(in crate::gateway) unsafe fn run() -> ExitCode {
+    // SAFETY: the caller keeps to the same condition, and the real components
+    // are left as they are.
+    unsafe { run_in_this_process(std::env::args_os().collect(), |_| {}) }
+}
+
+/// The body of [`super::super::run_replacing`]. The real function that sets
+/// environment variables never reaches `replace`: it is replaced first with
+/// one that sets none.
+pub(in crate::gateway) fn run_replacing(
+    args: Vec<OsString>,
+    replace: impl FnOnce(&mut Factories),
+) -> ExitCode {
+    // SAFETY: no environment variable is set: the function that sets them is
+    // replaced with one that sets none before anything else can call it, and
+    // `replace` gets only that one.
+    unsafe {
+        run_in_this_process(args, |factories| {
+            factories.set_process_environment = Box::new(|_| {});
+            replace(factories);
+        })
+    }
+}
+
+/// What [`run`] does, with `args` as the arguments and with the real
+/// components as `adjust` leaves them. When `adjust` panics, the panic is not
+/// caught, and stdout keeps the pipe if one was put on it.
+///
+/// # Safety
+///
+/// No other thread may be running in the process when it is called, and none
+/// may start before the environment variables are set (`adjust` and the
+/// components it leaves included), unless `adjust` first replaces
+/// `set_process_environment` with a function that sets none: the real one
+/// sets them before any thread of its own starts.
+unsafe fn run_in_this_process(
+    args: Vec<OsString>,
+    adjust: impl FnOnce(&mut Factories),
+) -> ExitCode {
     // Before any other thread starts, and before the pipe, so that whether
     // stdout is a terminal is the answer for the user's stdout.
     replace_panic_hook();
@@ -48,8 +86,9 @@ pub(in crate::gateway) unsafe fn run() -> ExitCode {
         stdout_is_terminal,
         stderr_is_terminal,
     };
-    let factories = real_factories(pipe, Arc::clone(&logging));
-    let code = super::run_with(std::env::args_os().collect(), environment(), io, factories);
+    let mut factories = real_factories(pipe, Arc::clone(&logging));
+    adjust(&mut factories);
+    let code = super::run_with(args, environment(), io, factories);
     if attached {
         finish_logging(&logging);
     }
