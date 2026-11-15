@@ -9,13 +9,13 @@ allowed-tools: mcp__plugin_mdya_mdya__search
 
 ## Steps
 
-Call `mdya:search` once. Only `query` comes from the user; everything else stays at its default (`mode="hybrid"`, `k=20`, `level="doc"`, `collections=[]`).
+Call `mdya:search` once. Only `query` comes from the user; leave the other inputs out so that they stay at their defaults (`mode="hybrid"`, `limit=20`, `unit="document"`, all collections).
 
 Present the results in score order, unchanged:
 
-- Header: `total = N / top score = X.XXX` (when hits = 0, top score is `-`)
-- Top 3 hits: `<rank>. <collection> / <path>  (score: X.XXX, matched_chunks: N)`, with the snippet on the next line as `   <snippet>`
-- Hit 4 onward: `<rank>. <collection> / <path>  (score: X.XXX)` only
+- Header: `total = N / top score = X.XXX`, where N is the result's `hit_count` (when hits = 0, top score is `-`)
+- Top 3 hits: `<rank>. <collection> / <key>  (score: X.XXX, chunk <chunk_index> of <chunk_count>)`, with the snippet on the next line as `   <snippet>`
+- Hit 4 onward: `<rank>. <collection> / <key>  (score: X.XXX)` only
 
 When hits = 0, print the header line only.
 
