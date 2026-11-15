@@ -10,7 +10,9 @@ use lancedb::arrow::arrow_array::RecordBatch;
 use lancedb::arrow::arrow_schema::{DataType, Field};
 use lancedb::expr::{DfExpr, col, lit};
 use lancedb::index::scalar::{FtsQuery, FullTextSearchQuery, MatchQuery};
-use lancedb::query::{ExecutableQuery, QueryBase, QueryExecutionOptions, Select, VectorQuery};
+use lancedb::query::{
+    ExecutableQuery, HasQuery, QueryBase, QueryExecutionOptions, Select, VectorQuery,
+};
 use lancedb::{DistanceType, Table};
 
 use self::rows::{ScoredChunk, ScoredDocument, Scoring, scored_chunks, scored_documents};
@@ -227,6 +229,8 @@ struct Target<'a> {
     table: &'a Table,
     text_column: &'static str,
     vector_column: &'static str,
+    /// The columns a full-text or a vector search returns, besides its score
+    /// column. A hybrid search returns every column.
     columns: &'static [&'static str],
 }
 
@@ -355,11 +359,7 @@ impl Search<'_> {
     }
 
     async fn ranked_rows(&self, target: &Target<'_>, limit: usize) -> Result<RankedRows, BoxError> {
-        let query = target
-            .table
-            .query()
-            .select(Select::columns(target.columns))
-            .limit(limit);
+        let query = target.table.query().limit(limit);
         let query = with_filter(query, collections_filter(&self.request.collections));
         let words = match_query(&self.request.query, target.text_column);
         let ranked = |rows, scoring| RankedRows {
@@ -369,19 +369,31 @@ impl Search<'_> {
         };
         Ok(match (self.request.mode, self.vector_side) {
             (SearchMode::FullText, _) => {
-                let rows = collect(query.full_text_search(words).execute()).await?;
-                ranked(rows, Scoring::Bm25)
+                let query = query.full_text_search(words);
+                let query = select_scored(query, target.columns, Scoring::Bm25);
+                ranked(collect(query.execute()).await?, Scoring::Bm25)
             }
-            (SearchMode::Hybrid, VectorSide::NoHits) => RankedRows {
-                rows: collect(query.full_text_search(words).execute()).await?,
-                scoring: Scoring::Bm25,
-                rank_only: true,
-            },
+            (SearchMode::Hybrid, VectorSide::NoHits) => {
+                let query = query.full_text_search(words);
+                let query = select_scored(query, target.columns, Scoring::Bm25);
+                RankedRows {
+                    rows: collect(query.execute()).await?,
+                    scoring: Scoring::Bm25,
+                    rank_only: true,
+                }
+            }
             (SearchMode::Vector, VectorSide::Search(vector)) => {
-                let rows = collect(nearest(query, vector, target)?.execute()).await?;
-                ranked(rows, Scoring::CosineSimilarity)
+                let query = nearest(query, vector, target)?;
+                let query = select_scored(query, target.columns, Scoring::CosineSimilarity);
+                ranked(collect(query.execute()).await?, Scoring::CosineSimilarity)
             }
             (SearchMode::Hybrid, VectorSide::Search(vector)) => {
+                // No columns are selected. LanceDB hands the selection to
+                // both the full-text and the vector search it runs, so a
+                // selected score column fails the search that lacks it, and
+                // each search gets its own score column only from lance
+                // adding it. Without a selection lance adds them with no
+                // warning, and the rows come with every column of the table.
                 let query = nearest(query.full_text_search(words), vector, target)?;
                 let options = QueryExecutionOptions::default();
                 let rows = collect(query.execute_hybrid(options)).await?;
@@ -437,10 +449,10 @@ impl Search<'_> {
             .tables
             .chunk
             .query()
-            .select(Select::columns(CHUNK_COLUMNS))
             .only_if_expr(filter)
             .full_text_search(words)
             .limit(EVERY_ROW);
+        let query = select_scored(query, CHUNK_COLUMNS, Scoring::Bm25);
         scored_chunks(&collect(query.execute()).await?, Scoring::Bm25)
     }
 
@@ -459,13 +471,13 @@ impl Search<'_> {
             .tables
             .chunk
             .query()
-            .select(Select::columns(CHUNK_COLUMNS))
             .only_if_expr(filter.and(col("vector").is_not_null()))
             .limit(EVERY_ROW)
             .nearest_to(vector)?
             .column("vector")
             .distance_type(DistanceType::Cosine)
             .bypass_vector_index();
+        let query = select_scored(query, CHUNK_COLUMNS, Scoring::Nearness);
         scored_chunks(&collect(query.execute()).await?, Scoring::Nearness)
     }
 }
@@ -563,6 +575,16 @@ fn nearest(
         .column(target.vector_column)
         .distance_type(DistanceType::Cosine)
         .refine_factor(REFINE_FACTOR))
+}
+
+/// Selects `columns` and the score column that `scoring` reads, and stops
+/// lance from adding a score column that is not selected. lance warns each
+/// time it adds one, and will stop adding it; with that stopped, a score
+/// column left out of the selection is an error of reading the rows.
+fn select_scored<Q: HasQuery>(mut query: Q, columns: &[&str], scoring: Scoring) -> Q {
+    query.mut_query().disable_scoring_autoprojection = true;
+    let columns: Vec<&str> = columns.iter().copied().chain([scoring.column()]).collect();
+    query.select(Select::columns(&columns))
 }
 
 async fn collect(

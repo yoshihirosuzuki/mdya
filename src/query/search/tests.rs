@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Once};
 
 use async_trait::async_trait;
 use lancedb::DistanceType;
@@ -11,6 +11,7 @@ use lancedb::index::scalar::FtsIndexBuilder;
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::table::{Duration as TimeDelta, OptimizeAction};
 use tracing::Level;
+use tracing_log::log;
 
 use super::field_model;
 use super::rows::{Scoring, scored_chunks, scored_documents};
@@ -939,4 +940,53 @@ async fn a_tokenizer_that_cannot_be_built_is_an_index_that_cannot_be_read() {
             "{mode:?}: {result:?}"
         );
     }
+}
+
+/// The warnings lance logs when a search selects its columns without the
+/// score column: lance adds the column itself, and warns that it will stop.
+static SCORE_COLUMN_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Records [`SCORE_COLUMN_WARNINGS`]. lance logs through the `log` crate,
+/// whose logger is set once for the whole process, so the warnings of every
+/// test in the process are recorded.
+struct ScoreColumnWarnings;
+
+impl log::Log for ScoreColumnWarnings {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record) {
+        let message = record.args().to_string();
+        if record.target().starts_with("lance") && message.contains("did not include") {
+            SCORE_COLUMN_WARNINGS.lock().unwrap().push(message);
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn record_score_column_warnings() {
+    static SET: Once = Once::new();
+    SET.call_once(|| {
+        log::set_logger(&ScoreColumnWarnings)
+            .expect("no other unit test sets the logger of the `log` crate");
+        log::set_max_level(log::LevelFilter::Warn);
+    });
+}
+
+#[tokio::test]
+async fn no_search_makes_lance_warn_about_a_left_out_score_column() {
+    record_score_column_warnings();
+    let tables = TestTables::searchable(&[document("doc", &["alpha beta", "gamma"])]).await;
+    for mode in [FullText, Vector, Hybrid] {
+        for unit in [Document, Chunk] {
+            search(&tables, request("alpha", mode, unit)).await;
+        }
+    }
+    for unit in [Document, Chunk] {
+        let query = query_with_other_model(&tables);
+        query.search(request("alpha", Hybrid, unit)).await.unwrap();
+    }
+    assert_eq!(*SCORE_COLUMN_WARNINGS.lock().unwrap(), Vec::<String>::new());
 }
