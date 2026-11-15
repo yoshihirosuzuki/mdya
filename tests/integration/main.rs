@@ -12,4 +12,5 @@ mod interruption;
 mod mcp_server;
 mod memory_limit;
 mod query_operations;
+mod running_environment;
 mod shared_parts;
