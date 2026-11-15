@@ -35,7 +35,7 @@ const MEMO: &str = "# 覚え書き\n\n古いタグは消さずに残します。
 
 /// The mdya MCP server over stdio, as an MCP client runs it: its stdin and
 /// stdout carry the exchange.
-struct StdioServer {
+pub(crate) struct StdioServer {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: Receiver<io::Result<String>>,
@@ -44,18 +44,18 @@ struct StdioServer {
 }
 
 /// How a server over stdio ended.
-struct Ended {
-    status: ExitStatus,
+pub(crate) struct Ended {
+    pub(crate) status: ExitStatus,
     /// The lines that the server wrote on stdout after the last answer the
     /// test waited for.
-    stdout: Vec<String>,
-    stderr: String,
+    pub(crate) stdout: Vec<String>,
+    pub(crate) stderr: String,
 }
 
 impl StdioServer {
     /// Starts `mdya mcp` from `command`, the executable with the test's
     /// directories.
-    fn start(mut command: Command) -> Self {
+    pub(crate) fn start(mut command: Command) -> Self {
         let mut child = command
             .arg("mcp")
             .stdin(Stdio::piped())
@@ -82,7 +82,7 @@ impl StdioServer {
 
     /// Starts the exchange as an MCP client does, and returns the result of
     /// `initialize`.
-    fn initialize(&mut self) -> Value {
+    pub(crate) fn initialize(&mut self) -> Value {
         let result = self.request(
             "initialize",
             json!({
@@ -96,7 +96,7 @@ impl StdioServer {
     }
 
     /// Calls `tool` and returns its result.
-    fn call(&mut self, tool: &str, arguments: Value) -> Value {
+    pub(crate) fn call(&mut self, tool: &str, arguments: Value) -> Value {
         self.request(
             "tools/call",
             json!({ "name": tool, "arguments": arguments }),
@@ -133,7 +133,8 @@ impl StdioServer {
         }
     }
 
-    fn send(&mut self, message: &Value) {
+    /// Writes `message` on the server's stdin, as one line.
+    pub(crate) fn send(&mut self, message: &Value) {
         let stdin = self.stdin.as_mut().unwrap();
         writeln!(stdin, "{message}").unwrap();
         stdin.flush().unwrap();
@@ -141,8 +142,13 @@ impl StdioServer {
 
     /// Closes stdin, as an MCP client does to end the exchange, and waits for
     /// the server to end.
-    fn finish(&mut self) -> Ended {
+    pub(crate) fn finish(&mut self) -> Ended {
         drop(self.stdin.take());
+        self.wait_for_end()
+    }
+
+    /// Waits for the server to end by itself, with stdin left open.
+    pub(crate) fn wait_for_end(&mut self) -> Ended {
         let deadline = Instant::now() + ANSWER_WAIT;
         let mut stdout = Vec::new();
         loop {
@@ -444,7 +450,7 @@ fn stop(child: &mut Child) {
 
 /// The structured content of a tool's successful result, which its text
 /// content must hold too.
-fn succeeded(result: &Value) -> Value {
+pub(crate) fn succeeded(result: &Value) -> Value {
     assert_eq!(result["isError"], false, "{result}");
     assert_eq!(
         text_content(result),
