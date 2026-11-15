@@ -15,6 +15,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Output};
 
+#[cfg(unix)]
+use crate::common::Locked;
 use crate::common::{Outcome, Workspace};
 
 fn text(path: &Path) -> String {
@@ -129,33 +131,6 @@ fn updated(name: &str, counts: [u32; 6]) -> String {
         "Updated the collection \"{name}\": {} added, {} changed, {} unchanged, {} re-ingested, {} deleted, {} failed.",
         counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
     )
-}
-
-/// Takes permissions away from a directory while it lives, and gives them
-/// back when dropped, so that the test's directory can be removed even when
-/// the test fails.
-#[cfg(unix)]
-struct Locked(PathBuf);
-
-#[cfg(unix)]
-impl Locked {
-    fn new(dir: &Path, mode: u32) -> Self {
-        set_mode(dir, mode).unwrap();
-        Self(dir.to_owned())
-    }
-}
-
-#[cfg(unix)]
-impl Drop for Locked {
-    fn drop(&mut self) {
-        let _ = set_mode(&self.0, 0o755);
-    }
-}
-
-#[cfg(unix)]
-fn set_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
 }
 
 #[test]
