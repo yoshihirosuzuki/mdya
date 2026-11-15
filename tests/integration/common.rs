@@ -123,27 +123,58 @@ impl Workspace {
 
     /// Runs mdya with the given arguments, and `stdin` as its standard input.
     pub fn run_with_stdin(&self, args: &[&str], stdin: &[u8]) -> Outcome {
-        self.run_with_io(args, stdin, false)
+        self.run_with_io(
+            args,
+            Surroundings {
+                stdin,
+                ..Surroundings::default()
+            },
+        )
     }
 
     /// Runs mdya with the given arguments, as if its standard input were a
     /// terminal where the user types `answer` to a confirmation.
     pub fn run_answering(&self, args: &[&str], answer: &str) -> Outcome {
-        self.run_with_io(args, answer.as_bytes(), true)
+        self.run_with_io(
+            args,
+            Surroundings {
+                stdin: answer.as_bytes(),
+                stdin_is_terminal: true,
+                ..Surroundings::default()
+            },
+        )
     }
 
-    fn run_with_io(&self, args: &[&str], stdin: &[u8], stdin_is_terminal: bool) -> Outcome {
+    /// Runs mdya with the given arguments, as if its stderr were a terminal,
+    /// with `env` as its environment variables.
+    pub fn run_on_a_terminal(&self, args: &[&str], env: &[(&str, &str)]) -> Outcome {
+        self.run_with_io(
+            args,
+            Surroundings {
+                stderr_is_terminal: true,
+                env,
+                ..Surroundings::default()
+            },
+        )
+    }
+
+    fn run_with_io(&self, args: &[&str], surroundings: Surroundings<'_>) -> Outcome {
         let stdout = Captured::default();
         let stderr = Captured::default();
         let io = Io {
-            stdin: Box::new(Cursor::new(stdin.to_vec())),
+            stdin: Box::new(Cursor::new(surroundings.stdin.to_vec())),
             stdout: Box::new(stdout.clone()),
             stderr: Box::new(stderr.clone()),
-            stdin_is_terminal,
+            stdin_is_terminal: surroundings.stdin_is_terminal,
             stdout_is_terminal: false,
-            stderr_is_terminal: false,
+            stderr_is_terminal: surroundings.stderr_is_terminal,
         };
-        let code = run_with(self.arguments(args), Vec::new(), io, real_factories());
+        let env = surroundings
+            .env
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect();
+        let code = run_with(self.arguments(args), env, io, real_factories());
         self.check_model_not_prepared(args);
         Outcome {
             code,
@@ -284,6 +315,83 @@ impl Workspace {
             self.model_cache_dir().into_os_string(),
         ]
     }
+}
+
+/// What a run of mdya in the test's own process gets besides its arguments.
+/// Its environment variables are only those of `env`.
+#[derive(Default)]
+struct Surroundings<'a> {
+    stdin: &'a [u8],
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+    env: &'a [(&'a str, &'a str)],
+}
+
+/// The mdya executable without the directory arguments, with `home` as the
+/// home directory and an HTTPS proxy that refuses connections: it uses the
+/// directories under `home` by default, and cannot fetch the embedding model.
+#[cfg(unix)]
+pub fn executable_at_home(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mdya"));
+    command.env("HOME", home);
+    refuse_fetching(&mut command);
+    command
+}
+
+/// Takes permissions away from directories while it lives, and gives them
+/// back when dropped, so that the test's directory can be removed even when
+/// the test fails.
+#[cfg(unix)]
+pub struct Locked(Vec<PathBuf>);
+
+#[cfg(unix)]
+impl Locked {
+    /// Sets `mode` on `dir`.
+    pub fn new(dir: &Path, mode: u32) -> Self {
+        Self::all(vec![dir.to_owned()], mode)
+    }
+
+    /// Sets `mode` on `dir` and on every directory under it.
+    pub fn tree(dir: &Path, mode: u32) -> Self {
+        Self::all(directories_in(dir), mode)
+    }
+
+    fn all(dirs: Vec<PathBuf>, mode: u32) -> Self {
+        // Made first, so that a failure on the way gives back what was taken.
+        let locked = Self(dirs);
+        for dir in &locked.0 {
+            set_mode(dir, mode).unwrap();
+        }
+        locked
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Locked {
+    fn drop(&mut self) {
+        for dir in &self.0 {
+            let _ = set_mode(dir, 0o755);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+}
+
+/// `dir` and every directory under it.
+#[cfg(unix)]
+fn directories_in(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![dir.to_owned()];
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            dirs.extend(directories_in(&path));
+        }
+    }
+    dirs
 }
 
 /// A proxy at a port that nothing listens on.
