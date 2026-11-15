@@ -24,6 +24,12 @@ name: verify
 on:
   workflow_dispatch:
 
+# Cargo settings for every step. Incremental compilation only adds artifacts
+# that no later run reuses, and colors keep Cargo's output readable in the log.
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
 jobs:
   build-and-link-check:
     name: build + link check (${{ matrix.os }})
@@ -35,10 +41,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
-      # `@stable` is a branch of the action; `actions.lock` pins it to a
-      # commit, and `gh actions-lock --relock` moves the pin forward. The Rust
-      # toolchain itself comes from `rust-toolchain.toml`.
-      - uses: dtolnay/rust-toolchain@stable
+      # `rust-toolchain.toml` names the toolchain; with no argument,
+      # `rustup toolchain install` installs it. The runner images come with
+      # rustup.
+      - name: Install the Rust toolchain
+        run: rustup toolchain install
 
       # `lance-encoding`'s build script invokes `protoc`; the runners do not
       # ship it. Installed via each OS package manager rather than a

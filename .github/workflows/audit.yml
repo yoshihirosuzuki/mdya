@@ -17,9 +17,8 @@
 # which is a subset of RustSec — not every RustSec advisory has a GHSA entry.
 # This workflow closes the gap by querying RustSec directly.
 #
-# `.github/workflows/actions.lock` pins every action to a commit, including
-# `dtolnay/rust-toolchain@stable`. Run `gh actions-lock` after changing any
-# `uses:`.
+# `.github/workflows/actions.lock` pins every action to a commit. Run
+# `gh actions-lock` after changing any `uses:`.
 
 name: audit
 
@@ -42,6 +41,11 @@ env:
   # Open issues carrying this label are the deduplication key: while one is
   # open, a failing run does not file another.
   ALERT_LABEL: security-advisory
+  # Cargo settings for every step. Incremental compilation only adds artifacts
+  # that no later run reuses, and colors keep Cargo's output readable in the
+  # log.
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
 
 jobs:
   audit:
@@ -56,7 +60,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      # `rust-toolchain.toml` names the toolchain; with no argument,
+      # `rustup toolchain install` installs it. The runner images come with
+      # rustup.
+      - name: Install the Rust toolchain
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2.9.3
 
@@ -66,10 +74,10 @@ jobs:
       # `--deny warnings` is intentional. Per-advisory suppressions live in
       # `.cargo/audit.toml` at the project root.
       #
-      # `--color never` overrides the `CARGO_TERM_COLOR: always` that
-      # `Swatinem/rust-cache` exports, so the captured output can be pasted
-      # into an issue body without ANSI escapes. `continue-on-error` lets the
-      # reporting step run; the last step restores the failure.
+      # `--color never` overrides the `CARGO_TERM_COLOR: always` set above for
+      # every step, so the captured output can be pasted into an issue body
+      # without ANSI escapes. `continue-on-error` lets the reporting step run;
+      # the last step restores the failure.
       - name: cargo audit
         id: scan
         continue-on-error: true
