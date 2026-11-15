@@ -14,9 +14,8 @@
 # `lance-encoding` invokes `protoc` from its build script, so it must be
 # present even for `cargo check`.
 #
-# `.github/workflows/actions.lock` pins every action to a commit, including
-# `dtolnay/rust-toolchain@stable`. Run `gh actions-lock` after changing any
-# `uses:`.
+# `.github/workflows/actions.lock` pins every action to a commit. Run
+# `gh actions-lock` after changing any `uses:`.
 
 name: cross-platform-smoke
 
@@ -36,6 +35,12 @@ concurrency:
 permissions:
   contents: read
 
+# Cargo settings for every step. Incremental compilation only adds artifacts
+# that no later run reuses, and colors keep Cargo's output readable in the log.
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
 jobs:
   check:
     name: check (${{ matrix.os }})
@@ -52,7 +57,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      # `rust-toolchain.toml` names the toolchain; with no argument,
+      # `rustup toolchain install` installs it. The runner images come with
+      # rustup.
+      - name: Install the Rust toolchain
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2.9.3
 
