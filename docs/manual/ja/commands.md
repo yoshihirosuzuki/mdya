@@ -1,450 +1,521 @@
-# コマンドリファレンス
+# コマンド
 
-mdya のサブコマンド一覧と詳細です。すべてのサブコマンドで以下のグローバルフラグが使えます。
+mdya の CLI のコマンドの書き方と、出力です。例の出力の場所は `/Users/me` の下に、mdya のバージョンは `X.Y.Z` に置き換えています。
 
-## グローバルフラグ
+## コマンドの一覧
 
-| フラグ | 役割 | default |
+| すること | コマンド |
+|---|---|
+| collection を作る | [`mdya collection add`](#collection-を作る-mdya-collection-add) |
+| collection を削除する | [`mdya collection remove`](#collection-を削除する-mdya-collection-remove) |
+| collection の一覧を見る | [`mdya collection list`](#collection-の一覧を見る-mdya-collection-list) |
+| collection の場所や説明を変える | [`mdya collection set`](#collection-の場所や説明を変える-mdya-collection-set) |
+| 指定した collection を update する | [`mdya update <collection 名>`](#collection-を-update-する-mdya-update) |
+| すべての collection を update する | [`mdya update --all`](#collection-を-update-する-mdya-update) |
+| 文書の内容を渡して取り込む | [`mdya put`](#文書の内容を渡して取り込む-mdya-put) |
+| 文書を指定して削除する | [`mdya remove`](#文書を指定して削除する-mdya-remove) |
+| 検索する | [`mdya search`](#検索する-mdya-search) |
+| 文書を取得する | [`mdya get`](#文書を取得する-mdya-get) |
+| インデックスの状態を見る | [`mdya status`](#インデックスの状態を見る-mdya-status) |
+| 設定を見る | [`mdya config list`](#設定を見る-mdya-config-list) |
+| 設定を変える | [`mdya config set`、`mdya config reset`](#設定を変える-mdya-config-setmdya-config-reset) |
+| 埋め込みベクトルを作り直す | [`mdya embedding rebuild`](#埋め込みベクトルを作り直す-mdya-embedding-rebuild) |
+| インデックスを保守する | [`mdya optimize`](#インデックスを保守する-mdya-optimize) |
+| MCP のサーバーを始める | [`mdya mcp`](#mcp-のサーバーを始める-mdya-mcp) |
+| mdya のバージョンを見る | [`mdya --version`](#mdya-のバージョンを見る-mdya---version) |
+| ヘルプを見る | [`--help`、`-h`](#ヘルプを見る---help-h) |
+
+## どのコマンドにも共通のこと
+
+### 全体のオプション
+
+次のオプションは、`mdya` のすぐあと、コマンドの名前より前に書きます (`mdya --data-dir ~/work-mdya search "手順"`)。コマンドの名前のあとに書くと、引数の使い方のエラー (終了コード 2) になります。
+
+| オプション | 意味 | 既定 |
 |---|---|---|
-| `--config-dir <PATH>` | 設定ディレクトリの上書き | `$HOME/.mdya/` |
-| `--model-cache-dir <PATH>` | 埋め込みモデルキャッシュディレクトリの上書き | `$HOME/.mdya-models/` |
-| `--log-level <LEVEL>` | ログの詳細度 (`trace` / `debug` / `info` / `warn` / `error`)。`RUST_LOG` 環境変数でも可 | `warn` |
-| `--log-format <FORMAT>` | ログのフォーマット (`compact` / `pretty` / `json`) | `compact` |
-| `--no-color` | 端末色出力の抑制。`NO_COLOR` 環境変数でも可 | TTY 自動判定 |
-| `-h, --help` | ヘルプ表示 | — |
-| `-V, --version` | バージョン表示 | — |
+| `--data-dir <ディレクトリ>` | 設定とインデックスのディレクトリ ([設定の「ディレクトリ」](configuration.md#ディレクトリ)) | `~/.mdya` |
+| `--model-cache-dir <ディレクトリ>` | 埋め込みモデルのキャッシュのディレクトリ | `~/.mdya-models` |
+| `--log-level <ログレベル>` | どのログレベルからログを出すか ([設定の「ログと色」](configuration.md#ログと色)) | `warn` |
+| `--log-format <形式>` | ログの出力形式 (`compact`、`pretty`、`json`) | `compact` |
+| `--no-color` | 出力に色を付けない | 出力先が端末のときだけ色を付ける |
 
-ログはすべて stderr に出ます。stdout は検索結果や MCP プロトコルメッセージなどデータ専用です。
+### 出力先
 
-## 終了コード
+- 標準出力 (stdout) には、コマンドの結果だけを出します。
+- 標準エラー出力 (stderr) には、メッセージ (成功したこと、進捗、完了のまとめなど)、エラー、ログを出します。
+- `--json` を付けられるコマンドは、結果を JSON で返します。付けなければ、人が読む形で返します。
+- エラーのときは、`--json` を付けていても、stdout に何も出しません。stderr に、人が読む形で、エラーメッセージと、その原因と、直し方を出します。スクリプトからは、stdout の中身ではなく、終了コードで成否を見てください。
+- 人が読む形で出すものの中の、取り込んだ文書や利用者から来た文字列 (key、スニペット、場所など) にある制御文字 (改行とタブも含む) と、文字の並ぶ向きを変える文字 (U+202A〜U+202E、U+2066〜U+2069) は、見える形に置き換えて出します。端末が、取り込んだものに操られないようにするためです。`mdya get` が返す文書の本文は、置き換えずに、元のまま出します。
 
-| コード | 意味 |
+### 終了コード
+
+| 終了コード | 意味 |
 |---|---|
-| `0` | 成功 |
-| `1` | アプリケーションエラー (IO / 設定不整合 / 検索失敗など) |
-| `2` | 引数のパースエラー |
-| `101` | 内部エラー (パニック) |
-| `137` | メモリ上限超過による即時終了 ([configuration.md の `memory_limit_mb`](configuration.md#memory_limit_mb) 参照) |
+| 0 | 成功 |
+| 1 | エラー |
+| 2 | 引数の使い方のエラー |
+| 101 | 想定外の失敗 (mdya の不具合) |
+| 137 | メモリの上限を超えて止まった |
 
----
+エラーごとの終了コードと直し方は、[エラーと直し方](errors.md) にあります。
 
-## `mdya init`
+### 進捗
 
-`~/.mdya/` を初期化します。
+取り込み、埋め込みベクトルの作り直し、保守は、進捗を stderr に出します。stderr が端末のときは、進捗のバーを描き直しながら出します。stderr が端末でないとき (ファイルへの振り向け、パイプなど) と、環境変数 `TERM` が `dumb` のとき (Windows 以外では、`TERM` がないときも) は、始めたときと 10 秒ごとに、状態を 1 行で出します。
 
-```sh
-mdya init
+```
+Updating 0/3, 0 chunks embedded, 10s
 ```
 
-- `config.yml` を default 値で生成 (既にあれば触りません)。
-- `index/` / `lance-models/` を作成 (既にあれば触りません)。
-- 埋め込みモデルのキャッシュは `~/.mdya-models/` (`--model-cache-dir` で変更可) に置かれ、初回の `mdya update-all` やベクトル / hybrid 検索で自動ダウンロードされます。`mdya init` はこの dir を作りません。
+### 確認を求めるコマンド
 
-何度実行しても安全です。やり直したい場合は `~/.mdya/` を手動で削除してから再実行してください。
+`mdya collection remove` と `mdya remove` は、削除する前に、端末で確認を求めます (`[y/N]`)。`y` で削除します。`--yes` を付けると、確認せずに削除します。端末でないところ (スクリプトなど) で流すときは、`--yes` が要ります。
 
----
+## collection を作る (`mdya collection add`)
 
-## `mdya collection add <path>`
-
-ディレクトリ、またはアーカイブ (`.zip` / `.tar` / `.tar.gz` / `.tgz`) をコレクションとして登録します。
-
-```sh
-mdya collection add <path> [--name <NAME>] [--description <TEXT>]
+```
+mdya collection add <collection 名> [--type <collection タイプ>] [--description <説明>] [<場所>]
 ```
 
-| 引数 / オプション | 役割 |
+| 引数とオプション | 意味 |
 |---|---|
-| `<path>` (必須) | 登録するディレクトリ、またはアーカイブ。`~/...` は展開される |
-| `--name <NAME>` | コレクション名。ディレクトリでは省略すると `<path>` の basename。アーカイブでは必須 |
-| `--description <TEXT>` | 人間向けの説明 (`mdya collection list` で表示) |
+| `<collection 名>` | 作る collection の名前。ASCII の英数字と `-`、`_` だけからなる、1〜64 文字 |
+| `--type <collection タイプ>` | `directory` (既定)、`archive`、`raw` のどれか ([collection と collection タイプ](collections.md)) |
+| `--description <説明>` | collection の説明。省略できる |
+| `<場所>` | ディレクトリの collection ではディレクトリ、アーカイブの collection ではアーカイブのファイル。raw の collection では渡さない |
 
-`config.yml` の `collections` セクションに 1 行追加されるだけで、索引化はここでは行われません。索引化は `mdya update-all` を実行したときに動きます。
+作るときには、取り込みません。取り込むのは、`mdya update` か `mdya put` です。
 
-例:
-
-```sh
-mdya collection add ~/notes
-mdya collection add ~/work --name work-docs --description "業務メモ"
-mdya collection add ~/Downloads/notion-export.zip --name notion
+```
+$ mdya collection add notes ~/notes --description "個人のメモ"
+Created the collection "notes" (directory).
+  path: /Users/me/notes
+  description: 個人のメモ
+$ mdya collection add notes-zip ~/notes.zip --type archive
+Created the collection "notes-zip" (archive).
+  path: /Users/me/notes.zip
+$ mdya collection add memo --type raw
+Created the collection "memo" (raw).
 ```
 
-### アーカイブを登録する
+起こりうるエラー: [同じ名前の collection がある](errors.md#同じ名前の-collection-がある)、[collection 名が決まりに合わない](errors.md#collection-名が決まりに合わない)、[タイプ別の属性が足りないか余計](errors.md#タイプ別の属性が足りないか余計)、[場所が見つからない](errors.md#場所が見つからない)、[場所が collection タイプに合わない](errors.md#場所が-collection-タイプに合わない)
 
-アーカイブはディスクに展開せずに、中の `.md` / `.markdown` / `.pdf` を直接読みます。形式は拡張子で判定します (大文字小文字は区別しません)。
+## collection を削除する (`mdya collection remove`)
 
-- 文書のパスは、アーカイブ内の名前です (例: `docs/a.md`)。`.` だけの階層 (先頭の `./` など) と空の階層は取り除き、区切りの `\` は `/` にそろえます。最上位のディレクトリは残ります (例: `export/docs/a.md`)。
-- 同じパスの項目が複数あるときは、後の項目を使います。
-- 通常のファイルだけを読みます。シンボリックリンクやハードリンクなどは読みません。リンクの名前は文書になりませんが、リンク先のファイルがアーカイブの中にあれば、その中身はリンク先の名前で検索できます。macOS がファイルの付加情報を入れる項目も読みません。該当するのは、最上位の `__MACOSX/` の下にある項目と、ファイル名が `._` で始まるファイル (例: `docs/._a.md`) です。
-- GNU tar や bsdtar のスパースファイル (中身が全部ゼロの部分を省いて格納したファイル) は、元のファイルに組み立て直して読みます。
-- アーカイブの中のアーカイブ (中の `.zip` など) は開きません。文書ではないので、数えず、警告も出さずに飛ばします。
-- アーカイブには、中の `.gitignore` も外側の `.gitignore` も使いません。
-- 次の文書は読まずに `failed` に数えます。
-  - 名前が UTF-8 でない文書 (Shift_JIS などで書かれた名前)、名前が絶対パス (`C:` のようなドライブ名で始まるものを含む) の文書、名前に `..` や制御文字を含む文書
-  - zip の中で、deflate と無圧縮以外の方式で圧縮された文書、暗号化された文書
-  - 解凍後の大きさが 256 MiB を超える文書
-  - スパースファイルで、配置の情報が使えない文書 (壊れている、断片が多すぎるなど)
-- アーカイブの中の文書の合計の大きさには、上限がありません。圧縮やスパースファイルのため、小さなアーカイブからでも 256 MiB までの文書がいくつも出てくることがあり、そのぶん取り込みに時間がかかり、索引も大きくなります。
-- 次のアーカイブは、全体を読めない扱いになります ([`mdya update-all`](#mdya-update-all) 参照)。
-  - 見つからない、壊れている、途中で切れているアーカイブ
-  - 末尾に終わりの印 (全ゼロのブロック 2 つ) がない `.tar` / `.tar.gz` / `.tgz`
-  - 複数の項目の圧縮データが重なっている zip
-  - 文書の名前の合計が 256 MiB を超えるアーカイブ (名前 1 件ごとに 128 バイトを足して数えます)
-  - 複数のファイルに分割された zip
-  - 先頭に別のデータ (自己解凍のプログラムなど) が付いていて、zip の中の位置を直していない zip
-- 変更の判定には、アーカイブ自体の更新時刻を使います。アーカイブが変わっていなければ、中の文書は読まずに `skipped` になります。ただし `.tar` / `.tar.gz` / `.tgz` は、中身の一覧を作るために毎回全体を読みます (`.tar.gz` / `.tgz` は解凍もします)。
-- 読んでいる間にアーカイブが書き換えられた (更新時刻か大きさが変わった) ときは、警告を出し、書き換えの途中や後の中身を索引に入れません。中身の一覧を作っている間なら、アーカイブ全体を読めない扱いにします。文書を読んでいる間なら、まだ読んでいない文書を `failed` に数え、その文書の前回の索引は残します。次の `mdya update-all` で読み直します。
-
----
-
-## `mdya collection list`
-
-登録済みコレクションを一覧表示します。
-
-```sh
-mdya collection list [--format <FORMAT>]
+```
+mdya collection remove <collection 名> [--yes] [--no-optimize]
 ```
 
-- `--format` は `human` (default) / `json` / `md` / `xml` から選びます。
-- 各コレクションについて `name` / `path` / `description` / `document_count` (取り込み済み文書数) を表示します。
-- `document_count` は索引内の文書数なので、`mdya update-all` をまだ走らせていないコレクションは `0` になります。
+collection と、その collection の文書を、インデックスから削除します。取り込み元 (ディレクトリやアーカイブのファイル) には触れません。削除する前に確認を求めます。`--no-optimize` は、[インデックスを保守する](#インデックスを保守する-mdya-optimize) を参照してください。
 
-```sh
+```
+$ mdya collection remove notes-zip --yes
+Removed the collection "notes-zip".
+```
+
+raw の collection の文書は、update で取り込み直せません。削除したあとに戻すには、同じ文書の内容を、もう一度 `mdya put` で渡す必要があります。
+
+起こりうるエラー: [collection がない](errors.md#collection-がない)、[確認が得られない](errors.md#確認が得られない)
+
+## collection の一覧を見る (`mdya collection list`)
+
+```
+mdya collection list [--json]
+```
+
+collection ごとに、collection 名、collection タイプ、文書の数、説明、タイプ別の属性を返します。collection は、名前の順 (文字の Unicode のコードポイントの順) に並べます。
+
+```
 $ mdya collection list
-notes  ~/notes        個人メモ    42 docs
-work   ~/work          (no desc)    0 docs
+notes (directory, 0 documents)
+  個人のメモ
+  path: /Users/me/notes
 ```
 
-`json` で出すとスクリプトから扱いやすいエンベロープになります。
+`--json` を付けたときの形は、次のとおりです。`description` は、説明がないときは `null` です。`attributes` は、ディレクトリとアーカイブの collection では場所 (`path`) を持ち、raw の collection では空のオブジェクトです。
 
-```sh
-$ mdya collection list --format json
-{
-  "collections": [
-    { "name": "notes", "path": "~/notes", "description": "個人メモ", "document_count": 42 }
-  ]
-}
+```json
+{"collections":[{"name":"notes","type":"directory","description":"個人のメモ","document_count":0,"attributes":{"path":"/Users/me/notes"}}]}
 ```
 
----
-
-## `mdya update-all`
-
-登録済みの全コレクションを走査し、新規 / 変更された `.md` / `.markdown` / `.pdf` ファイルを取り込み、走査に現れなくなったファイル (削除されたもの、`.gitignore` で新たに除外されたもの) の索引データを掃除します。
-
-```sh
-mdya update-all
-```
-
-- 索引対象は `.md` / `.markdown` / `.pdf` 拡張子のファイルです。`.pdf` は取り込み時に plain text に変換して Markdown と共通の chunker と embedding に流します。
-- アーカイブのコレクションは、アーカイブの中の同じ拡張子の文書を読みます ([アーカイブを登録する](#アーカイブを登録する) 参照)。
-- コレクションルート配下のシンボリックリンクは辿りません ([configuration.md の `collections`](configuration.md#collections) 参照)。
-- コレクションルートが git リポジトリ内にある場合、`.gitignore` で除外されるパスは索引化しません ([configuration.md の `collections`](configuration.md#collections) 参照)。
-- パスに制御文字 (Unicode の分類 Cc の文字。改行・タブ・ESC など) を含むファイルは読まずに、`failed` に数えます。アーカイブの中の文書も同じです。
-- 並列度は `runtime.embed_parallelism` で調整します。
-- 進捗は stderr に表示します。表示のしかたは、stderr にプログレスバーを表示できるかどうかで変わります ([進捗の表示](#進捗の表示) 参照)。
-- 終わると stderr にサマリを 1 行出します。stdout には何も出しません。
+## collection の場所や説明を変える (`mdya collection set`)
 
 ```
-Indexed 43 documents (new: 5, updated: 3, skipped: 34, removed: 0, failed: 1).
+mdya collection set <collection 名> [--description <説明> | --no-description] [<場所>]
 ```
 
-各カウンタの意味:
+説明か、取り込む場所を変えます。少なくとも 1 つを渡します。`--no-description` は、説明をなくします。新しい場所は、次に update するときに使います。文書は、このコマンドでは変わりません。
 
-- `new` — 新規に取り込んだファイル数
-- `updated` — 内容が変わったので再取り込みしたファイル数
-- `skipped` — 変更がなくスキップしたファイル数
-- `removed` — ファイルが消えた、または `.gitignore` で除外されるようになったので索引から消した数
-- `failed` — 取り込みに失敗したファイル数
-
-`failed > 0` の場合は終了コード `1` を返します (サマリは表示されます)。
-
-アーカイブのコレクションで、アーカイブを読めないとき (見つからない、壊れている、途中で切れている、など) は、警告を出し、そのコレクションの索引は更新も削除もせずにそのまま残して、ほかのコレクションの更新を続けます。この場合も終了コード `1` を返します。ディレクトリのコレクションでは、ディレクトリが見つからないと中身が空と扱われ、索引から文書が消えます。ただし、名前がアーカイブの拡張子で終わるディレクトリ (例: `notes.zip` という名前のディレクトリ) が見つからないときは、アーカイブが見つからないときと同じく、索引をそのまま残します。
-
-### 進捗の表示
-
-stderr にプログレスバーを表示できるときは、プログレスバーと、処理中のファイルを 1 つずつ 1 行で表示します。埋め込み計算に入ったファイルは、ファイル名の後に「済んだチャンク数/総数」を表示します。全ファイルを処理した後、検索用の索引を更新している間は `Updating search indexes` と表示します。
-
-プログレスバーを表示できないときは、取り込みを始めたときと、その後 10 秒ごとに、その時点の状態を 1 行で出します。表示できないのは、stderr が端末でないとき (ファイルへのリダイレクト、パイプ、CI のログなど) と、環境変数 `TERM` が `dumb` のとき (Windows 以外では未設定のときも) です。
+collection 名と collection タイプは変えられません。変えたいときは、削除して作り直してください。
 
 ```
-Indexing 'notes': 12/340 files; in progress: docs/big.pdf (320/12000 chunks), memo.md
+$ mdya collection set notes --description "仕事のメモ"
+Changed the collection "notes".
+  path: /Users/me/notes
+  description: 仕事のメモ
 ```
 
-ファイル数は処理中のコレクションのもので、コレクションごとに 0 から数えます。`in progress:` の後には処理中のファイルを並べ、埋め込み計算に入ったファイルにはチャンクの進みを添えます。全ファイルを処理した後、検索用の索引を更新している間は、状態の行が `Updating search indexes` になります。
+起こりうるエラー: [collection がない](errors.md#collection-がない)、[変えるものを指定していない](errors.md#変えるものを指定していない)、[タイプ別の属性が足りないか余計](errors.md#タイプ別の属性が足りないか余計)、[場所が見つからない](errors.md#場所が見つからない)、[場所が collection タイプに合わない](errors.md#場所が-collection-タイプに合わない)、[この mdya が知らない collection タイプの collection がある](errors.md#この-mdya-が知らない-collection-タイプの-collection-がある)
 
----
+## collection を update する (`mdya update`)
 
-## `mdya search fts|vector|hybrid <query>`
-
-3 つのモードで検索します。引数とオプションは 3 モードで共通です。
-
-```sh
-mdya search fts    <query> [-c <NAMES>...] [-n <N>] [--chunks] [--format <FORMAT>]
-mdya search vector <query> [-c <NAMES>...] [-n <N>] [--chunks] [--format <FORMAT>]
-mdya search hybrid <query> [-c <NAMES>...] [-n <N>] [--chunks] [--format <FORMAT>]
+```
+mdya update <collection 名> [--force] [--no-optimize]
+mdya update --all [--force] [--no-optimize]
 ```
 
-| 引数 / オプション | 役割 | default |
+ディレクトリとアーカイブの collection を、取り込み元の今の中身に合わせます ([collection と collection タイプ](collections.md))。`mdya update <collection 名>` は、指定した 1 つの collection を、`mdya update --all` は、ディレクトリとアーカイブのすべての collection を update します。raw の collection は update できません。
+
+| オプション | 意味 |
+|---|---|
+| `--force` | 変わっていない文書も、取り込み直す |
+| `--no-optimize` | 最後にインデックスを保守しない ([インデックスを保守する](#インデックスを保守する-mdya-optimize)) |
+
+変わっていない文書は飛ばすので、2 回目からは、変わった文書だけを取り込みます。初めて埋め込みモデルを使うときは、埋め込みモデルを取得します ([設定の「埋め込みモデル」](configuration.md#埋め込みモデル))。
+
+進捗には、処理を終えた文書の数と、処理する文書の全体の数と、埋め込みベクトルを作り終えた chunk の数を出します。終わると、結果ごとの文書の数を出します。
+
+```
+$ mdya update notes
+Updated the collection "notes": 3 added, 0 changed, 0 unchanged, 0 re-ingested, 0 deleted, 0 failed.
+$ mdya update --all
+Updated 2 collections: 4 added, 0 changed, 2 unchanged, 0 re-ingested, 0 deleted, 0 failed.
+```
+
+| 結果 | 意味 |
+|---|---|
+| `added` | 新しく足した |
+| `changed` | 変わったので取り込み直した |
+| `unchanged` | 変わっていないので飛ばした |
+| `re-ingested` | 変わっていないが、`--force` で取り込み直した |
+| `deleted` | 取り込み元からなくなったので削除した |
+| `failed` | 読めなかった ([読めない文書がある](errors.md#読めない文書がある)) |
+
+読めない文書や、読めない取り込み元があったときは、ほかの文書や collection を取り込んでから、終了コード 1 で終わります。
+
+エラーで止まったときも、エラーメッセージのあとに、止まるまでの結果ごとの文書の数を出します。止まるまでに書き終えた文書は残るので、どこまで進んだかがわかります。
+
+途中で止めたとき (Ctrl+C など) は、もう一度同じコマンドを流してください。`--force` を付けていなければ、変わっていない文書を飛ばすので、止めたところの続きから進みます。
+
+起こりうるエラー: [collection がない](errors.md#collection-がない)、[update できない collection タイプの collection を指定した](errors.md#update-できない-collection-タイプの-collection-を指定した)、[読めない文書がある](errors.md#読めない文書がある)、[取り込み元を読めない](errors.md#取り込み元を読めない)、[埋め込みモデルを使えない](errors.md#埋め込みモデルを使えない)、[埋め込みベクトルを作り直していない](errors.md#埋め込みベクトルを作り直していない)、[埋め込みモデルのコンテキスト長を超える chunk がある](errors.md#埋め込みモデルのコンテキスト長を超える-chunk-がある)、[この mdya が知らない collection タイプの collection がある](errors.md#この-mdya-が知らない-collection-タイプの-collection-がある)
+
+## 文書の内容を渡して取り込む (`mdya put`)
+
+```
+mdya put <collection 名> <key> --file-type <ファイルタイプ> [--force] [--no-optimize] <場所>
+```
+
+raw の collection に、文書を 1 つ取り込みます。その key の文書がなければ足し、あれば置き換えます。
+
+| 引数とオプション | 意味 |
+|---|---|
+| `<collection 名>` | raw の collection の名前 |
+| `<key>` | 文書の key。空の文字列を含め、どんな文字列も受け付ける |
+| `--file-type <ファイルタイプ>` | Markdown は `text/markdown`、`markdown`、`md` のどれか。PDF は `application/pdf`、`pdf` のどれか。大文字と小文字は区別しない。`text/markdown` に `charset` を付けるときは、`UTF-8` だけを受け付ける |
+| `--force` | 文書の本文が前と同じでも、取り込み直す |
+| `--no-optimize` | 最後にインデックスを保守しない ([インデックスを保守する](#インデックスを保守する-mdya-optimize)) |
+| `<場所>` | 文書の内容を読むファイル。`-` なら標準入力から読む |
+
+```
+$ mdya put memo idea.md --file-type md ~/memo-idea.md
+Added "idea.md" to the collection "memo".
+$ printf '# 買うもの\n\n- 牛乳\n' | mdya put memo shopping.md --file-type text/markdown -
+Added "shopping.md" to the collection "memo".
+$ mdya put memo idea.md --file-type md ~/memo-idea.md
+Skipped "idea.md" in the collection "memo": it has not changed.
+```
+
+起こりうるエラー: [collection がない](errors.md#collection-がない)、[文書の内容を渡して取り込めない collection タイプの collection を指定した](errors.md#文書の内容を渡して取り込めない-collection-タイプの-collection-を指定した)、[扱えないファイルタイプを指定した](errors.md#扱えないファイルタイプを指定した)、[読めない文書がある](errors.md#読めない文書がある)、[埋め込みモデルを使えない](errors.md#埋め込みモデルを使えない)、[埋め込みベクトルを作り直していない](errors.md#埋め込みベクトルを作り直していない)、[埋め込みモデルのコンテキスト長を超える chunk がある](errors.md#埋め込みモデルのコンテキスト長を超える-chunk-がある)、[この mdya が知らない collection タイプの collection がある](errors.md#この-mdya-が知らない-collection-タイプの-collection-がある)
+
+## 文書を指定して削除する (`mdya remove`)
+
+```
+mdya remove <collection 名> <key> [--yes] [--no-optimize]
+```
+
+文書を 1 つ、インデックスから削除します。取り込み元には触れません。削除する前に確認を求めます。
+
+ディレクトリとアーカイブの collection の文書は、取り込み元に残っていれば、次に update したときに、また取り込まれます。
+
+```
+$ mdya remove memo shopping.md --yes
+Removed "shopping.md" from the collection "memo".
+$ mdya remove notes setup.md --yes
+Removed "setup.md" from the collection "notes".
+If it is still in the collection's source, it comes back at the next update.
+```
+
+起こりうるエラー: [collection がない](errors.md#collection-がない)、[文書がない](errors.md#文書がない)、[確認が得られない](errors.md#確認が得られない)、[この mdya が知らない collection タイプの collection がある](errors.md#この-mdya-が知らない-collection-タイプの-collection-がある)
+
+## 検索する (`mdya search`)
+
+```
+mdya search <クエリ> [--mode <fts|vector|hybrid>] [-c, --collection <collection 名>]... [-n, --limit <件数の上限>] [--unit <document|chunk>] [--json]
+```
+
+| 引数とオプション | 意味 | 既定 |
 |---|---|---|
-| `<query>` (必須) | 検索クエリ文字列。空文字列はエラー | — |
-| `-c, --collections <NAMES>` | 対象コレクションの絞り込み。CSV (`-c notes,work`) または繰り返し (`-c notes -c work`) で複数指定可 (OR)。スペース区切り (`-c notes work`) は受け付けない | 全コレクション |
-| `-n, --limit <N>` | 上位 N 件 | `20` |
-| `--chunks` | hit 粒度をチャンク単位にする。 off (default) は文書単位の集約 hit を返し、 on にすると文書内で hit したチャンクごとに 1 行を返す | off |
-| `--format <FORMAT>` | 出力形式 (`human` / `json` / `md` / `xml`) | `human` |
+| `<クエリ>` | 探すもの。空白だけのものは受け付けない | なし (必須) |
+| `--mode` | 検索方式。`fts` (全文検索)、`vector` (ベクトル検索)、`hybrid` (ハイブリッド検索) | `hybrid` |
+| `-c`、`--collection` | 探す collection。カンマで区切るか (`-c notes,work`)、繰り返して (`-c notes -c work`) 複数を渡せる。指定したどれかの collection の文書を探す。`-c notes work` のようにスペースで区切った語は、collection 名として読まない | すべての collection |
+| `-n`、`--limit` | 返すヒットの数の上限。1 以上 9007199254740991 以下 | 20 |
+| `--unit` | `document` (文書ごとに 1 つのヒット) か `chunk` (chunk ごとに 1 つのヒット) | `document` |
+| `--json` | 結果を JSON で返す | |
 
-### 3 モードの違い
+### 検索方式
 
-- `fts` — BM25 による全文検索。語句一致を見ます。日本語形態素解析に対応しています。
-- `vector` — cosine 類似度によるベクトル検索。意味的な近さを見ます。初回実行時に埋め込みモデル (約 140 MB) を `~/.mdya-models/` にダウンロードします。
-- `hybrid` — `fts` と `vector` の結果を Reciprocal Rank Fusion (RRF) で統合します。
+- `fts` (全文検索): クエリの語が、文書や chunk に現れるかで探します。埋め込みモデルを使いません。スコアは BM25 の値 (語が現れる回数と、その語の珍しさから求める値) で、大きいほど上に並べます。
+- `vector` (ベクトル検索): クエリと chunk の意味の近さで探します。スコアは cosine 類似度で、0 から 1 の値です。速く探すための索引で探すので、最も近い文書や chunk を取りこぼすことがあります。
+- `hybrid` (ハイブリッド検索): 全文検索とベクトル検索の結果を、それぞれの順位で合わせます (RRF)。スコアは、それぞれの検索での順位 (0 から数える) を r として、1 / (60 + r) を両方の検索で求めて足した値です。片方の検索でヒットしなかったときは、その側の値を 0 とします。
 
-スコアの数値域はモードごとに異なります:
+検索方式によってスコアの意味が違うので、違う検索方式のスコアどうしを比べないでください。
 
-- `fts` — BM25 のスコア (上限なし、値そのものに絶対的な意味はありません)
-- `vector` — `[0, 1]` の cosine 類似度
-- `hybrid` — RRF の合算値 (上限約 `0.033`)
+全文検索の語の切り方は、次のとおりです。
 
-モードを跨いでスコア値を直接比較しないでください。
+- 文章を、日本語の辞書 (IPADIC) で語に切ります。カタカナの複合語は、辞書にある語だけでできていれば、その語に分けます (「モデルキャッシュ」は「モデル」と「キャッシュ」)。
+- 英字と数字が混ざる並びは、英字と数字の切り替わりで分けます (`u32` は `u` と `32`)。英字の語の中の記号も語になります (`C++` の `++`)。
+- 半角と全角のカナや英数字、丸付きの数字などは、同じ文字として扱います。大文字と小文字、アクセント記号の有無、英語の語形の違い (`run` と `running`) は区別しません。日本語の活用の違い (「走る」と「走った」) は区別します。
+- 日本語の助詞、助動詞、接続詞、句読点や括弧などと、英語のよく出る語 (`the`、`a`、`you` など) は、探す語にしません。そのため、否定の「ない」も探す語にせず、「削除しない」は「削除し」と同じに探します。クエリの語が、すべて探す語にしない語のときは、何もヒットしません。
+- 255 バイト以上の語 (UTF-8 で数えます。日本語では、およそ 85 字以上) は、語にしません。
 
-### 出力フォーマット
+### 結果
 
-#### `--format human` (default)
+ヒットを、スコアの高い順に返します。スコアが同じヒットは、collection 名の順、key の順 (どちらも、文字の Unicode のコードポイントの順) に並べ、`--unit chunk` のときは、さらに chunk の番号の小さい順に並べます。
+
+- `--unit document`: ヒットした文書を、件数の上限まで返します。
+- `--unit chunk`: ヒットした chunk を、1 つずつ別のヒットとして、件数の上限まで返します。
+
+スニペットは、ヒットした chunk から抜き出した、60 文字までの文字列です。クエリの語のうち、chunk で最初に現れる語の 30 文字前から抜き出します。どの語も現れなければ、chunk の先頭から抜き出します。改行は空白に置き換え、前か後ろを切ったときは `…` を付けます。
 
 ```
-notes/release.md  score=0.812  chunks=4
-  > リリース手順は以下の通り
-  > 1. バージョン番号を更新する
----
-notes/checklist.md  score=0.751  chunks=1
-  > 公開前チェックリスト
----
-2 doc hits (showing 20 max)
+$ mdya search "リリースの手順"
+1. notes  meetings/2026-11-10.md
+   score 0.0331, chunk 2 of 3
+   ## 次にやること - リリースの手順を見直す。 - 会議室の予約を、来月の分まで取る。 
+
+2. notes  release.md
+   score 0.0331, chunk 0 of 3
+   # リリースの手順 タグを打つ前に、変更履歴を書き、バージョン番号を上げます。 
+
+3. notes  setup.md
+   score 0.0323, chunk 0 of 1
+   # 開発環境の用意 新しい PC で開発を始めるときの手順です。 1. リポジトリを取得します。 2. 必要な道具を…
 ```
 
-抜粋の中の制御文字は、タブを除いて `\u{1b}` のような形で表示します。
+各ヒットの 1 行目は、collection 名と key です。2 行目は、スコアと、スニペットを抜き出した chunk の番号 (0 から数える) と、その文書の chunk の数です。3 行目がスニペットです。
 
-#### `--format json`
-
-機械処理向けエンベロープです。`jq` などで加工できます。
-
-```sh
-mdya search fts "release" --format json | jq '.hits[].path'
-```
-
-エンベロープの構造:
+`--json` を付けたときの形は、次のとおりです (読みやすいように改行を入れています)。
 
 ```json
 {
-  "query": "release",
-  "mode": "fts",
-  "level": "doc",
-  "collections": ["notes"],
+  "query": "リリースの手順",
+  "mode": "hybrid",
+  "unit": "document",
+  "collections": [],
   "limit": 20,
-  "total": 17,
+  "hit_count": 3,
   "hits": [
-    {
-      "collection": "notes",
-      "path": "release.md",
-      "score": 0.812,
-      "snippet": "...",
-      "matched_chunks": 3,
-      "chunk_count": 4
-    }
-  ]
+    {"collection":"notes","key":"meetings/2026-11-10.md","score":0.03306011110544205,"snippet":"## 次にやること - リリースの手順を見直す。 - 会議室の予約を、来月の分まで取る。 ","chunk_index":2,"chunk_count":3},
+    {"collection":"notes","key":"release.md","score":0.03306011110544205,"snippet":"# リリースの手順 タグを打つ前に、変更履歴を書き、バージョン番号を上げます。 ","chunk_index":0,"chunk_count":3},
+    {"collection":"notes","key":"setup.md","score":0.032258063554763794,"snippet":"# 開発環境の用意 新しい PC で開発を始めるときの手順です。 1. リポジトリを取得します。 2. 必要な道具を…","chunk_index":0,"chunk_count":1}
+  ],
+  "warnings": []
 }
 ```
 
-- `level` は hit 粒度です。default の `doc` では文書単位の集約 hit を返し、 hit の `matched_chunks` に文書内で hit したチャンク数が入ります。 `--chunks` を渡すと `level: "chunk"` になり、 hit はチャンク単位で `chunk_sequence` (0-indexed のチャンク番号) を含みます。
-- `chunk_count` は hit した文書のチャンク総数です。どちらの粒度の hit にも入ります。`mdya get --chunk <N> --chunk-end <M>` で周辺や続きを読むときの上限の目安になります。
-- `total` は `hits` 配列の件数 (= `limit` で切り詰めた後) と一致し、`level: "doc"` のときは文書数、`level: "chunk"` のときはチャンク数を表します。
-- ヒットは `score` の降順に並びます。
-- スクリプト用途では必ず終了コードを確認してください。`json` フォーマットでエラーが起きると stdout は空になります (`{"hits":[]}` ではない) ので、stdout の有無だけで成否を判定するとミスリードします。
+- `query`、`mode`、`unit`、`collections`、`limit`: 渡したクエリ、検索方式、`document` か `chunk` か、collection 名、件数の上限です。collection を指定しなかったときは、`collections` は空の配列です。
+- `hit_count`: 返したヒットの数です。
+- 各ヒットの `chunk_index` はスニペットを抜き出した chunk の番号、`chunk_count` はその文書の chunk の数です。`mdya get` で chunk の範囲を指定するのに使えます。
+- `warnings`: 警告の文の配列です。たとえば、設定の埋め込みモデルとインデックスの埋め込みベクトルを作った埋め込みモデルが違うときに入ります ([設定と違う埋め込みモデルで作った埋め込みベクトルがある](errors.md#設定と違う埋め込みモデルで作った埋め込みベクトルがある))。
 
-#### `--format md`
+起こりうるエラー: [クエリが空](errors.md#クエリが空)、[件数の上限が 0](errors.md#件数の上限が-0)、[クエリが、埋め込みモデルのコンテキスト長を超える](errors.md#クエリが埋め込みモデルのコンテキスト長を超える)、[collection がない](errors.md#collection-がない)、[埋め込みモデルを使えない](errors.md#埋め込みモデルを使えない)、[設定と違う埋め込みモデルで作った埋め込みベクトルがある](errors.md#設定と違う埋め込みモデルで作った埋め込みベクトルがある)
 
-Markdown に整形した人間 / agent 向けビューです。複数行 snippet を blockquote で出すので読みやすくなります。LLM のコンテキストに貼り付ける用途にも向きます。抜粋の中の制御文字は、`human` と同じく `\u{1b}` のような形で表示します。
+## 文書を取得する (`mdya get`)
 
-#### `--format xml`
-
-`json` の構造を 1:1 で写した XML です。ただし、XML 1.0 で表せない文字 (タブ・改行・復帰を除く U+0000–001F の制御文字と、U+FFFE / U+FFFF) は、置き換え文字 U+FFFD にします。
-
-### エラー時の動作
-
-`human` 以外のフォーマットで検索に失敗した場合、stdout には何も出さず、stderr に `human` 形式でエラーが出ます。スクリプトからは終了コードで成否を判定してください。
-
----
-
-## `mdya get <collection> <path>`
-
-文書の原文を stdout に出力します。検索ヒットから元の文書を取り出すときに使います。
-
-```sh
-mdya get <collection> <path> [--chunk <N> [--chunk-end <M>]] [-f]
+```
+mdya get <collection 名> <key> [--chunk-index <番号> [--end-chunk-index <番号>]] [--no-size-limit]
 ```
 
-| 引数 | 役割 |
+文書の本文を、手を加えずに stdout に出します。末尾に改行も足しません。返すのはインデックスにある文書の本文で、取り込み元を読み直しません。
+
+| オプション | 意味 |
 |---|---|
-| `<collection>` (必須) | コレクション名 (`config.yml` で宣言済みのもの) |
-| `<path>` (必須) | コレクションルートからの相対パス (アーカイブのコレクションでは、アーカイブ内のパス) |
+| `--chunk-index <番号>` | 文書の本文の全体ではなく、その番号の chunk の範囲の文字を返す |
+| `--end-chunk-index <番号>` | `--chunk-index` の chunk から、この番号の chunk まで (この番号を含む) の範囲の文字を、一続きで返す。`--chunk-index` 以上の番号にする。最後の chunk を超える番号なら、文書の本文の終わりまで返す |
+| `--no-size-limit` | 出力の大きさの上限 ([設定の「文書を取得するときの大きさの上限」](configuration.md#文書を取得するときの大きさの上限)) を外す |
 
-| オプション | 役割 |
-|---|---|
-| `--chunk <N>` | document 全文ではなく、チャンク `N` (0-indexed) にあたる部分の原文だけを出力する |
-| `--chunk-end <M>` | `--chunk <N>` と組み合わせ、チャンク `N` から `M` まで (`M` を含む) を 1 続きの原文として出力する。`M` は `N` 以上。最後のチャンクを超える `M` は文書の末尾までとして扱う |
-| `-f`, `--no-size-limit` | `get.cli_max_bytes` の上限を無視してサイズに関わらず出力する |
+chunk の範囲は、文書の本文を隙間なく覆います。隣り合う chunk の範囲が重なることがあります。範囲を 1 回で指定したときは、重なる文字は 1 度だけ入ります。
 
-例:
+```
+$ mdya get notes release.md --chunk-index 0
+# リリースの手順
 
-```sh
-mdya get notes release.md
-mdya get notes release.md --chunk 3                 # hit したチャンクだけ
-mdya get notes release.md --chunk 2 --chunk-end 4   # その前後も含めて
+タグを打つ前に、変更履歴を書き、バージョン番号を上げます。
+
 ```
 
-ファイルシステムではなく索引内に保存された原文を返します。`mdya update-all` を実行していない / 取り込まれていない文書は取得できません。
+起こりうるエラー: [collection がない](errors.md#collection-がない)、[文書がない](errors.md#文書がない)、[chunk がない](errors.md#chunk-がない)、[chunk の範囲の指定が正しくない](errors.md#chunk-の範囲の指定が正しくない)、[出力が大きすぎる](errors.md#出力が大きすぎる)
 
-`--chunk` で返るのは、そのチャンクにあたる部分の原文です。見出し記号・リンク先・HTML などの書式も元のまま含まれます。チャンクの範囲は文書を隙間なく区切っています。`--chunk 0 --chunk-end <最後>` は文書全体を返し、1 回の範囲指定の中では隣り合うチャンクの間に重複は出ません。ただし、1 つの長いブロック (長い段落・コードブロック、または PDF) を切ったチャンクは前後と少し重なります。別々に取得した結果の境目がそうしたブロックの途中に来ると、つないだときに継ぎ目で少し重複します (1 チャンクずつでも範囲指定でも同じです)。`N` が最後のチャンクを超えるとエラーになります。チャンクの総数は検索結果の `chunk_count` で分かります。
+## インデックスの状態を見る (`mdya status`)
 
-`mdya get` は出力が `get.cli_max_bytes` (default 1 MiB、[`configuration.md` の `cli_max_bytes`](configuration.md#cli_max_bytes) 参照) を超えると既定でエラー停止し、巨大なファイルをうっかり取得して端末を埋め尽くすのを防ぎます。全文取得でも `--chunk` 指定でも同じです。意図的に大きな出力をリダイレクト / パイプするときは `-f` / `--no-size-limit` を渡すとそのまま出力できます。
-
-索引が古い形式のまま (チャンクの範囲を記録する前の mdya で作ったもの) だと、`--chunk` 指定はエラーになり、作り直しのコマンドを案内します。全文取得はそのまま使えます。作り直しは [`mdya vector use`](#索引の形式が古い場合) で行います。
-
----
-
-## `mdya status`
-
-索引の状態を表示します。
-
-```sh
-mdya status [--format <FORMAT>]
+```
+mdya status [--json]
 ```
 
-| オプション | 役割 | default |
+```
+$ mdya status
+version: mdya X.Y.Z
+configured embedding model: cl-nagoya/ruri-v3-30m (256 dimensions)
+index embedding model: cl-nagoya/ruri-v3-30m (256 dimensions, the configured one)
+  chunks with embeddings: 7 (0 truncated)
+chunks without embeddings: 0
+collections: 1
+documents: 3
+chunks: 7
+```
+
+- `configured embedding model`: 設定の埋め込みモデルと、それが作る埋め込みベクトルの次元です。
+- `index embedding model`: インデックスの埋め込みベクトルを作った埋め込みモデルと、それが設定の埋め込みモデルと同じかです。その下の行は、その埋め込みモデルで作った埋め込みベクトルを持つ chunk の数と、そのうち埋め込みベクトルが chunk の全体を表していない chunk の数 (`truncated`。[埋め込みモデルのコンテキスト長を超える chunk がある](errors.md#埋め込みモデルのコンテキスト長を超える-chunk-がある)) です。インデックスに chunk がないときは、`index embedding model: none` と出ます。
+- `chunks without embeddings`: 埋め込みベクトルを持たない chunk の数です。
+- `collections`、`documents`、`chunks`: インデックス全体の collection、文書、chunk の数です。
+
+`--json` を付けたときの形は、次のとおりです。
+
+```json
+{"version":"X.Y.Z","configured_embedding_model":"cl-nagoya/ruri-v3-30m","configured_embedding_dimension":256,"index_embedding_models":[{"model":"cl-nagoya/ruri-v3-30m","dimension":256,"configured":true,"chunk_count":7,"truncated_chunk_count":0}],"chunks_without_embedding_count":0,"collection_count":1,"document_count":3,"chunk_count":7,"warnings":[]}
+```
+
+`configured_embedding_dimension` と `configured` は、設定の埋め込みモデルを使えずに次元を確かめられなかったときは `null` です。そのときは、理由を `warnings` に入れます ([埋め込みモデルを使えない](errors.md#埋め込みモデルを使えない))。エラーにはしません。
+
+## 設定を見る (`mdya config list`)
+
+```
+mdya config list [--json]
+```
+
+設定の名前と、今の値を返します。変えていない設定は、既定の値を返します。各設定の意味は、[設定](configuration.md) にあります。
+
+```
+$ mdya config list
+mcp.show_version = true
+embedding.model = cl-nagoya/ruri-v3-30m
+embedding.ollama_endpoint = http://127.0.0.1:11434
+resources.memory_limit_mb = 8192
+resources.embedding_parallelism = 8
+get.cli_limit_bytes = 1048576
+get.mcp_limit_bytes = 1048576
+```
+
+`--json` を付けると、設定の名前を項目の名前にした JSON のオブジェクトで返します。
+
+```json
+{"mcp.show_version":true,"embedding.model":"cl-nagoya/ruri-v3-30m","embedding.ollama_endpoint":"http://127.0.0.1:11434","resources.memory_limit_mb":8192,"resources.embedding_parallelism":8,"get.cli_limit_bytes":1048576,"get.mcp_limit_bytes":1048576}
+```
+
+## 設定を変える (`mdya config set`、`mdya config reset`)
+
+```
+mdya config set <設定の名前> <値>
+mdya config reset <設定の名前>
+```
+
+`mdya config set` は設定を 1 つ変え、`mdya config reset` は既定の値に戻します。設定の名前と、受け付ける値は、[設定](configuration.md) にあります。設定のファイルを直接書き換えないでください。直接書き換えたときの動作は、約束していません。
+
+```
+$ mdya config set resources.embedding_parallelism 4
+Changed resources.embedding_parallelism from 8 to 4.
+$ mdya config reset resources.embedding_parallelism
+Changed resources.embedding_parallelism from 4 to 8.
+```
+
+埋め込みモデルを変えたときは、インデックスの埋め込みベクトルを作った埋め込みモデルが変えたあとの設定と違えば、そのことを伝えます。`mdya embedding rebuild` で作り直すまで、ベクトル検索は何もヒットせず、`mdya update` と `mdya put` はエラーになります ([設定の「埋め込みモデルを変える」](configuration.md#埋め込みモデルを変える))。
+
+```
+$ mdya config set embedding.model sentence-transformers/all-MiniLM-L6-v2
+Changed embedding.model from cl-nagoya/ruri-v3-30m to sentence-transformers/all-MiniLM-L6-v2.
+The index's embeddings were made with another model (cl-nagoya/ruri-v3-30m).
+Until you run mdya embedding rebuild, vector search finds nothing, and update and put fail.
+```
+
+変えたあとの埋め込みモデルの名前が、インデックスの埋め込みベクトルを作った埋め込みモデルと同じで、そのモデルを使えずに次元を確かめられないときは、エラーにせず設定を変えます。インデックスの埋め込みベクトルが、変えたあとの埋め込みモデルで作ったものかがわからないことと、その理由を伝えます ([埋め込みモデルを使えない](errors.md#埋め込みモデルを使えない))。
+
+動いている MCP のサーバーには、サーバーを始め直したときに効きます。
+
+起こりうるエラー: [設定の名前がない](errors.md#設定の名前がない)、[設定の値が正しくない](errors.md#設定の値が正しくない)
+
+## 埋め込みベクトルを作り直す (`mdya embedding rebuild`)
+
+```
+mdya embedding rebuild [--force] [--no-optimize]
+```
+
+インデックスの埋め込みベクトルを、設定の埋め込みモデルで作り直します。取り込み元は読まず、文書の本文と chunk は変えません。
+
+- インデックスの埋め込みベクトルを作った埋め込みモデルが、設定と同じときは、何もしません。
+- `--force` を付けると、同じときも作り直します。Ollama のモデルを、同じ名前のまま、埋め込みベクトルの次元も同じモデルに取り替えたときに使います。mdya は、埋め込みモデルを、名前と、埋め込みベクトルの次元で区別するので、取り替えたことを見分けられないためです。次元の違うモデルに取り替えたときは、`--force` がなくても作り直します。
+- 作り直しているあいだは、前の埋め込みベクトルを残し、すべての chunk を作り直し終えたときに、新しい埋め込みベクトルに切り替えます。埋め込みモデルを変えたあとの作り直しでは、前の埋め込みベクトルは設定と違うので、CLI の検索と、設定を変えたあとに始めた MCP のサーバーでは、切り替えるまで、ベクトル検索は何もヒットしません。設定を変える前に始めた MCP のサーバーは、サーバーを始めたときの設定で比べるので、切り替えるまではヒットし、切り替えたあとはヒットしなくなります ([MCP のサーバーの「設定を変えたとき」](mcp.md#設定を変えたとき))。`--force` で同じ埋め込みモデルのまま作り直すときは、切り替えるまで、前の埋め込みベクトルで検索します。
+- 途中で止めたときは、作りかけの埋め込みベクトルを検索に使いません。同じコマンドをもう一度流すと、作り直しを終えます。
+
+```
+$ mdya embedding rebuild
+Rebuilt the embeddings of 15 chunks.
+$ mdya embedding rebuild
+Nothing was rebuilt: the embeddings were already made with the configured model.
+```
+
+起こりうるエラー: [埋め込みモデルを使えない](errors.md#埋め込みモデルを使えない)、[埋め込みモデルのコンテキスト長を超える chunk がある](errors.md#埋め込みモデルのコンテキスト長を超える-chunk-がある)
+
+## インデックスを保守する (`mdya optimize`)
+
+```
+mdya optimize
+```
+
+インデックスは、書き込むたびに、書き込む前の状態を残し、ファイルも細かく増えます。保守では、細かいファイルをまとめて検索を速く保ち、書き込む前の状態のうち、作ってから 7 日より前のものを消して、ディスクの使用量を抑えます。
+
+次のコマンドも、既定で、最後に保守します。`--no-optimize` を付けると、保守しません。そのときは、あとで `mdya optimize` で保守できます。
+
+- `mdya collection remove`
+- `mdya update`
+- `mdya put`
+- `mdya remove`
+- `mdya embedding rebuild`
+
+```
+$ mdya optimize
+Maintained the index.
+```
+
+7 日より長く書き込みのなかったインデックスを保守すると、別のプロセス (MCP のサーバーなど) で、保守の前に始めた検索が、エラー ([インデックスや設定を読めない](errors.md#インデックスや設定を読めない)) になることがあります。もう一度検索すれば、読めます。`--no-optimize` を付けた書き込みでは、保守に時間がかからず、このエラーも起きません。
+
+書き込みのコマンドの最後の保守に失敗したときは、コマンドを終えたままにし、保守に失敗したことを警告として出します。終了コードは、保守の失敗では変わりません。`mdya optimize` で保守に失敗したときは、エラーで終わります ([インデックスや設定に書き込めない](errors.md#インデックスや設定に書き込めない))。
+
+## MCP のサーバーを始める (`mdya mcp`)
+
+```
+mdya mcp [--http] [--address <アドレス>]
+```
+
+AI アシスタントなどの MCP のクライアントから使う MCP のサーバーを始めます。使い方は、[MCP のサーバー](mcp.md) にあります。
+
+| オプション | 意味 | 既定 |
 |---|---|---|
-| `--format <FORMAT>` | 出力形式 (`human` / `json` / `md` / `xml`) | `human` |
+| `--http` | stdio ではなく、HTTP で待ち受ける | stdio |
+| `--address <アドレス>` | HTTP で待ち受けるアドレス。`<ホスト>:<番号>` の形。IPv6 のアドレスは `[ ]` で囲む | `127.0.0.1:8000` |
 
-返される情報:
+起こりうるエラー: [待ち受けるアドレスを使えない](errors.md#待ち受けるアドレスを使えない)、[MCP のクライアントとのやりとりを始められない](errors.md#mcp-のクライアントとのやりとりを始められない)
 
-- `version` — mdya のバージョン
-- `embedding_model` — 索引に埋め込んだモデル ID
-- `vector_dim` — ベクトル次元数
-- `collections` — 登録済みコレクション数
-- `chunks` — 索引内のチャンク総数
-- `sources` — 索引内の文書総数
-
-`mdya init` 済みであることを前提とします。初期化されていなければエラーになります。
-
-```sh
-$ mdya status --format json
-{
-  "version": "0.0.0",
-  "embedding_model": "cl-nagoya/ruri-v3-30m",
-  "vector_dim": 256,
-  "collections": 3,
-  "chunks": 12043,
-  "sources": 312
-}
-```
-
----
-
-## `mdya vector use <model>`
-
-埋め込みモデルを切り替えます。**破壊的な操作**です。
-
-```sh
-mdya vector use <model> [--yes]
-```
-
-| 引数 / オプション | 役割 |
-|---|---|
-| `<model>` (必須) | 新しいモデル ID。例: `cl-nagoya/ruri-v3-30m` / `ollama:nomic-embed-text` |
-| `-y, --yes` | 確認プロンプトをスキップ (非対話 stdin では必須) |
-
-### 何が起きるか
-
-1. `config.yml` の `embedding.model` を新しいモデルに書き換え
-2. 索引内のベクトルテーブルを削除
-3. 登録済みコレクションを全部スキャンし、新しいモデルで再度埋め込み計算 (`update-all` と同じ走査なので、`.gitignore` の除外が効きます)。進捗は `update-all` と同じように表示します ([進捗の表示](#進捗の表示) 参照)
-
-文書本文の索引 (`mdya get` で取れる原文) はモデル非依存なので残ります。再計算が走るのはベクトル部分だけです。
-
-### 確認プロンプト
-
-対話端末では切り替え内容を表示してから `[y/N]` で確認します。`y` または `yes` を入力すると進みます。それ以外 (空入力含む) は中止します。
+## mdya のバージョンを見る (`mdya --version`)
 
 ```
-This will switch the embedding model:
-  cl-nagoya/ruri-v3-30m -> ollama:nomic-embed-text (dim 768)
-The chunks index will be DROPPED and 3 collection(s) re-embedded from scratch.
-Proceed? [y/N]:
+$ mdya --version
+mdya X.Y.Z
 ```
 
-スクリプトなど非対話 stdin で実行する場合は `--yes` を付けてください。`--yes` なしの非対話実行は安全のため拒否します。
+## ヘルプを見る (`--help`、`-h`)
 
-### 完了サマリ
+どのコマンドにも、`--help` か `-h` を付けられます。`mdya --help` はコマンドの一覧を、`mdya collection --help` は `collection` の下のコマンドの一覧を、`mdya collection add --help` は、そのコマンドの引数とその説明を、stdout に出します。
 
-終わると stderr に次のような 1 行を出します。stdout には何も出しません。
+`--help` があるときは、ほかの引数を確かめずにヘルプを出します (`mdya search --help` はクエリがなくてもヘルプを出します)。コマンドの名前が正しくないとき (`mdya nosuchcmd --help`) は、引数の使い方のエラー (終了コード 2) です。
 
-```
-Switched embedding model to 'ollama:nomic-embed-text'. Re-embedded 312 document(s) (removed: 0, failed: 0).
-```
-
-`failed > 0` の場合は終了コード `1` を返します。残りは `mdya update-all` の通常実行で再開できます。
-
-アーカイブを読めないコレクションがあった場合も、終了コード `1` を返します。そのコレクションの文書は再度の埋め込み計算がされないので、検索には当たらなくなります (`--chunk` を付けない `mdya get` で取れる原文は残ります)。アーカイブを読めるようにしてから `mdya update-all` を実行すると戻ります。
-
-### 索引の形式が古い場合
-
-チャンクの範囲を記録する前の mdya で作った索引は、`mdya update-all` / `mdya search` / `mdya get --chunk` がエラーで停止し、次のコマンドを案内します。
-
-```sh
-mdya vector use <現在のモデル>
-```
-
-モデルを変えずに、索引のベクトルテーブルを作り直して全文書を再取り込みします。`config.yml` のモデル指定は変わりません。切り替えのときと同じく確認プロンプトが出ます。表示は次のようになります。
-
-```
-This will rebuild the index for 'cl-nagoya/ruri-v3-30m' (dim 256).
-The chunks index will be DROPPED and 3 collection(s) re-embedded from scratch.
-Proceed? [y/N]:
-```
-
-完了すると `Rebuilt the index for 'cl-nagoya/ruri-v3-30m'. Re-embedded 312 document(s) (removed: 0, failed: 0).` と表示します。モデルも索引も現在の形式のまま一致しているときは、何もせずに終わります。
-
-`mdya mcp` を起動したまま作り直した場合は、作り直した後に `mdya mcp` を再起動してください。起動中のサーバは、起動時に読んだ索引の形式を使い続けます。
-
-### Ollama を使う場合
-
-`ollama:<model>` 形式を指定すると、Ollama の埋め込み API を使います。事前に Ollama を起動し、対象モデルを `ollama pull <model>` などで用意しておいてください。
-
-### gated モデルを使う場合
-
-gated な `google/embeddinggemma-300m` に切り替えるには、事前に Hugging Face でのライセンス同意とログインが必要です ([`configuration.md` の `embedding`](configuration.md#embedding) を参照)。
-
----
-
-## `mdya mcp`
-
-MCP (Model Context Protocol) サーバを起動します。Claude Code 等のクライアントから検索ツールを呼び出せるようになります。
-
-詳細は [`mcp.md`](mcp.md) を参照してください。
-
-```sh
-mdya mcp              # stdio で起動 (default)
-mdya mcp --http       # HTTP で起動 (foreground daemon)
-mdya mcp --http --addr 127.0.0.1:9000  # bind address を指定
-```
-
----
-
-## `mdya version`
-
-mdya のバージョンを 1 行で表示します。
-
-```sh
-$ mdya version
-mdya v0.0.0
-```
-
-スクリプトや MCP クライアントから安定して読み取れる出力面として用意されています。
+引数のない `mdya` と、下のコマンドが足りないとき (`mdya collection`) は、ヘルプを出さず、引数の使い方のエラー (終了コード 2) になります。

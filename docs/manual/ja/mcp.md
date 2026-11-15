@@ -1,163 +1,134 @@
-# MCP サーバ連携
+# MCP のサーバー
 
-mdya は MCP (Model Context Protocol) サーバとして起動でき、Claude Code / Claude Desktop などの MCP クライアントから検索ツールを呼び出せます。
+`mdya mcp` は、MCP のサーバーとして動き、AI アシスタント (Claude Code など) から、mdya の文書を検索できるようにします。
 
-## 起動方法
+## MCP でできることと、できないこと
 
-```sh
-mdya mcp                                  # stdio (default)
-mdya mcp --http                           # HTTP (foreground daemon)
-mdya mcp --http --addr 127.0.0.1:9000     # bind address を指定
+MCP のツールは、次の 4 つです。どれも読み取りだけで、mdya の中身を変えるものはありません。
+
+| ツール | すること |
+|---|---|
+| `list_collections` | collection の一覧を見る |
+| `search` | 検索する |
+| `get_document` | 文書を取得する |
+| `get_version` | mdya のバージョンを見る |
+
+collection を作る、取り込む、文書を削除する、設定を変える、といった操作は、MCP ではできません。CLI のコマンドで行ってください ([コマンド](commands.md))。MCP のサーバーを動かしたまま CLI で取り込んだ文書は、サーバーを始め直さなくても、次の呼び出しから検索できます。
+
+## 始め方
+
+| 動かし方 | 始め方 |
+|---|---|
+| stdio | MCP のクライアントが `mdya mcp` を起動し、標準入力と標準出力でやりとりする |
+| HTTP | 利用者が `mdya mcp --http` を動かしておき、MCP のクライアントが HTTP でつなぐ |
+
+stdio では、標準出力を MCP のやりとりだけに使います。ログは stderr に出ます。
+
+HTTP では、パス `/mcp` で待ち受けます。待ち受けるアドレスの既定は `127.0.0.1:8000` で、`--address` で変えられます。始めると、待ち受け先を stderr に出します。
+
+```
+$ mdya mcp --http --address 127.0.0.1:18765
+Listening on http://127.0.0.1:18765/mcp
 ```
 
-| モード | 用途 | 備考 |
+HTTP のサーバーは、mdya を動かしている PC の中から使うものです。ループバック以外のホスト名に宛てた要求は断ります。`Origin` のヘッダーがある要求は、そのスキームが `http` か `https` で、ホストがループバックのときだけ受け付け、それ以外は HTTP の 403 で断ります。`Origin` のヘッダーがない要求は、受け付けます。PC の外のサイトのページから、ブラウザが mdya に送る要求を受け付けないためです。
+
+## AI アシスタントに登録する
+
+### Claude Code
+
+stdio で登録するときは、次のとおりです。
+
+```
+claude mcp add --transport stdio mdya -- mdya mcp
+```
+
+既定のほかの設定とインデックスのディレクトリを使うときは、`mcp` の前に `--data-dir` を書きます。
+
+```
+claude mcp add --transport stdio mdya -- mdya --data-dir /Users/me/work-mdya mcp
+```
+
+HTTP のサーバーを動かしておき、そこにつなぐときは、次のとおりです。
+
+```
+claude mcp add --transport http mdya http://127.0.0.1:8000/mcp
+```
+
+### ほかの MCP のクライアント
+
+stdio では、起動するコマンドを `mdya`、引数を `mcp` にします。`--data-dir` などの全体のオプションは、`mcp` の前の引数に入れます。HTTP では、接続先を `http://127.0.0.1:8000/mcp` (`--address` を変えたときは、そのアドレス) にします。
+
+## ツール
+
+各ツールは、結果の構造を表す出力の schema を、ツールの定義の中で示します。成功したときは、その schema に合う構造で返します。
+
+### `list_collections`
+
+入力はありません。結果は、`mdya collection list --json` と同じ構造です ([コマンドの「collection の一覧を見る」](commands.md#collection-の一覧を見る-mdya-collection-list))。collection の説明は、どの collection を探すかを決めるのに使えます。
+
+### `search`
+
+| 入力 | 意味 | 省略したとき |
 |---|---|---|
-| stdio (default) | エディタ統合 (Claude Code 等) | stdout は MCP プロトコル専用、ログは stderr へ |
-| `--http` | バックグラウンド常駐 | foreground プロセス。シェル側で `&` / `nohup` / systemd 等で背景化 |
+| `query` | 探すもの。空白だけのものは受け付けない | 省略できない |
+| `mode` | `fts`、`vector`、`hybrid` のどれか | `hybrid` |
+| `collections` | 探す collection の名前の配列 | すべての collection (空の配列も同じ) |
+| `limit` | 返すヒットの数の上限。1 以上 9007199254740991 以下 | 20 |
+| `unit` | `document` か `chunk` | `document` |
 
-`--http` の bind address は default が `127.0.0.1:8000` (loopback) です。リモート公開は想定外で、loopback 以外の Host ヘッダはサーバが拒否します。
+結果は、`mdya search --json` と同じ構造です ([コマンドの「検索する」](commands.md#検索する-mdya-search))。各ヒットの `collection`、`key`、`chunk_index` を、`get_document` に渡して、文書を読めます。
 
-`--http` daemon は設定ディレクトリ単位で 1 つだけ起動できます (`~/.mdya/mcp.pid` を排他ロックで保持)。2 つ目を起動しようとすると拒否されます。
+### `get_document`
 
-stdio モードはエディタ統合用の設計です。クライアント側でプロセス管理する前提で動きます。
+| 入力 | 意味 | 省略したとき |
+|---|---|---|
+| `collection` | collection 名 | 省略できない |
+| `key` | 文書の key | 省略できない |
+| `chunk_index` | 始まりの chunk の番号 | 文書の本文の全体を返す |
+| `end_chunk_index` | 終わりの chunk の番号 (この番号を含む)。`chunk_index` 以上にする。最後の chunk を超えるなら、文書の本文の終わりまで返す | `chunk_index` の chunk だけを返す |
 
-## Claude Code への登録
-
-```sh
-claude mcp add mdya -- mdya mcp
-```
-
-これで `mdya` という名前で MCP サーバが登録され、ツールが利用可能になります。
-
-## 提供ツール
-
-mdya MCP サーバは次のツールを提供します。
-
-### 検索ツール
-
-| ツール名 | 内容 |
-|---|---|
-| `search` | Markdown コレクションの検索。`mode` でバックエンド (BM25 / ベクトル / ハイブリッド) を選択 |
-
-入力スキーマ:
+結果は、`collection`、`key`、`text` (返す文字) を持ちます。返す文字が、MCP の上限 (`get.mcp_limit_bytes`、既定は 1 MiB。[設定](configuration.md#文書を取得するときの大きさの上限)) を超えるときは、エラーになります。chunk の範囲を指定して、分けて取得してください。
 
 ```json
-{
-  "query": "リリース手順",
-  "mode": "hybrid",
-  "k": 20,
-  "collections": ["notes"],
-  "level": "doc"
-}
+{"collection":"notes","key":"release.md","text":"# リリースの手順\n\nタグを打つ前に、変更履歴を書き、バージョン番号を上げます。\n\n"}
 ```
 
-- `query` (必須) — 検索クエリ文字列。空文字列 / 空白のみはエラー。
-- `mode` (任意、default `"hybrid"`) — 検索バックエンド。`"fts"` (BM25 の語句一致)、`"vector"` (cosine の意味検索)、`"hybrid"` (両者を RRF で統合)。
-- `k` (任意、default `20`) — 上位 N 件。`0` はエラー。
-- `collections` (任意) — コレクション名で絞り込み。省略 / 空配列で全コレクション対象。未知のコレクション名はエラー。
-- `level` (任意、default `"doc"`) — hit 粒度。`"doc"` は文書単位の集約 hit、`"chunk"` はチャンク単位の hit。
+### `get_version`
 
-出力は CLI の `--format json` と同じエンベロープです。
+入力はありません。結果は `{"version":"mdya X.Y.Z"}` の形です。MCP のサーバーとして動いている mdya のバージョンを返します。
+
+#### バージョンを示さない
+
+`mdya config set mcp.show_version false` にすると、MCP で mdya のバージョンを示しません。`get_version` の結果は `{"version":"mdya"}` になり、MCP の初期化のときに返すサーバーの情報の `version` も `mdya` になります。CLI の `mdya --version` と `mdya status` には効きません。
+
+## エラー
+
+ツールのエラーは、MCP のツールの実行のエラー (`isError: true`) として返します。中身は、次の形の JSON のオブジェクトです。同じ中身を、文字としても添えます。
 
 ```json
-{
-  "query": "リリース手順",
-  "mode": "fts",
-  "level": "doc",
-  "collections": ["notes"],
-  "limit": 20,
-  "total": 17,
-  "hits": [
-    {
-      "collection": "notes",
-      "path": "release.md",
-      "score": 0.812,
-      "snippet": "...",
-      "matched_chunks": 3,
-      "chunk_count": 4
-    }
-  ]
-}
+{"code":"collection_not_found","message":"Error: the collection \"nosuch\" does not exist\n\nHow to fix:\n    Check the collection name in the list of collections (mdya collection list, or the list_collections tool).","details":{"collection":"nosuch"}}
 ```
 
-`level: "doc"` (default) では文書単位の集約 hit が返り、 hit の `matched_chunks` に文書内で hit したチャンク数が入ります。 入力で `level: "chunk"` を渡すとチャンク単位の hit が返り、 hit に `chunk_sequence` (0-indexed のチャンク番号) が入ります。 どちらの粒度でも、 hit の `chunk_count` にその文書のチャンク総数が入ります。
+- `code`: エラーの種類です。下の表のどれかです。知らない `code` は、`internal` と同じに扱ってください。
+- `message`: CLI で同じエラーが起きたときに stderr に出すのと同じ説明 (エラーメッセージ、原因、直し方) です。
+- `details`: 入力を直して呼び直すのに使う情報です。
 
-スコアの数値域は mode ごとに異なります ([commands.md の 3 モードの違い](commands.md#3-モードの違い) を参照)。
+| `code` | 当たるエラー | `details` |
+|---|---|---|
+| `invalid_input` | [クエリが空](errors.md#クエリが空)、[件数の上限が 0](errors.md#件数の上限が-0)、[chunk がない](errors.md#chunk-がない)、[chunk の範囲の指定が正しくない](errors.md#chunk-の範囲の指定が正しくない)、[クエリが、埋め込みモデルのコンテキスト長を超える](errors.md#クエリが埋め込みモデルのコンテキスト長を超える)、入力の値が入力の schema に合わない (知らない検索方式、必須の入力がない、など) | `input`: 正しくない入力の名前 |
+| `collection_not_found` | [collection がない](errors.md#collection-がない) | `collection`: collection 名 |
+| `document_not_found` | [文書がない](errors.md#文書がない) | `collection`: collection 名、`key`: key |
+| `output_too_large` | [出力が大きすぎる](errors.md#出力が大きすぎる) | `size_bytes`: 返すものの大きさ、`limit_bytes`: MCP の上限 |
+| `embedding_model_unavailable` | [埋め込みモデルを使えない](errors.md#埋め込みモデルを使えない) | なし (空のオブジェクト) |
+| `internal` | [インデックスや設定を読めない](errors.md#インデックスや設定を読めない)、[想定外の失敗](errors.md#想定外の失敗) | なし (空のオブジェクト) |
 
-### 文書取得ツール
+## 設定を変えたとき
 
-| ツール名 | 内容 |
-|---|---|
-| `get_document` | 1 つの文書の原文を取得 |
+MCP のサーバーは、サーバーを始めたときの設定を使い続けます。`mdya config set` で変えた設定は、サーバーを始め直したときに効きます。
 
-入力:
+埋め込みモデルの設定を変えたときは、サーバーを始め直してください。始め直さないと、サーバーは前の埋め込みモデルでクエリの埋め込みベクトルを作り、CLI で埋め込みベクトルを作り直したあとは、ベクトル検索で何もヒットしなくなります ([設定と違う埋め込みモデルで作った埋め込みベクトルがある](errors.md#設定と違う埋め込みモデルで作った埋め込みベクトルがある))。
 
-```json
-{
-  "collection": "notes",
-  "path": "release.md"
-}
-```
+## ログ
 
-出力:
-
-```json
-{
-  "collection": "notes",
-  "path": "release.md",
-  "content": "..."
-}
-```
-
-- `collection` (必須) — コレクション名 (`config.yml` で宣言済みのもの)。
-- `path` (必須) — コレクションルートからの相対パス (アーカイブのコレクションでは、アーカイブ内のパス)。
-- `chunk` (任意) — 0-indexed の `chunk_sequence`。指定すると document 全文ではなく、そのチャンクにあたる部分の原文を返します。省略時は忠実な全文を返します。
-- `chunk_end` (任意) — `chunk` と組み合わせ、チャンク `chunk` から `chunk_end` まで (`chunk_end` を含む) を 1 続きの原文として返します。`chunk` 以上の値を指定します。最後のチャンクを超える値は文書の末尾までとして扱います。
-
-検索ヒットの `collection` と `path` をそのまま渡せば原文が取れます。hit の `chunk_sequence` を `chunk` に渡せばそのチャンクだけを取得できます。前後も含めて読むときは、`chunk` に hit より小さい番号、`chunk_end` に大きい番号を渡します。チャンクにあたる部分の原文には、見出し記号・リンク先・HTML などの書式も元のまま含まれます。チャンクの範囲は文書を隙間なく区切っているので、1 回の範囲指定の中では隣り合うチャンクの間に重複は出ません。ただし、1 つの長いブロック (長い段落・コードブロック、または PDF) を切ったチャンクは前後と少し重なるので、別々に取得した結果の境目がそうしたブロックの途中に来ると、つないだときに継ぎ目で少し重複します。
-
-全文が `get.mcp_max_bytes` を超える文書も、多くの場合は `chunk` / `chunk_end` で上限に収まる範囲ずつ読み進められます。本文に文字を持たない大きな内容 (巨大な HTML ブロックなど) を含み、1 チャンクの範囲だけで上限を超える部分は読めません。チャンクの総数は検索 hit の `chunk_count` で分かります。
-
-### 索引情報ツール
-
-| ツール名 | 内容 |
-|---|---|
-| `list_collections` | 登録済みコレクションの一覧 |
-
-入力は不要です。出力は CLI の `mdya collection list --format json` と同じ shape です ([commands.md](commands.md) を参照)。
-
-## エラー時の動作
-
-ツール呼び出しが失敗すると、構造化されたエラーが返ります。
-
-```json
-{
-  "code": "unknown_collection",
-  "message": "unknown collection: 'foo'",
-  "details": { "collection": "foo" }
-}
-```
-
-| `code` | 発生条件 |
-|---|---|
-| `empty_query` | `query` が空文字列 / 空白のみ |
-| `invalid_limit` | `k` が `0` |
-| `unknown_collection` | 未知のコレクション名を指定 |
-| `not_found` | `get_document` で該当文書が無い、または指定した `chunk` が範囲外 |
-| `invalid_chunk_range` | `get_document` で `chunk` なしに `chunk_end` を指定した、または `chunk_end` が `chunk` より小さい |
-| `payload_too_large` | `get_document` の応答 (全文、または `chunk` / `chunk_end` の範囲) が `get.mcp_max_bytes` を超過。`details` に `size_bytes` / `limit_bytes` が入る。`chunk` / `chunk_end` の範囲を狭めて絞り込める |
-| `index_outdated` | 索引がチャンクの範囲を記録する前の mdya で作られている。`search` と、`chunk` を指定した `get_document` で返る。`details.embedding_model` のモデル名で `mdya vector use <model>` を実行すると作り直せる。全文の `get_document` はそのまま使える。作り直した後は MCP サーバを再起動する |
-| `schema_metadata_missing` | 索引が未初期化 / 壊れている |
-| `internal` | I/O / 埋め込み / 設定読み込み等の障害 |
-
-クライアントは `code` を見て挙動を分けられます。`details` はコードに応じて追加情報を含みます。
-
-## ログ出力
-
-`mdya mcp` のログはすべて stderr に出ます。stdio モードでは stdout が MCP プロトコルチャネルとして占有されているため、ログを stdout に混ぜるとプロトコルが壊れます。
-
-`--http` daemon を背景常駐させてログをファイルに残したい場合はシェルでリダイレクトしてください。
-
-```sh
-nohup mdya mcp --http > ~/.mdya/mcp.log 2>&1 &
-```
+MCP のサーバーのログは、stderr に出ます。ログをファイルに残したいときは、シェルで stderr をファイルに振り向けてください ([設定の「ログと色」](configuration.md#ログと色))。
