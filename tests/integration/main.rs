@@ -8,6 +8,8 @@ mod common;
 mod concurrent_operations;
 mod index_and_settings;
 mod ingest_operations;
+mod interruption;
 mod mcp_server;
+mod memory_limit;
 mod query_operations;
 mod shared_parts;
