@@ -1,16 +1,31 @@
-# mdya user manual
+# mdya manual
 
-mdya indexes local Markdown collections and returns search results over a CLI and an MCP server. It offers three search modes: BM25 full-text search, on-device vector search, and a hybrid that fuses both.
+*English / [日本語](../ja/README.md)*
 
-This manual is a reference for **people who use mdya**. Installation and the shortest path to a working setup are covered in the [README](../../../README.md). The pages here go deeper into the configuration file and the individual subcommands.
+This is the manual to read after you start using mdya. Installation and the first steps are in the repository's [README](../../../README.md).
 
-## Table of contents
+## Contents
 
-- [Configuration](configuration.md) — every option in `~/.mdya/config.yml`, the directory layout, and how to relocate the configuration directory.
-- [Command reference](commands.md) — arguments, options, and output for each subcommand.
-- [MCP server](mcp.md) — how to run `mdya mcp`, which tools it exposes, and how to register it with Claude Code and similar clients.
+- [Collections and collection types](collections.md): Where mdya ingests documents from, and which items become documents. The differences between directory, archive, and raw.
+- [Commands](commands.md): How to write each CLI command, and its output and exit codes.
+- [Settings](configuration.md): The names and values of the settings, directories, the embedding model, memory and parallelism, and logs.
+- [The MCP server](mcp.md): How to register it with an AI assistant, and the MCP tools.
+- [Errors and how to fix them](errors.md): Look up what happened and how to fix it from the exit code and the error message.
 
-## Not covered here
+When mdya ends with an error, open [Errors and how to fix them](errors.md) and search it for words from the error message.
 
-- Installation and quick start → [README](../../../README.md)
-- License → [`LICENSE-MIT`](../../../LICENSE-MIT) / [`LICENSE-APACHE`](../../../LICENSE-APACHE)
+## Terms
+
+These are the terms used in this manual.
+
+- collection: Something you create and name, and put documents in. Every document in mdya is in one of the collections.
+- collection type: Where a collection gets the content of its documents from. There are three: directory, archive, and raw ([Collections and collection types](collections.md)).
+- document: The unit for searching and getting. It is not always a file. The file type of a document is Markdown or PDF.
+- key: The name that tells documents apart within a collection. In a directory collection, it is the path relative to the directory.
+- body: The whole text of a document, taken from the document content. For Markdown, it is the document content itself; for PDF, it is the text extracted from the PDF.
+- chunk: One of the pieces a document's body is divided into. Chunks are numbered from 0, in order from the start of the body.
+- source: Where document content comes from. It is a directory, an archive file, or document content that you pass in.
+- ingest: To read documents from a source and make them searchable.
+- update: To read the current contents of a source and make the collection's documents match those contents.
+- index: Everything mdya keeps for searching.
+- embedding model: A model that represents the meaning of text as lists of numbers that can be used for search (embeddings). Vector search and hybrid search use it.

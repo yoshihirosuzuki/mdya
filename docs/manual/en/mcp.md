@@ -1,163 +1,134 @@
-# MCP server
+# The MCP server
 
-mdya can run as an MCP (Model Context Protocol) server. MCP clients such as Claude Code or Claude Desktop can then call its search tools.
+`mdya mcp` runs as an MCP server and lets an AI assistant (such as Claude Code) search the documents in mdya.
 
-## Launching
+## What MCP can and cannot do
 
-```sh
-mdya mcp                                  # stdio (default)
-mdya mcp --http                           # HTTP (foreground daemon)
-mdya mcp --http --addr 127.0.0.1:9000     # specify the bind address
+There are four MCP tools, listed below. All of them only read, and none of them changes anything in mdya.
+
+| Tool | What it does |
+|---|---|
+| `list_collections` | List the collections |
+| `search` | Search |
+| `get_document` | Get a document |
+| `get_version` | Show the mdya version |
+
+Operations such as adding a collection, ingesting, removing a document, and changing settings cannot be done through MCP. Use the CLI commands for them ([Commands](commands.md)). Documents ingested with the CLI while the MCP server is running can be searched from the next call on, without restarting the server.
+
+## Starting the server
+
+| How it runs | How it is started |
+|---|---|
+| stdio | The MCP client starts `mdya mcp` and talks with it over standard input and standard output |
+| HTTP | You keep `mdya mcp --http` running, and the MCP client connects to it over HTTP |
+
+With stdio, standard output is used only for MCP communication. Logs go to stderr.
+
+With HTTP, the server listens on the path `/mcp`. The address to listen on is `127.0.0.1:8000` by default, and you can change it with `--address`. When the server starts, it writes where it is listening to stderr.
+
+```
+$ mdya mcp --http --address 127.0.0.1:18765
+Listening on http://127.0.0.1:18765/mcp
 ```
 
-| Mode | Use case | Notes |
+The HTTP server is meant to be used from within the computer that runs mdya. It refuses requests addressed to a host name other than a loopback one. A request with an `Origin` header is accepted only when its scheme is `http` or `https` and its host is loopback; otherwise, it is refused with HTTP 403. A request without an `Origin` header is accepted. This is so that mdya does not accept requests that a browser sends to it from a page of a site outside the computer.
+
+## Registering with an AI assistant
+
+### Claude Code
+
+To register it with stdio:
+
+```
+claude mcp add --transport stdio mdya -- mdya mcp
+```
+
+To use a settings and index directory other than the default, put `--data-dir` before `mcp`.
+
+```
+claude mcp add --transport stdio mdya -- mdya --data-dir /Users/me/work-mdya mcp
+```
+
+To connect to an HTTP server that you keep running:
+
+```
+claude mcp add --transport http mdya http://127.0.0.1:8000/mcp
+```
+
+### Other MCP clients
+
+With stdio, use `mdya` as the command to start and `mcp` as its arguments. Put global options such as `--data-dir` in the arguments before `mcp`. With HTTP, use `http://127.0.0.1:8000/mcp` as the URL to connect to (or, if you changed `--address`, that address).
+
+## Tools
+
+Each tool gives, in its tool definition, an output schema that describes the structure of its result. On success, it returns a result whose structure matches that schema.
+
+### `list_collections`
+
+It takes no input. The result has the same structure as `mdya collection list --json` ([Commands: Listing collections](commands.md#listing-collections-mdya-collection-list)). The descriptions of the collections can be used to decide which collections to search.
+
+### `search`
+
+| Input | Meaning | When omitted |
 |---|---|---|
-| stdio (default) | Editor integration (Claude Code, etc.) | stdout is reserved for the MCP protocol; logs go to stderr |
-| `--http` | Background daemon | A foreground process. Background it with `&` / `nohup` / systemd / etc. from the shell |
+| `query` | What to search for. Input that is only white space is not accepted | Cannot be omitted |
+| `mode` | One of `fts`, `vector`, and `hybrid` | `hybrid` |
+| `collections` | An array of the names of the collections to search | All the collections (an empty array is the same) |
+| `limit` | The most hits to return. From 1 to 9007199254740991 | 20 |
+| `unit` | `document` or `chunk` | `document` |
 
-The `--http` bind address defaults to `127.0.0.1:8000` (loopback). Remote exposure is out of scope; the server rejects Host headers from non-loopback addresses.
+The result has the same structure as `mdya search --json` ([Commands: Searching](commands.md#searching-mdya-search)). You can pass each hit's `collection`, `key`, and `chunk_index` to `get_document` to read the document.
 
-Only one `--http` daemon can run per configuration directory (a `~/.mdya/mcp.pid` lock guards it). A second instance is rejected.
+### `get_document`
 
-The stdio mode is designed for editor integration. It assumes the client manages the process lifetime.
+| Input | Meaning | When omitted |
+|---|---|---|
+| `collection` | The collection name | Cannot be omitted |
+| `key` | The key of the document | Cannot be omitted |
+| `chunk_index` | The chunk index of the first chunk | Returns the whole body of the document |
+| `end_chunk_index` | The chunk index of the last chunk (this chunk is included). Must be `chunk_index` or larger. If it is past the last chunk, returns the body up to the end of the document | Returns only the chunk at `chunk_index` |
 
-## Registering with Claude Code
-
-```sh
-claude mcp add mdya -- mdya mcp
-```
-
-This registers the MCP server under the name `mdya` and makes its tools available.
-
-## Provided tools
-
-The mdya MCP server provides the following tools.
-
-### Search tool
-
-| Tool | Description |
-|---|---|
-| `search` | Search Markdown collections; `mode` selects the backend (BM25 / vector / hybrid) |
-
-Input schema:
+The result has `collection`, `key`, and `text` (the text to return). When the text to return is over the MCP limit (`get.mcp_limit_bytes`, 1 MiB by default; [Settings](configuration.md#output-size-limit-for-getting-documents)), an error is returned. Give a chunk range and get the document in parts.
 
 ```json
-{
-  "query": "release plan",
-  "mode": "hybrid",
-  "k": 20,
-  "collections": ["notes"],
-  "level": "doc"
-}
+{"collection":"notes","key":"release.md","text":"# リリースの手順\n\nタグを打つ前に、変更履歴を書き、バージョン番号を上げます。\n\n"}
 ```
 
-- `query` (required) — search query string. Empty or whitespace-only is an error.
-- `mode` (optional, default `"hybrid"`) — search backend: `"fts"` (BM25 keyword/phrase), `"vector"` (cosine semantic), or `"hybrid"` (both, fused with RRF).
-- `k` (optional, default `20`) — top N hits. `0` is an error.
-- `collections` (optional) — filter by collection name. Omitted or empty array means all collections. Unknown collection names are an error.
-- `level` (optional, default `"doc"`) — hit granularity. `"doc"` returns aggregated hits per document; `"chunk"` returns one hit per matched chunk.
+### `get_version`
 
-The output matches the CLI's `--format json` envelope.
+It takes no input. The result has the form `{"version":"mdya X.Y.Z"}`. It returns the version of the mdya that is running as the MCP server.
+
+#### Hiding the version
+
+With `mdya config set mcp.show_version false`, mdya does not show its version over MCP. The result of `get_version` becomes `{"version":"mdya"}`, and the `version` in the server information returned at MCP initialization also becomes `mdya`. This has no effect on `mdya --version` and `mdya status` in the CLI.
+
+## Errors
+
+A tool error is returned as an MCP tool execution error (`isError: true`). Its content is a JSON object of the following form. The same content is also included as text.
 
 ```json
-{
-  "query": "release plan",
-  "mode": "fts",
-  "level": "doc",
-  "collections": ["notes"],
-  "limit": 20,
-  "total": 17,
-  "hits": [
-    {
-      "collection": "notes",
-      "path": "release.md",
-      "score": 0.812,
-      "snippet": "...",
-      "matched_chunks": 3,
-      "chunk_count": 4
-    }
-  ]
-}
+{"code":"collection_not_found","message":"Error: the collection \"nosuch\" does not exist\n\nHow to fix:\n    Check the collection name in the list of collections (mdya collection list, or the list_collections tool).","details":{"collection":"nosuch"}}
 ```
 
-At `level: "doc"` (default), hits are aggregated per document and each hit's `matched_chunks` counts how many chunks within the document matched. Passing `level: "chunk"` returns hits at chunk granularity, and each hit carries `chunk_sequence` (the 0-indexed chunk number). At either granularity, each hit's `chunk_count` is the total number of chunks in its document.
+- `code`: The kind of error. It is one of those in the table below. Treat a `code` you do not know the same as `internal`.
+- `message`: The same explanation (the error message, the cause, and how to fix) that the CLI writes to stderr when the same error happens there.
+- `details`: Information for fixing the input and calling again.
 
-The numeric range of `score` differs per mode (see [the three modes in commands.md](commands.md#the-three-modes)).
+| `code` | Errors it covers | `details` |
+|---|---|---|
+| `invalid_input` | [The query is empty](errors.md#the-query-is-empty), [The limit is zero](errors.md#the-limit-is-zero), [The chunk does not exist](errors.md#the-chunk-does-not-exist), [The chunk range is not valid](errors.md#the-chunk-range-is-not-valid), [The query is longer than the embedding model's context length](errors.md#the-query-is-longer-than-the-embedding-models-context-length), an input value does not match the input schema (an unknown search mode, a missing required input, and so on) | `input`: the name of the input that is not valid |
+| `collection_not_found` | [The collection does not exist](errors.md#the-collection-does-not-exist) | `collection`: the collection name |
+| `document_not_found` | [The document does not exist](errors.md#the-document-does-not-exist) | `collection`: the collection name, `key`: the key |
+| `output_too_large` | [The output is too large](errors.md#the-output-is-too-large) | `size_bytes`: the size of what is to be returned, `limit_bytes`: the MCP limit |
+| `embedding_model_unavailable` | [The embedding model cannot be used](errors.md#the-embedding-model-cannot-be-used) | None (an empty object) |
+| `internal` | [The index or settings cannot be read](errors.md#the-index-or-settings-cannot-be-read), [Unexpected failure](errors.md#unexpected-failure) | None (an empty object) |
 
-### Document retrieval tool
+## When the settings change
 
-| Tool | Description |
-|---|---|
-| `get_document` | Fetch the original text of one document |
+The MCP server keeps using the settings it had when it started. Settings changed with `mdya config set` take effect when the server is restarted.
 
-Input:
+When you change the embedding model setting, restart the server. If you do not, the server makes the embeddings of queries with the previous embedding model, and after you rebuild the embeddings with the CLI, vector search no longer returns any hits ([Some embeddings were made with another model than the configured one](errors.md#some-embeddings-were-made-with-another-model-than-the-configured-one)).
 
-```json
-{
-  "collection": "notes",
-  "path": "release.md"
-}
-```
+## Logs
 
-Output:
-
-```json
-{
-  "collection": "notes",
-  "path": "release.md",
-  "content": "..."
-}
-```
-
-- `collection` (required) — collection name (must be declared in `config.yml`).
-- `path` (required) — document path relative to the collection root (for an archive collection, the path inside the archive).
-- `chunk` (optional) — a 0-indexed `chunk_sequence`. When given, the original text that chunk covers is returned instead of the full document; omit it for the faithful full document.
-- `chunk_end` (optional) — with `chunk`, return chunks `chunk` through `chunk_end` (inclusive) as one contiguous piece of the original text. Must be `>= chunk`; a value past the last chunk reads to the end of the document.
-
-You can pass the `collection` and `path` from a search hit directly to retrieve its source text, or pass a hit's `chunk_sequence` as `chunk` to fetch just that chunk. To read its neighbours too, pass a `chunk` below the hit's number and a `chunk_end` above it. A chunk's original text keeps its formatting: heading markers, link targets, HTML, and so on. Chunk ranges cover the document without gaps, so within one range read no text repeats between adjacent chunks. Chunks cut from one long block (a long paragraph or code block, or a PDF) overlap their neighbours slightly, though: when separate reads meet inside such a block, joining them repeats a little text at the seam.
-
-A document whose full text exceeds `get.mcp_max_bytes` can usually still be read piece by piece with `chunk` / `chunk_end` ranges that fit under the cap. A part where a single chunk's range alone exceeds the cap — large content with no body text, such as a huge HTML block — cannot be read this way. A search hit's `chunk_count` tells you how many chunks the document has.
-
-### Index introspection tool
-
-| Tool | Description |
-|---|---|
-| `list_collections` | List registered collections |
-
-It takes no input. The output shape matches `mdya collection list --format json` (see [commands.md](commands.md)).
-
-## Error behavior
-
-When a tool call fails, a structured error is returned.
-
-```json
-{
-  "code": "unknown_collection",
-  "message": "unknown collection: 'foo'",
-  "details": { "collection": "foo" }
-}
-```
-
-| `code` | Trigger |
-|---|---|
-| `empty_query` | `query` is empty or whitespace-only |
-| `invalid_limit` | `k` is `0` |
-| `unknown_collection` | An unknown collection name was given |
-| `not_found` | `get_document` found no matching document, or the requested `chunk` is out of range |
-| `invalid_chunk_range` | `get_document` got `chunk_end` without `chunk`, or a `chunk_end` smaller than `chunk` |
-| `payload_too_large` | A `get_document` response (full document or `chunk` / `chunk_end` range) exceeded `get.mcp_max_bytes`. `details` carries `size_bytes` / `limit_bytes`; narrow the `chunk` / `chunk_end` range to fit |
-| `index_outdated` | The index was built by an older mdya, before chunk ranges were recorded. Returned by `search` and by `get_document` with `chunk`. Rebuild it with `mdya vector use <model>`, using the model in `details.embedding_model`. Full-document `get_document` keeps working. Restart the MCP server after the rebuild |
-| `schema_metadata_missing` | The index is uninitialized or corrupted |
-| `internal` | I/O, embedding, configuration-load, or other failure |
-
-Clients can branch on `code`. `details` carries code-specific extra information.
-
-## Logging
-
-All `mdya mcp` logs go to stderr. In stdio mode stdout is occupied by the MCP protocol channel, so mixing logs into stdout would break the protocol.
-
-When backgrounding the `--http` daemon and you want logs written to a file, redirect from the shell.
-
-```sh
-nohup mdya mcp --http > ~/.mdya/mcp.log 2>&1 &
-```
+The MCP server's logs go to stderr. To keep the logs in a file, redirect stderr to a file in the shell ([Settings: Logs and color](configuration.md#logs-and-color)).

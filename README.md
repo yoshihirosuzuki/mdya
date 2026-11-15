@@ -6,38 +6,40 @@
 [![Latest release](https://img.shields.io/github/v/release/yoshihirosuzuki/mdya)](https://github.com/yoshihirosuzuki/mdya/releases/latest)
 [![CI](https://github.com/yoshihirosuzuki/mdya/actions/workflows/ci.yml/badge.svg)](https://github.com/yoshihirosuzuki/mdya/actions/workflows/ci.yml)
 
-A small, fast search primitive for your local Markdown collections. BM25 full-text search, on-device vector search, and a hybrid that fuses both — exposed through two entry points: a **CLI** and an **MCP server**.
+A tool for searching the Markdown and PDF documents on your own computer, from the command line or from an AI assistant over MCP.
 
 ## Overview
 
-mdya is a **search primitive**. It indexes local Markdown, and returns search results over a CLI and an MCP server. That is all it does.
+- You can use full-text search, vector search (which finds text by closeness in meaning), and hybrid search, which combines the two.
+- The documents to search are ingested from directories, archives (zip, tar, and gzip-compressed tar), and document content passed in with a command.
+- There are two entry points: the CLI commands, and the MCP server, which you use from an AI assistant (such as Claude Code).
+- It does not use cloud LLM APIs. Embeddings (sequences of numbers that represent the meaning of text, used for vector search) are made on your computer. There is also a setting that leaves making the embeddings to Ollama.
+- It runs as a single executable.
 
-mdya is not a search agent and not an LLM query-rewriting front-end. It has no query expansion, no reranker, and no multi-stage agent pipeline. Workflows that want those things are expected to layer a separate tool on top of mdya via its CLI or MCP interface.
+mdya covers the work up to returning search results. It has no models for rewriting queries or for reordering results.
 
-It is local-first by construction. There is no path to any cloud LLM API; inference runs entirely on-device; distribution is a single binary.
+### Document language
 
-What it can do:
+The default settings are meant for Japanese documents. The default embedding model, `cl-nagoya/ruri-v3-30m`, is a Japanese model, and full-text search splits text into words with a Japanese dictionary (IPADIC).
 
-- **BM25 full-text search** — full-text search with Japanese morphological analysis (lindera/ipadic) support.
-- **Vector search** — cosine similarity over on-device embeddings (default `cl-nagoya/ruri-v3-30m`, 256 dimensions).
-- **Hybrid search** — fuses BM25 and vector results via Reciprocal Rank Fusion (RRF).
-- **Markdown chunking** — splits along heading and code-fence boundaries.
-- **MCP server** — `mdya mcp` (stdio / HTTP) exposes the search tools to MCP clients.
+For documents in languages other than Japanese, you can choose embedding models that may suit them: `google/embeddinggemma-300m`, `sentence-transformers/all-MiniLM-L6-v2` (English), and Ollama models. However, search accuracy has not been verified for documents in languages other than Japanese ([Settings: Document language](docs/manual/en/configuration.md#document-language)).
 
-`.pdf` files go through the same ingest path as `.md`. They are converted to plain text at ingest time and then chunked and embedded with the same pipeline as Markdown.
+### If you used an earlier version
 
-A `.zip` / `.tar` / `.tar.gz` / `.tgz` archive can be registered as a collection too. The documents inside it are read without extracting it (see [Registering an archive](docs/manual/en/commands.md#registering-an-archive)).
+mdya has been rebuilt. The rebuilt mdya is not compatible with mdya v0.4.3 and earlier.
 
-## Supported platforms
+## Supported operating systems
 
-- macOS (arm64 / x86_64)
-- Linux (amd64 / arm64)
+mdya runs on macOS, Linux, and Windows. The releases page has prebuilt binaries for the following:
+
+- macOS (arm64, x86_64)
+- Linux (x86_64, arm64)
 - Windows (x86_64)
 
-## Install
+## Installation
 
 ```sh
-# Linux / macOS
+# Linux and macOS
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/yoshihirosuzuki/mdya/releases/latest/download/mdya-installer.sh | sh
 ```
 
@@ -46,116 +48,131 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/yoshihirosuzuki/mdya/re
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/yoshihirosuzuki/mdya/releases/latest/download/mdya-installer.ps1 | iex"
 ```
 
-Or grab an archive from the [releases page](https://github.com/yoshihirosuzuki/mdya/releases) and put the `mdya` binary on your `PATH`.
+Or, download a prebuilt binary from the [releases page](https://github.com/yoshihirosuzuki/mdya/releases), and put `mdya` in a directory on your `PATH`.
 
-Rust users can install from [crates.io](https://crates.io/crates/mdya) instead. This builds from source, so it needs the [build-from-source prerequisites](#build-from-source) below (notably `protoc`):
+You can also install from [crates.io](https://crates.io/crates/mdya). This builds from source, so you need the prerequisites in "Building from source" below.
 
 ```sh
 cargo install mdya
 ```
 
-### Build from source
+### Building from source
 
 Prerequisites:
 
-- Rust 1.95+ (pinned automatically by `rust-toolchain.toml` at the repo root)
-- `just` (`cargo install just`)
-- `protoc` (Protocol Buffers compiler, a build dependency of the `lance` storage library). On macOS `brew install protobuf`; on Linux `apt install -y protobuf-compiler`; on Windows `choco install protoc`.
+- Rust 1.95 or later (the repository's `rust-toolchain.toml` sets the version)
+- `protoc` (the Protocol Buffers compiler, used to build dependency crates). On macOS, `brew install protobuf`; on Linux, `apt install -y protobuf-compiler`; on Windows, `choco install protoc`
+- A network connection. During the build, the dependency crates and the Japanese dictionary for full-text search (from `https://Lindera.dev/`) are downloaded. When building without a network connection, see "Building without a network connection" below.
 
 ```sh
 git clone https://github.com/yoshihirosuzuki/mdya.git
 cd mdya
-cargo build --release        # produces ./target/release/mdya
-# or install onto your PATH:
+cargo build --release        # builds ./target/release/mdya
+# Or, to put it on your PATH:
 cargo install --path .       # installs mdya into ~/.cargo/bin
 ```
 
+#### Building without a network connection
+
+While you have a network connection, download what the build downloads (the dependency crates and the dictionary for full-text search) to the computer you build on. Install Rust and `protoc` beforehand as well.
+
+1. In the repository directory, download the dependency crates. After `cargo fetch`, Cargo can run without a network connection as long as `Cargo.lock` does not change.
+
+   ```sh
+   cargo fetch --locked
+   ```
+
+2. Download the dictionary tarball, and put it in `3.0.7/` under the directory for dictionaries (here, `$HOME/lindera`). `3.0.7` is the version of the `lindera-ipadic` crate that mdya uses, and you can check it in `Cargo.lock`.
+
+   ```sh
+   mkdir -p "$HOME/lindera/3.0.7"
+   curl -sSfL -o "$HOME/lindera/3.0.7/mecab-ipadic-2.7.0-20250920.tar.gz" https://Lindera.dev/mecab-ipadic-2.7.0-20250920.tar.gz
+   ```
+
+3. Without a network connection, set the environment variable `LINDERA_DICTIONARIES_PATH` to the directory for dictionaries, and build with `--frozen`. With `--frozen`, Cargo does not use the network, and when it tries to change `Cargo.lock`, it stops with an error.
+
+   ```sh
+   LINDERA_DICTIONARIES_PATH="$HOME/lindera" cargo build --release --frozen
+   ```
+
 ## Getting started
 
-The shortest path is `init` → `collection add` → `update-all` → `search`.
+These are the steps from ingesting the Markdown in a directory to searching it.
 
 ```sh
-mdya init                       # create ~/.mdya/ (config.yml + data directories for the index)
-mdya collection add ~/notes     # register a directory as a collection (name = basename, here: notes)
-mdya update-all                 # walk every registered collection, ingest .md / .markdown / .pdf, build the index
-mdya search fts "release plan"     # BM25 full-text search
-mdya search vector "release plan"  # vector search
-mdya search hybrid "release plan"  # hybrid (RRF)
+mdya collection add notes ~/notes   # make ~/notes the collection "notes"
+mdya update notes                   # ingest the .md, .markdown, and .pdf files in ~/notes
+mdya search "リリースの手順"           # search
+mdya get notes release.md           # read a document that was found
 ```
 
-> The first `mdya update-all` (and vector / hybrid searches) automatically downloads the embedding model (`cl-nagoya/ruri-v3-30m`, about 140 MB) into `~/.mdya-models/`, and reuses that cache afterwards.
+The first time you ingest (and the first time you run a vector search or hybrid search), mdya downloads the embedding model (`cl-nagoya/ruri-v3-30m`, about 150 MB) from Hugging Face and puts it in `~/.mdya-models`. From the second time on, it reads the model from there.
 
-Search results are printed to stdout in a human-readable format.
+Search results look like this:
 
 ```
-notes/release.md  score=0.812  chunks=4
-  > The release procedure is as follows
-  > 1. Update the version number
----
-notes/checklist.md  score=0.751  chunks=1
-  > Pre-release checklist
----
-2 doc hits (showing 20 max)
+$ mdya search "リリースの手順"
+1. notes  meetings/2026-11-10.md
+   score 0.0331, chunk 2 of 3
+   ## 次にやること - リリースの手順を見直す。 - 会議室の予約を、来月の分まで取る。 
+
+2. notes  release.md
+   score 0.0331, chunk 0 of 3
+   # リリースの手順 タグを打つ前に、変更履歴を書き、バージョン番号を上げます。 
+
+3. notes  setup.md
+   score 0.0323, chunk 0 of 1
+   # 開発環境の用意 新しい PC で開発を始めるときの手順です。 1. リポジトリを取得します。 2. 必要な道具を…
 ```
 
-Common flags:
+Each hit shows the collection name and key, the score and chunk index, and a snippet (the text around where the match was found).
 
-- `-c, --collections <NAMES...>` — restrict to specific collections (default: all)
-- `-n, --limit <N>` — top N hits (default 20)
-- `--format <FORMAT>` — output format (default `human`). `json` (machine-friendly envelope), `md` (Markdown, suitable for pasting or LLM input), and `xml` (structurally equivalent to JSON, also for LLM input) are also available.
+After you change files, running `mdya update notes` re-ingests only the documents that changed. To re-ingest all collections, run `mdya update --all`.
 
-## MCP server
+You can also do the following:
 
-mdya can run as an MCP (Model Context Protocol) server, so clients like Claude Code or Claude Desktop can call its search tools.
+- Make an archive (`.zip`, `.tar`, `.tar.gz`, `.tgz`) a collection: `mdya collection add <name> <archive> --type archive`
+- Pass document content with a command: create a collection with `mdya collection add <name> --type raw`, and pass the content with `mdya put`
+- Choose the search mode: `mdya search --mode fts` (full-text search), `--mode vector` (vector search), `--mode hybrid` (the default)
+- Get results as JSON: `--json`
+
+## Using mdya from an AI assistant (MCP)
+
+`mdya mcp` runs as an MCP server. Register it with Claude Code as follows:
 
 ```sh
-mdya mcp        # start the MCP server over stdio
+claude mcp add --transport stdio mdya -- mdya mcp
 ```
 
-Registering with Claude Code:
+With the MCP tools, an AI assistant can list collections (`list_collections`), search (`search`), and get documents (`get_document`). The MCP tools are read-only. Create collections and ingest documents with the CLI, as in "Getting started" above.
 
-```sh
-claude mcp add mdya -- mdya mcp
-```
+## Manual
 
-## Further reading
+Detailed usage is in the [manual](docs/manual/en/README.md).
 
-For configuration, individual subcommands, and MCP details, see the [user manual](docs/manual/en/README.md).
-
-## Configuration
-
-Configuration lives in a single file at `~/.mdya/config.yml` (a template is generated by `mdya init`). Minimal example:
-
-```yaml
-collections:
-  notes:
-    path: ~/notes
-embedding:
-  model: cl-nagoya/ruri-v3-30m
-runtime:
-  memory_limit_mb: 8192     # upper bound on this process's RSS, in MB. 0 to disable.
-  embed_parallelism: 8      # number of files embedded in parallel during update-all. 0 for sequential.
-```
-
-`mdya collection add <path>` rewrites the `collections` section, so you usually do not need to edit it by hand. The configuration directory can be moved with `--config-dir <path>`, and the embedding model cache with `--model-cache-dir <path>` (default `$HOME/.mdya-models/`).
+- [Collections and collection types](docs/manual/en/collections.md)
+- [Commands](docs/manual/en/commands.md)
+- [Settings](docs/manual/en/configuration.md)
+- [The MCP server](docs/manual/en/mcp.md)
+- [Errors and how to fix them](docs/manual/en/errors.md)
 
 ## Development
 
 ```sh
-just check    # fmt-check + clippy (-D warnings) + cargo test (full workspace) + cargo audit
-just          # list available recipes
+just check    # format check, clippy (warnings are errors), cargo test (the whole workspace), cargo audit
+just          # list the recipes
 ```
 
-`just check` needs the [build-from-source prerequisites](#build-from-source) — Rust, `just`, `protoc` — plus `cargo install cargo-audit --locked` and network access, since the advisory database is fetched on every run. Offline, run `cargo audit --no-fetch --stale` instead.
+In addition to the prerequisites in "Building from source" and `just`, `just check` needs `cargo-audit` (`cargo install cargo-audit --locked`) and a network connection (it downloads the advisory database every time). When you have no network connection, run `cargo audit --no-fetch --stale` instead.
 
 ## Contributing
 
-Contributions are welcome on a best-effort basis (one-person maintainer; no formal SLA). Please read the following before opening an issue or PR:
+Issues and PRs are handled on a best-effort basis (there is one maintainer, and no response deadlines are promised). Before opening an issue or PR, please read the following:
 
-- [CONTRIBUTING.md](CONTRIBUTING.md) — issue / PR workflow, build and test setup.
-- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — Contributor Covenant.
-- [SECURITY.md](SECURITY.md) — private channels for security vulnerabilities.
-- [SUPPORT.md](SUPPORT.md) — where to ask questions.
+- [CONTRIBUTING.md](CONTRIBUTING.md): the flow for issues and PRs, and the steps to build and test.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): Contributor Covenant.
+- [SECURITY.md](SECURITY.md): how to report a security vulnerability without making it public.
+- [SUPPORT.md](SUPPORT.md): where to ask questions.
 
 ## License
 

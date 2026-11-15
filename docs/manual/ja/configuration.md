@@ -1,163 +1,151 @@
 # 設定
 
-mdya の設定は `~/.mdya/config.yml` の 1 ファイルにまとまっています。`mdya init` がひな形を生成し、`mdya collection add` がコレクションのセクションを書き換えます。多くの場合手で編集する必要はありませんが、`embedding` / `runtime` / `get` の値を変えたいときは直接編集できます。
+mdya の設定と、mdya が PC に置くものです。
 
-## ディレクトリレイアウト
+## 設定の変え方
 
-`mdya init` を実行すると以下が生成されます。
+設定は、`mdya config set` で変え、`mdya config reset` で既定の値に戻します。今の値は、`mdya config list` で見られます ([コマンドの「設定を変える」](commands.md#設定を変える-mdya-config-setmdya-config-reset))。設定のファイルを直接書き換えないでください。直接書き換えたときの動作は、約束していません。
+
+| 設定の名前 | 意味 | 既定の値 | 受け付ける値 |
+|---|---|---|---|
+| `embedding.model` | [埋め込みモデル](#埋め込みモデル) | `cl-nagoya/ruri-v3-30m` | 下の一覧のモデルか、`ollama:<モデル名>` |
+| `embedding.ollama_endpoint` | Ollama の接続先 ([Ollama を使う](#ollama-を使う)) | `http://127.0.0.1:11434` | `http://` か `https://` で始まる URL |
+| `resources.memory_limit_mb` | [メモリの上限](#メモリと並列の度合い) (MB) | `8192` | 0 以上の整数。0 にすると、メモリを監視しない |
+| `resources.embedding_parallelism` | [並列の度合い](#メモリと並列の度合い) | `8` | 0 以上の整数。0 にすると、1 つずつ順に処理する。1024 より大きい値は 1024 として扱う |
+| `get.cli_limit_bytes` | CLI で文書を取得するときの大きさの上限 (バイト。[文書を取得するときの大きさの上限](#文書を取得するときの大きさの上限)) | `1048576` | 0 以上の整数。0 にすると、上限を掛けない |
+| `get.mcp_limit_bytes` | MCP で文書を取得するときの大きさの上限 (バイト) | `1048576` | 0 以上の整数。0 にすると、上限を掛けない |
+| `mcp.show_version` | MCP で、mdya のバージョンを示すか ([MCP のサーバー](mcp.md#バージョンを示さない)) | `true` | `true` か `false` |
+
+整数は、9007199254740991 以下を、10 進数で書きます。この説明書の MB は、1,048,576 バイト (1 MiB) です。
+
+動いている MCP のサーバーは、サーバーを始めたときの設定を使い続けます。変えた設定は、サーバーを始め直したときに効きます。
+
+## ディレクトリ
+
+mdya は、PC の次の 2 つのディレクトリに、ものを置きます。どちらも、初めて要るときに mdya が作ります。
+
+| ディレクトリ | 置くもの | 既定の場所 | 変え方 |
+|---|---|---|---|
+| 設定とインデックスのディレクトリ | 設定、インデックス、collection の属性と、そのほか mdya が動くのに要るもの | `~/.mdya` | `--data-dir <ディレクトリ>` |
+| 埋め込みモデルのキャッシュのディレクトリ | 取得した埋め込みモデル | `~/.mdya-models` | `--model-cache-dir <ディレクトリ>` |
+
+- `--data-dir` と `--model-cache-dir` は、`mdya` のすぐあと、コマンドの名前より前に書きます。環境変数では指定できません。
+- 先頭の `~` は、ホームディレクトリに置き換えます。相対パスは、そのコマンドを流したときの作業ディレクトリから解決します。
+- 設定とインデックスのディレクトリを分けると、別の設定と別のインデックスになります。いくつかの設定とインデックスのディレクトリで、1 つの埋め込みモデルのキャッシュのディレクトリを共有できます。
+- これらのディレクトリの中のものを直接消したときの動作は、約束しません。
+
+## 埋め込みモデル
+
+ベクトル検索とハイブリッド検索は、埋め込みモデルで、文章の意味を埋め込みベクトルに表して探します。クエリの埋め込みベクトルも、取り込む chunk の埋め込みベクトルも、設定の埋め込みモデル (`embedding.model`) で作ります。全文検索は、埋め込みモデルを使いません。
+
+選べる埋め込みモデルは、次のとおりです。
+
+| `embedding.model` の値 | 説明 |
+|---|---|
+| `cl-nagoya/ruri-v3-30m` (既定) | 日本語のモデル |
+| `google/embeddinggemma-300m` | 利用に許可の要るモデル ([許可の要るモデル](#許可の要るモデル)) |
+| `sentence-transformers/all-MiniLM-L6-v2` | 英語のモデル |
+| `ollama:<モデル名>` | 埋め込みベクトルを作ることを、Ollama に任せる ([Ollama を使う](#ollama-を使う)) |
+
+Ollama のほかのモデルは、mdya が PC の上で動かします。初めて使うときに、Hugging Face からモデルを取得し、埋め込みモデルのキャッシュのディレクトリに置きます (`cl-nagoya/ruri-v3-30m` は約 150 MB)。2 回目からは、キャッシュから読みます。そのため、初めて使うときだけ、ネットワークが要ります。
+
+### 文書の言語
+
+既定の設定は、日本語の文書向けです。
+
+- 既定の埋め込みモデル `cl-nagoya/ruri-v3-30m` は、日本語のモデルです。
+- 全文検索は、日本語の辞書 (IPADIC) で語を切ります。英語の語も探せます ([コマンドの「検索する」](commands.md#検索する-mdya-search))。ほかの言語の語の切り方には、合わせていません。
+
+日本語のほかの言語の文書に使えそうな埋め込みモデルとして、`google/embeddinggemma-300m`、`sentence-transformers/all-MiniLM-L6-v2` (英語) と、Ollama のモデルを選べます。ただし、日本語のほかの言語の文書で、検索の精度は確かめていません。
+
+### 埋め込みモデルを変える
+
+1. `mdya config set embedding.model <モデル>` で、設定を変えます。
+2. `mdya embedding rebuild` で、インデックスの埋め込みベクトルを、新しい埋め込みモデルで作り直します。取り込み元を読み直さずに、作り直します。
+
+設定を変えても、インデックスの埋め込みベクトルは変わりません。インデックスに、前の埋め込みモデルで作った埋め込みベクトルがあるときは、作り直すまで、ベクトル検索は何もヒットせず (ハイブリッド検索は、全文検索の側だけで並べます)、`mdya update` と `mdya put` はエラーになります。違う埋め込みモデルで作った埋め込みベクトルどうしは、比べても意味がないためです。インデックスに chunk がまだないとき (取り込む前に埋め込みモデルを変えたとき) は、作り直す必要はありません。
+
+mdya は、埋め込みモデルを、名前と、それが作る埋め込みベクトルの次元で区別します。Ollama のモデルを、同じ名前のまま、次元の違うモデルに取り替えたときも、違う埋め込みモデルとみなします。名前も次元も同じモデルに取り替えたときは、見分けられないので、`mdya embedding rebuild --force` で作り直してください。
+
+### 許可の要るモデル
+
+`google/embeddinggemma-300m` は、Hugging Face で、利用に許可の要るモデルです。
+
+1. Hugging Face で、[モデルのページ](https://huggingface.co/google/embeddinggemma-300m) を開き、利用の条件に同意して、許可を得ます。
+2. Hugging Face のアクセストークンを、環境変数 `HF_TOKEN` に入れて、mdya を動かします。トークンは、モデルを取得するときに使います。
+
+### Ollama を使う
+
+`embedding.model` を `ollama:<モデル名>` にすると、埋め込みベクトルを作ることを、Ollama に任せます。`ollama:` のあとにモデル名のない書き方は、受け付けません。
+
+- Ollama を別にインストールし、動かしておきます。使うモデルも、Ollama で用意しておきます。
+- Ollama の接続先は、`embedding.ollama_endpoint` で変えられます。PC の外の接続先にすると、埋め込む文章が PC の外に送られます。
+
+### プロキシ
+
+PC の上で動かす埋め込みモデルの取得と、PC の外の Ollama とのやりとりは、プロキシの環境変数に従います。mdya には、プロキシを指定する設定や引数はありません。
+
+- 読む環境変数は、`HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY`、`NO_PROXY` と、それぞれの小文字の名前です。`NO_PROXY` に書いた接続先には、プロキシを通しません。
+- Ollama の接続先のホストが、`localhost` か、ループバックのアドレス (`127.0.0.0/8`、`::1` と、`::ffff:127.0.0.1` のように IPv6 で書いた `127.0.0.0/8` のアドレス) と書かれているときは、プロキシの環境変数に関係なく、プロキシを通しません。同じ PC の Ollama に送る文章を、プロキシに送らないためです。
+- 使えるのは、http と https のプロキシです。SOCKS のプロキシは使えず、設定されていると、プロキシを通すやりとりはエラーになります。OS のプロキシの設定 (macOS のシステムの設定、Windows のレジストリ) は読みません。
+
+## メモリと並列の度合い
+
+mdya は、自分のメモリ使用量 (常駐するメモリの量) を監視し、メモリの上限 (`resources.memory_limit_mb`、既定は 8192 MB) を超えたら、その場で止まります。PC が固まるのを避けるためです。PC のメモリは mdya のほかのプロセスも使うので、PC 全体が固まらないことまでは約束しません。
+
+並列の度合い (`resources.embedding_parallelism`、既定は 8) は、埋め込みベクトルを作るときに、同時に処理する文書の数です。mdya が使うメモリは、並列の度合いを上げるほど増えます。
+
+### 測った例
+
+既定の値 (並列の度合い 8、メモリの上限 8192 MB) で測った 1 つの例です。文書の集まりや PC が違えば、使うメモリも違います。
+
+- 文書の集まり: Markdown 188 ファイル、合わせて約 2.9 MiB。2 つのディレクトリの collection に分けた。
+- 埋め込みモデル: `cl-nagoya/ruri-v3-30m`。
+- PC: Apple M4、メモリ 16 GB、macOS。
+
+| 操作 | 各回のメモリ使用量の最大 (3 回流したときの範囲) |
+|---|---|
+| 取り込み (`mdya update --all`) | 1172.5〜1210.9 MB |
+| 埋め込みベクトルの作り直し (`mdya embedding rebuild --force`) | 1092.2〜1165.3 MB |
+
+### メモリの上限を超えたとき
+
+mdya は終了コード 137 で止まり、stderr に次のように出します (メモリの上限を 50 MB にしたときの例です)。
 
 ```
-~/.mdya/
-├── config.yml      # ユーザが編集する設定ファイル
-├── index/          # 索引データ
-└── lance-models/   # 全文検索の形態素解析辞書設定
+Error: mdya's memory usage went over the limit of 50 MB
+
+How to fix:
+    Raise the memory limit (mdya config set resources.memory_limit_mb) or lower the parallelism (mdya config set resources.embedding_parallelism), then run the operation again.
 ```
 
-各エントリの役割:
+メモリの上限を上げるか (`mdya config set resources.memory_limit_mb <MB>`)、並列の度合いを下げて (`mdya config set resources.embedding_parallelism <数>`)、もう一度同じ操作をしてください。止まるまでに書き終えた文書は残ります。`--force` を付けない update では、変わっていない文書を飛ばすので、止まったところの続きから進みます。
 
-- `config.yml` — 設定の単一情報源です。
-- `index/` — `mdya update-all` が構築する索引の置き場です。
-- `lance-models/` — 全文検索の日本語形態素解析に使う辞書設定の置き場です。`mdya init` が用意します。
+アーカイブの collection では、1 つの項目は展開したあと 256 MiB までで、中の文書は 1 つずつ読みます ([collection と collection タイプの「大きさとメモリ」](collections.md#大きさとメモリ))。
 
-埋め込みモデルのキャッシュは設定ディレクトリの外、default で `$HOME/.mdya-models/` に置かれます。初回の `mdya update-all` やベクトル / hybrid 検索で約 140 MB のモデルが自動ダウンロードされ、以降はこのキャッシュを使います。`mdya init` はこのディレクトリを作りません (初回のモデル読み込み時に自動で作られます)。
+## 文書を取得するときの大きさの上限
 
-複数の設定ディレクトリで 1 つのモデルキャッシュを共有したり、設定ディレクトリを読み取り専用でマウントしたりできます。
+`mdya get` と、MCP の `get_document` が返す文字 (文書の本文の全体か、chunk の範囲の文字) の、UTF-8 のバイト数の上限です。大きな文書をうっかり取得して、端末や AI アシスタントのやりとりを埋めないようにするためです。
 
-## 設定ディレクトリの切り替え
+- `get.cli_limit_bytes`: CLI の上限です。既定は 1048576 (1 MiB) です。`mdya get --no-size-limit` で、その 1 回だけ上限を外せます。
+- `get.mcp_limit_bytes`: MCP の上限です。既定は 1048576 (1 MiB) です。呼び出しごとに上限を外す手段はありません。
 
-`~/.mdya/` 以外の場所を使いたい場合は `--config-dir <path>` フラグ (全サブコマンドに付与可能) で上書きします。未指定なら `$HOME/.mdya/` を使います。
+上限を超えるときは、何も返さずにエラーになります ([出力が大きすぎる](errors.md#出力が大きすぎる))。chunk の範囲を指定して、分けて取得してください。
 
-埋め込みモデルキャッシュの場所も `--model-cache-dir <path>` フラグで上書きできます。未指定なら `$HOME/.mdya-models/` を使います。
+## ログと色
 
-例:
+mdya は、ログを stderr にだけ出します。メッセージ (成功したこと、進捗、完了のまとめなど) はログではないので、ログレベルを変えても出ます。
 
-```sh
-mdya --config-dir ./scratch-mdya init
-mdya --config-dir ./scratch-mdya --model-cache-dir /shared/mdya-models search fts "release"
+| 決めること | 決め方 | 既定 |
+|---|---|---|
+| ログレベル | `--log-level` で、`error`、`warn`、`info`、`debug`、`trace` のどれかを指定する。ログを出すものごとにも指定できる (`mdya=debug`)。付けなければ、環境変数 `RUST_LOG` を使う | `warn` (警告以上) |
+| ログの出力形式 | `--log-format` で、`compact` (1 行 1 件)、`pretty` (読みやすく整える)、`json` のどれかを指定する | `compact` |
+| 色 | `--no-color` を付けるか、環境変数 `NO_COLOR` があれば、色を付けない | stdout と stderr ごとに、端末のときだけ色を付ける |
+
+`RUST_LOG` に正しくない指定があれば、その指定だけを無視し、そのことを警告として出します。
+
+ログをファイルに残したいとき (MCP のサーバーを動かし続けるときなど) は、シェルで stderr をファイルに振り向けてください。
+
 ```
-
-`~/...` 記法は config 内の `path` でも引数でも展開されます。
-
-## config.yml の全項目
-
-最小例:
-
-```yaml
-collections:
-  notes:
-    path: ~/notes
-embedding:
-  model: cl-nagoya/ruri-v3-30m
-runtime:
-  memory_limit_mb: 8192
-  embed_parallelism: 8
-get:
-  cli_max_bytes: 1048576
-  mcp_max_bytes: 1048576
+mdya mcp --http 2>> ~/mdya-mcp.log
 ```
-
-セクションは 4 つあります。
-
-### collections
-
-検索対象として登録したディレクトリとアーカイブの一覧です。
-
-```yaml
-collections:
-  notes:
-    path: ~/notes
-    description: 個人メモ
-  work:
-    path: /Users/me/work/docs
-```
-
-- キー (`notes` / `work`) がコレクション名になります。`mdya search ... -c notes` のようにフィルタで使います。
-- `path` (必須) は索引対象のディレクトリ、またはアーカイブ (`.zip` / `.tar` / `.tar.gz` / `.tgz`) です。`~/...` は展開されます。アーカイブの読み方は [`commands.md` の「アーカイブを登録する」](commands.md#アーカイブを登録する) を参照してください。
-- `description` (任意) は人間向けの説明文です。`mdya collection list` で表示されます。
-
-`mdya collection add <path>` で追加するのが普通で、ディレクトリの場合キー名は `<path>` の basename になります (`--name` で上書き可)。アーカイブの場合は `--name` でキー名を指定します。
-
-`mdya update-all` の走査は**コレクションルート配下のシンボリックリンクを辿りません**。ルート自身がシンボリックリンクの場合 (例: `~/notes -> ~/Dropbox/notes`) は辿ります。別ディスクに散らばった領域を索引化したいときは、別コレクションとして追加してください。
-
-コレクションルートが git リポジトリの中にある場合、`mdya update-all` は `.gitignore` で除外されているファイルとディレクトリを索引化しません (ルートより上の階層の `.gitignore` も適用されます)。アーカイブには、中の `.gitignore` も外側の `.gitignore` も使いません。
-
-### embedding
-
-ベクトル検索 / hybrid 検索で使う埋め込みモデルを 1 つだけ指定します。
-
-```yaml
-embedding:
-  model: cl-nagoya/ruri-v3-30m
-```
-
-- `model` — モデル ID。default は `cl-nagoya/ruri-v3-30m` (256 次元、日本語に強い、約 140 MB、Apache 2.0)。`ollama:<name>` 形式で Ollama を指すこともできます (詳細は [`commands.md` の `mdya vector use`](commands.md#mdya-vector-use-model))。
-- モデルを変えたいときは `config.yml` を手で書き換えるのではなく `mdya vector use <model>` を使ってください。索引と config が整合した状態で切り替わります。
-
-**Ollama エンドポイント。** `model` が `ollama:<name>` 形式のとき、mdya は Ollama サーバへ埋め込みリクエストを送ります。エンドポイントは任意の `ollama` サブセクションで設定できます:
-
-```yaml
-embedding:
-  model: ollama:nomic-embed-text
-  ollama:
-    endpoint: http://127.0.0.1:11434
-```
-
-- `ollama.endpoint` (任意) — Ollama サーバのベース URL。default は `http://127.0.0.1:11434` (loopback)。loopback 以外のアドレスに向けると埋め込みテキストがローカルマシンの外へ送られ、推論が on-device で完結しなくなります。mdya のローカルファースト保証を保つには loopback のままにしてください。
-
-**gated モデルについて。** `google/embeddinggemma-300m` は Hugging Face 上で gated です。ungated な `cl-nagoya/ruri-v3-30m` (default) や `sentence-transformers/all-MiniLM-L6-v2` と違い、mdya が download する前に一度だけライセンス同意とアクセストークンが必要です。
-
-1. Hugging Face にログインし、[モデルページ](https://huggingface.co/google/embeddinggemma-300m) を開きます。Gemma ライセンスに同意してアクセスを申請してください (多くの場合その場で許可されます)。
-2. mdya が重みを download できるよう認証します。`hf auth login` を一度実行するか、`HF_TOKEN` 環境変数を設定してください。両方ある場合は `HF_TOKEN` が優先されます。
-3. あとは通常どおり実行します。token は一度きりの download にのみ使われ、推論は常に on-device で動きます。
-
-`config.yml` の `embedding.model` と索引内のモデルが食い違うと、`mdya update-all` は安全のため停止し、`mdya search vector` / `hybrid` は警告を出して検索を続けます。
-
-### runtime
-
-実行時の挙動の調整つまみです。
-
-```yaml
-runtime:
-  memory_limit_mb: 8192
-  embed_parallelism: 8
-```
-
-#### memory_limit_mb
-
-mdya プロセス自身の使用メモリ (RSS) の上限を MB で指定します。default は `8192` (= 8 GB)。`0` で無効化されます。
-
-上限を超えると mdya はエラーを 1 行出して即終了します (終了コード 137)。これは大きなコレクションを索引化中に PC ごとハングするのを避けるための安全装置です。終了したら下記の `embed_parallelism` を下げるか、`memory_limit_mb` を上げてください。
-
-#### embed_parallelism
-
-`mdya update-all` で並列に埋め込みを計算するファイル数の上限です。default は `8`。`0` で逐次処理になります。
-
-並列度を上げると速くなる一方、メモリ使用量も比例して増えます。ワーストケースで 1 ファイルあたり約 1.5 GB を消費するため、`memory_limit_mb` との関係を意識して調整してください:
-
-- 並列度 `8` × 1.5 GB ≈ 12 GB (上限 8 GB を超える可能性あり)
-- 並列度 `4` × 1.5 GB ≈ 6 GB
-- `0` (逐次) ≈ 1.5 GB
-
-アーカイブのコレクションでは、処理中のファイルに加えて、先に読んだ文書を 2 件 (それぞれ解凍後 256 MiB まで) 持つので、最大で 512 MiB 多くなります。文書の数がとても多いアーカイブでは、文書の名前の分もメモリが増えます。
-
-メモリ上限に引っかかって 137 で落ちる場合は、まず並列度を下げてみてください。
-
-### get
-
-`mdya get` と MCP `get_document` ツールが返す内容 (document 全文、またはチャンクの範囲) のサイズ上限です。単位は UTF-8 バイト数です。
-
-```yaml
-get:
-  cli_max_bytes: 1048576
-  mcp_max_bytes: 1048576
-```
-
-#### cli_max_bytes
-
-`mdya get` がエラーで停止せずに出力する最大サイズです。全文取得にも `--chunk` / `--chunk-end` 指定にも効きます。default は `1048576` (= 1 MiB)。`0` で無効化されます。
-
-`mdya get` に `-f` / `--no-size-limit` を渡すと、その 1 回だけ上限を無視して出力します (大きな出力を意図的にリダイレクト / パイプするときに便利)。
-
-#### mcp_max_bytes
-
-MCP `get_document` ツールが `payload_too_large` エラーを返さずに返す最大サイズです。全文取得にも `chunk` / `chunk_end` 指定にも効きます。default は `1048576` (= 1 MiB)。`0` で無効化されます。MCP 側にはリクエスト単位の上書きはありません。上限を超える文書も、多くの場合は `chunk` / `chunk_end` で上限に収まる範囲ずつ読めます。1 チャンクの範囲だけで上限を超える部分は読めません。

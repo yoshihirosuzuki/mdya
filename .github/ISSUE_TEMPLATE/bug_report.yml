@@ -16,7 +16,7 @@ body:
       label: What did you try?
       description: Command, MCP tool call, or sequence of operations. Include the exact arguments where relevant.
       placeholder: |
-        e.g. `mdya search hybrid --collection notes -n 10 "embedding model"`
+        e.g. `mdya search --mode hybrid --collection notes -n 10 "embedding model"`
     validations:
       required: true
 
