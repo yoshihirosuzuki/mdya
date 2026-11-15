@@ -36,18 +36,15 @@ use super::super::{Factories, Io, LogSettings, run_with};
 use super::{Environment, hf_token, progress_terminal, size_limit};
 
 /// The home directory that the tests give, an absolute path on the operating
-/// system that runs them.
-#[cfg(windows)]
-const HOME: &str = r"C:\Users\user";
-#[cfg(not(windows))]
-const HOME: &str = "/home/user";
+/// system that runs them. It lies under a file of the crate, so that nothing
+/// can be there: looking for what mdya 0.4.x or earlier left in the settings
+/// and index directory looks at the real file system.
+const HOME: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml/home");
 
 /// The working directory that the tests give, an absolute path on the
-/// operating system that runs them.
-#[cfg(windows)]
-const WORK: &str = r"C:\work";
-#[cfg(not(windows))]
-const WORK: &str = "/work";
+/// operating system that runs them, under a file for the same reason as
+/// [`HOME`].
+const WORK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml/work");
 
 /// What a run is given, besides the arguments.
 struct Setup {
@@ -558,6 +555,194 @@ fn the_version_and_the_help_need_no_settings_and_index_directory() {
 
         assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.stderr);
     }
+}
+
+// What mdya 0.4.x or earlier left in the settings and index directory
+
+/// A settings and index directory of its own, holding each of `names` as a
+/// file.
+fn data_dir_with_files(names: &[&str]) -> tempfile::TempDir {
+    let data_dir = tempfile::tempdir().unwrap();
+    for name in names {
+        std::fs::write(data_dir.path().join(name), b"left by mdya 0.4.x\n").unwrap();
+    }
+    data_dir
+}
+
+/// The first line of the error about what mdya 0.4.x or earlier left at
+/// `places`, with its line break.
+fn old_version_error_line(places: &[PathBuf]) -> String {
+    let places: Vec<String> = places
+        .iter()
+        .map(|place| format!("\"{}\"", place.display()))
+        .collect();
+    format!(
+        "Error: mdya 0.4.x or earlier left its settings or index here, and this mdya does not use them: {}\n",
+        places.join(", ")
+    )
+}
+
+#[test]
+fn each_name_that_mdya_0_4_left_ends_with_its_place_before_anything_is_assembled() {
+    for name in ["config.yml", "index", "lance-models"] {
+        let data_dir = data_dir_with_files(&[name]);
+        let data_dir_arg = data_dir.path().to_str().unwrap();
+
+        let outcome = run(
+            &["--data-dir", data_dir_arg, "config", "list"],
+            Setup::new(),
+        );
+
+        assert_eq!(outcome.code, ExitCode::from(1), "{name}");
+        assert_eq!(outcome.stdout, "", "{name}");
+        assert!(
+            outcome
+                .stderr
+                .starts_with(&old_version_error_line(&[data_dir.path().join(name)])),
+            "{}",
+            outcome.stderr
+        );
+        assert!(nothing_assembled(&outcome), "{name}");
+    }
+}
+
+#[test]
+fn the_places_that_mdya_0_4_left_are_listed_in_order_and_left_as_they_are() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let config = data_dir.path().join("config.yml");
+    let index = data_dir.path().join("index");
+    let models = data_dir.path().join("lance-models");
+    std::fs::create_dir(&models).unwrap();
+    std::fs::create_dir(&index).unwrap();
+    std::fs::write(&config, b"embedding: old\n").unwrap();
+
+    let outcome = run(
+        &["--data-dir", data_dir.path().to_str().unwrap(), "status"],
+        Setup::new(),
+    );
+
+    assert_eq!(outcome.code, ExitCode::from(1));
+    assert!(
+        outcome.stderr.starts_with(&old_version_error_line(&[
+            config.clone(),
+            index.clone(),
+            models.clone()
+        ])),
+        "{}",
+        outcome.stderr
+    );
+    assert_eq!(std::fs::read(&config).unwrap(), b"embedding: old\n");
+    assert!(index.is_dir() && models.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symbolic_link_that_mdya_0_4_left_counts_without_being_followed() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let index = data_dir.path().join("index");
+    std::os::unix::fs::symlink(data_dir.path().join("nowhere"), &index).unwrap();
+
+    let outcome = run(
+        &["--data-dir", data_dir.path().to_str().unwrap(), "status"],
+        Setup::new(),
+    );
+
+    assert_eq!(outcome.code, ExitCode::from(1));
+    assert!(
+        outcome
+            .stderr
+            .starts_with(&old_version_error_line(&[index])),
+        "{}",
+        outcome.stderr
+    );
+}
+
+#[test]
+fn what_this_mdya_places_is_not_taken_for_what_mdya_0_4_left() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let dictionary = data_dir.path().join("index_language_models/lindera/ipadic");
+    std::fs::create_dir_all(&dictionary).unwrap();
+    std::fs::write(dictionary.join("config.yml"), b"").unwrap();
+    std::fs::create_dir(data_dir.path().join("lancedb")).unwrap();
+    std::fs::write(data_dir.path().join("config.json"), b"{}").unwrap();
+    std::fs::write(data_dir.path().join("gateway_write.lock"), b"").unwrap();
+
+    let outcome = run(
+        &[
+            "--data-dir",
+            data_dir.path().to_str().unwrap(),
+            "config",
+            "list",
+        ],
+        Setup::new(),
+    );
+
+    assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.stderr);
+    assert_eq!(outcome.records.config_dirs, [data_dir.path()]);
+}
+
+#[test]
+fn the_version_and_the_help_do_not_look_at_what_mdya_0_4_left() {
+    let data_dir = data_dir_with_files(&["config.yml"]);
+    let data_dir_arg = data_dir.path().to_str().unwrap();
+    for flag in ["--version", "--help"] {
+        let outcome = run(&["--data-dir", data_dir_arg, flag], Setup::new());
+
+        assert_eq!(outcome.code, ExitCode::SUCCESS, "{}", outcome.stderr);
+        assert!(nothing_assembled(&outcome), "{flag}");
+    }
+}
+
+#[test]
+fn a_usage_error_is_shown_before_what_mdya_0_4_left() {
+    let data_dir = data_dir_with_files(&["config.yml"]);
+    let data_dir_arg = data_dir.path().to_str().unwrap();
+
+    let log_level = run(
+        &["--data-dir", data_dir_arg, "--log-level", "loud", "status"],
+        Setup::new(),
+    );
+    let argument = run(&["--data-dir", data_dir_arg, "nosuch"], Setup::new());
+
+    assert_eq!(log_level.code, ExitCode::from(2));
+    assert!(
+        log_level
+            .stderr
+            .contains("the log level \"loud\" is not valid"),
+        "{}",
+        log_level.stderr
+    );
+    assert_eq!(argument.code, ExitCode::from(2));
+    assert!(
+        argument
+            .stderr
+            .starts_with("Error: the arguments are not valid"),
+        "{}",
+        argument.stderr
+    );
+}
+
+#[test]
+fn the_mcp_server_does_not_start_over_what_mdya_0_4_left() {
+    let data_dir = data_dir_with_files(&["index"]);
+    let mut setup = Setup::new();
+    setup.stdin = mcp_requests(&[]);
+
+    let outcome = run(
+        &["--data-dir", data_dir.path().to_str().unwrap(), "mcp"],
+        setup,
+    );
+
+    assert_eq!(outcome.code, ExitCode::from(1));
+    assert_eq!(outcome.stdout, "");
+    assert!(
+        outcome
+            .stderr
+            .starts_with(&old_version_error_line(&[data_dir.path().join("index")])),
+        "{}",
+        outcome.stderr
+    );
+    assert!(nothing_assembled(&outcome));
 }
 
 // Assembling
