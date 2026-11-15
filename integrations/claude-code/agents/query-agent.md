@@ -20,9 +20,9 @@ model: sonnet
 
 ## Retrieval heuristic
 
-1. Default to `mdya:search` (mode omitted = hybrid) at `level: "doc"` (top 1–3 hits).
+1. Default to `mdya:search` (mode omitted = hybrid) at `unit: "document"` (top 1–3 hits).
 2. For a short document (roughly 5–10k characters), fetch the whole document with `mdya:get_document`.
-3. For a large document, or a hit with many `matched_chunks`, search at `level: "chunk"`, then pinpoint with `get_document(chunk=N)`.
+3. For a large document (a hit with a large `chunk_count`), search again at `unit: "chunk"`, then pinpoint each hit with `mdya:get_document`, passing `chunk_index` and `end_chunk_index` to get the hit's chunk and the chunks around it.
 
 ## Return format (mandatory)
 
@@ -32,8 +32,8 @@ Write the answer body as flowing prose, placing an inline `[1]` `[2]` marker aft
 <answer body>. <claim 1> [1]. <claim 2> [2].
 
 ---
-[1] <collection> / <path>
-[2] <collection> / <path> (chunk_sequence=N)
+[1] <collection> / <key>
+[2] <collection> / <key> (chunk_index=N)
 ~~~
 
 When there is no relevant match at all, return a single short sentence with no `---` divider and no citation list:
