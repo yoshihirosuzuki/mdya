@@ -5,6 +5,7 @@ mod collection_operations;
 mod collection_sources;
 mod command_line;
 mod common;
+mod concurrent_operations;
 mod index_and_settings;
 mod ingest_operations;
 mod mcp_server;
