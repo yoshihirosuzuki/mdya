@@ -78,7 +78,8 @@ pub(crate) fn human_search(output: &SearchOutput) -> Result<String, UnsafeNumber
     Ok(blocks.join("\n"))
 }
 
-/// The index status, one `name: value` line an item.
+/// The index status, one `name: value` line an item, then a `warning:` line
+/// for each warning.
 pub(crate) fn human_status(output: &StatusOutput) -> String {
     let mut text = format!("version: mdya {}\n", replace_controls(&output.version));
     let dimensions = match output.configured_embedding_dimension {
@@ -106,6 +107,9 @@ pub(crate) fn human_status(output: &StatusOutput) -> String {
     let _ = writeln!(text, "collections: {}", output.collection_count.get());
     let _ = writeln!(text, "documents: {}", output.document_count.get());
     let _ = writeln!(text, "chunks: {}", output.chunk_count.get());
+    for warning in &output.warnings {
+        let _ = writeln!(text, "warning: {}", replace_controls(warning));
+    }
     text
 }
 
