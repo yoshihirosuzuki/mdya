@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use crate::config::{ConfigError, Settings};
+use crate::config::ConfigError;
 use crate::format::{Extracted, FileType, Format, FormatError};
 use crate::path::{MakePathAbsoluteError, make_path_absolute};
 use crate::watchdog::WatchdogSettings;
@@ -75,6 +75,13 @@ const DEFAULT_MODEL_CACHE_DIR: &str = "~/.mdya-models";
 
 /// The exit code when the memory watchdog stops mdya.
 const MEMORY_LIMIT_EXIT_CODE: i32 = 137;
+
+/// The least memory limit, in MB, that showing the settings and setting or
+/// resetting the memory limit are watched at, so that however low the memory
+/// limit is set, the user can see it and raise it again. It is chosen to be
+/// the same as the default memory limit, which every operation is watched at
+/// until the user changes it; it does not follow a change of that default.
+const LEAST_MEMORY_LIMIT_FOR_THE_MEMORY_LIMIT_MB: u64 = 8192;
 
 /// The body of [`super::run_with`].
 pub(super) fn run_with(
@@ -198,6 +205,20 @@ impl Task {
             Task::Cli(operation) => operation.command(),
             Task::Mcp(_) => "mdya mcp",
         }
+    }
+
+    /// The memory limit, in MB, that the task is watched at, when the
+    /// memory limit is set to `set_mb`: at least
+    /// [`LEAST_MEMORY_LIMIT_FOR_THE_MEMORY_LIMIT_MB`] for showing the
+    /// settings and setting or resetting the memory limit, and `set_mb` for
+    /// the rest. 0, which turns the watchdog off, stays 0 for every task.
+    fn watched_memory_limit_mb(&self, set_mb: u64) -> u64 {
+        let for_the_memory_limit =
+            matches!(self, Task::Cli(operation) if operation.shows_or_changes_the_memory_limit());
+        if set_mb == 0 || !for_the_memory_limit {
+            return set_mb;
+        }
+        set_mb.max(LEAST_MEMORY_LIMIT_FOR_THE_MEMORY_LIMIT_MB)
     }
 }
 
@@ -362,7 +383,8 @@ async fn assemble_and_run(assemble: Assemble<'_>) -> u8 {
         Err(error) => return report(GatewayError::Entry(EntryError::Config(error)), output),
     };
     // Kept until the task ends: the watchdog runs while it is kept.
-    let _watchdog = (factories.start_watchdog)(watchdog_settings(&settings, output));
+    let watched_mb = task.watched_memory_limit_mb(settings.resources_memory_limit_mb);
+    let _watchdog = (factories.start_watchdog)(watchdog_settings(watched_mb, output));
     let operations = assembly::operations(assembly::Parts {
         factories: &factories,
         config,
@@ -418,10 +440,9 @@ async fn serve(
     }
 }
 
-/// What the memory watchdog is started with: the memory limit, and the
-/// explanation it writes to stderr when the limit is exceeded.
-fn watchdog_settings(settings: &Settings, output: &CliOutput) -> WatchdogSettings {
-    let limit = settings.resources_memory_limit_mb;
+/// What the memory watchdog is started with: the memory limit `limit` in MB,
+/// and the explanation it writes to stderr when the limit is exceeded.
+fn watchdog_settings(limit: u64, output: &CliOutput) -> WatchdogSettings {
     let explanation = output.error_report.memory_limit_explanation(limit);
     WatchdogSettings {
         memory_limit_mb: limit,
