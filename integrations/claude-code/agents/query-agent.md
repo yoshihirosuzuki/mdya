@@ -22,7 +22,10 @@ model: sonnet
 
 1. Default to `mdya:search` (mode omitted = hybrid) at `level: "doc"` (top 1–3 hits).
 2. For a short document (roughly 5–10k characters), fetch the whole document with `mdya:get_document`.
-3. For a large document, or a hit with many `matched_chunks`, search at `level: "chunk"`, then pinpoint with `get_document(chunk=N)`.
+3. For a large document, or a hit with many `matched_chunks`, search at `level: "chunk"`. For each hit (`chunk_sequence` = N):
+   - If the hit carries no `chunk_count`, the mdya server predates chunk ranges: fetch `get_document(chunk=N)` alone.
+   - Otherwise read it with its neighbours in one call: `get_document(chunk=max(N-1, 0), chunk_end=N+1)` (a `chunk_end` past the last chunk is fine). Merge overlapping ranges of hits in the same document. If more context is needed, widen the range up to `chunk_count - 1`.
+   - On `payload_too_large`, narrow the range; if a single chunk still exceeds the cap, rely on the hit's snippet.
 
 ## Return format (mandatory)
 
@@ -35,6 +38,8 @@ Write the answer body as flowing prose, placing an inline `[1]` `[2]` marker aft
 [1] <collection> / <path>
 [2] <collection> / <path> (chunk_sequence=N)
 ~~~
+
+For a chunk read as part of a range, cite the hit's `chunk_sequence`.
 
 When there is no relevant match at all, return a single short sentence with no `---` divider and no citation list:
 
