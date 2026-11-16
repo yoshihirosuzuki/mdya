@@ -12,7 +12,7 @@ use serde_json::json;
 use tokio::runtime::RuntimeFlavor;
 
 use crate::collection::CollectionInfo;
-use crate::config::{Config, ConfigError, Settings};
+use crate::config::{Config, ConfigError, SettingChange, Settings, check_setting};
 use crate::embedding::test_double::TestEmbedding;
 use crate::embedding::{Embedding, EmbeddingSettings};
 use crate::format::Format;
@@ -370,6 +370,50 @@ fn settings_with(change: impl FnOnce(&mut Settings)) -> Settings {
     let mut settings = TestConfig::default_settings();
     change(&mut settings);
     settings
+}
+
+/// A configuration test double whose memory limit is `mb`. It answers `set`
+/// with a change of the setting named to the number set, and `reset` with a
+/// change to 8192, each from `mb`.
+fn memory_limit_set_to(mb: u64) -> TestConfig {
+    TestConfig::new()
+        .on_current(move || {
+            Ok(settings_with(|settings| {
+                settings.resources_memory_limit_mb = mb
+            }))
+        })
+        .on_change(move |call| {
+            let (name, after) = match call {
+                ConfigCall::Set { name, value } => (name, value.parse::<u64>().unwrap()),
+                ConfigCall::Reset { name } => (name, 8192),
+                ConfigCall::Current => unreachable!("reading the settings is not a change"),
+            };
+            Ok(SettingChange {
+                name: check_setting(name, None).unwrap(),
+                before: json!(mb),
+                after: json!(after),
+            })
+        })
+}
+
+/// A setup whose configuration test double is [`memory_limit_set_to`]`(mb)`,
+/// with `home` as the home directory: changing a setting takes the lock on
+/// write operations in the settings and index directory.
+fn memory_limit_setup(mb: u64, home: &tempfile::TempDir) -> Setup {
+    let mut setup = Setup::new();
+    setup.config = memory_limit_set_to(mb);
+    setup.dirs = test_dir_lookup(Some(home.path().to_str().unwrap()), Ok(WORK));
+    setup
+}
+
+/// The memory limits, in MB, that the watchdogs of a run were started with.
+fn watched_memory_limits(outcome: &Outcome) -> Vec<u64> {
+    outcome
+        .watchdog
+        .started
+        .iter()
+        .map(|settings| settings.memory_limit_mb)
+        .collect()
 }
 
 /// The lines that an MCP client writes to start the exchange, and then to
@@ -865,7 +909,7 @@ fn settings_that_cannot_be_read_end_before_the_watchdog_starts() {
 
 #[test]
 fn the_watchdog_runs_with_the_memory_limit_until_the_operation_ends() {
-    let outcome = run(&["config", "list"], Setup::new());
+    let outcome = run(&["collection", "list"], Setup::new());
 
     let started = &outcome.watchdog.started;
     assert_eq!(started.len(), 1);
@@ -880,6 +924,155 @@ fn the_watchdog_runs_with_the_memory_limit_until_the_operation_ends() {
     );
     assert!(started[0].message.ends_with('\n'));
     assert_eq!(outcome.watchdog.running, 0);
+}
+
+// Showing the settings and setting or resetting the memory limit are watched
+// at 8192 MB at the least (`LEAST_MEMORY_LIMIT_FOR_THE_MEMORY_LIMIT_MB` in
+// `entry.rs`), so that however low the memory limit is set, the user can see
+// it and raise it again.
+
+#[test]
+fn showing_the_settings_under_a_memory_limit_of_1_mb_shows_it_and_is_watched_at_8192_mb() {
+    let home = tempfile::tempdir().unwrap();
+
+    let human = run(&["config", "list"], memory_limit_setup(1, &home));
+    let json = run(&["config", "list", "--json"], memory_limit_setup(1, &home));
+
+    assert_eq!(human.code, ExitCode::SUCCESS, "{}", human.stderr);
+    assert!(
+        human.stdout.contains("resources.memory_limit_mb = 1\n"),
+        "{}",
+        human.stdout
+    );
+    assert_eq!(watched_memory_limits(&human), [8192]);
+    assert!(
+        human.watchdog.started[0]
+            .message
+            .starts_with("Error: mdya's memory usage went over the limit of 8192 MB"),
+        "{}",
+        human.watchdog.started[0].message
+    );
+    assert_eq!(json.code, ExitCode::SUCCESS, "{}", json.stderr);
+    let shown: serde_json::Value = serde_json::from_str(&json.stdout).unwrap();
+    assert_eq!(shown["resources.memory_limit_mb"], json!(1));
+    assert_eq!(watched_memory_limits(&json), [8192]);
+}
+
+#[test]
+fn changing_a_memory_limit_of_1_mb_changes_it_and_is_watched_at_8192_mb() {
+    let changes: [(&[&str], ConfigCall, &str); 4] = [
+        (
+            &["config", "set", "resources.memory_limit_mb", "8192"],
+            ConfigCall::Set {
+                name: "resources.memory_limit_mb".to_owned(),
+                value: "8192".to_owned(),
+            },
+            "Changed resources.memory_limit_mb from 1 to 8192.\n",
+        ),
+        (
+            &["config", "set", "resources.memory_limit_mb", "2"],
+            ConfigCall::Set {
+                name: "resources.memory_limit_mb".to_owned(),
+                value: "2".to_owned(),
+            },
+            "Changed resources.memory_limit_mb from 1 to 2.\n",
+        ),
+        (
+            &["config", "set", "resources.memory_limit_mb", "1"],
+            ConfigCall::Set {
+                name: "resources.memory_limit_mb".to_owned(),
+                value: "1".to_owned(),
+            },
+            "Changed resources.memory_limit_mb from 1 to 1.\n",
+        ),
+        (
+            &["config", "reset", "resources.memory_limit_mb"],
+            ConfigCall::Reset {
+                name: "resources.memory_limit_mb".to_owned(),
+            },
+            "Changed resources.memory_limit_mb from 1 to 8192.\n",
+        ),
+    ];
+    for (args, call, message) in changes {
+        let home = tempfile::tempdir().unwrap();
+
+        let outcome = run(args, memory_limit_setup(1, &home));
+
+        assert_eq!(
+            outcome.code,
+            ExitCode::SUCCESS,
+            "{args:?}: {}",
+            outcome.stderr
+        );
+        assert_eq!(outcome.stderr, message, "{args:?}");
+        assert_eq!(
+            outcome.config_calls,
+            [ConfigCall::Current, call],
+            "{args:?}"
+        );
+        assert_eq!(watched_memory_limits(&outcome), [8192], "{args:?}");
+    }
+}
+
+#[test]
+fn other_operations_are_watched_at_a_memory_limit_of_1_mb() {
+    let others: [&[&str]; 4] = [
+        &["collection", "list"],
+        &["config", "set", "resources.embedding_parallelism", "4"],
+        &["config", "reset", "resources.embedding_parallelism"],
+        &["mcp"],
+    ];
+    for args in others {
+        let home = tempfile::tempdir().unwrap();
+
+        let outcome = run(args, memory_limit_setup(1, &home));
+
+        assert_eq!(watched_memory_limits(&outcome), [1], "{args:?}");
+    }
+}
+
+#[test]
+fn showing_the_settings_and_changing_the_memory_limit_are_watched_at_a_memory_limit_above_8192_mb()
+{
+    let operations: [&[&str]; 2] = [
+        &["config", "list"],
+        &["config", "set", "resources.memory_limit_mb", "1"],
+    ];
+    for args in operations {
+        let home = tempfile::tempdir().unwrap();
+
+        let outcome = run(args, memory_limit_setup(16384, &home));
+
+        assert_eq!(
+            outcome.code,
+            ExitCode::SUCCESS,
+            "{args:?}: {}",
+            outcome.stderr
+        );
+        assert_eq!(watched_memory_limits(&outcome), [16384], "{args:?}");
+    }
+}
+
+#[test]
+fn a_memory_limit_of_0_turns_the_watchdog_off_for_every_operation() {
+    let operations: [&[&str]; 3] = [
+        &["config", "list"],
+        &["config", "set", "resources.memory_limit_mb", "8192"],
+        &["collection", "list"],
+    ];
+    for args in operations {
+        let home = tempfile::tempdir().unwrap();
+
+        let outcome = run(args, memory_limit_setup(0, &home));
+
+        assert_eq!(
+            outcome.code,
+            ExitCode::SUCCESS,
+            "{args:?}: {}",
+            outcome.stderr
+        );
+        assert_eq!(watched_memory_limits(&outcome), [0], "{args:?}");
+    }
 }
 
 #[test]

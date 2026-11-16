@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::collection::{CollectionChange, CollectionError};
-use crate::config::ConfigError;
+use crate::config::{ConfigError, SettingName};
 use crate::format::Format;
 use crate::ingest::IngestError;
 use crate::query::{ChunkRangeRequest, QueryError, SearchMode, SearchUnit};
@@ -104,6 +104,20 @@ impl CliOperation {
             Operation::ResetSetting { .. } => "mdya config reset",
             Operation::RebuildEmbeddings { .. } => "mdya embedding rebuild",
             Operation::Optimize => "mdya optimize",
+        }
+    }
+
+    /// Whether the operation shows the settings, or sets or resets the
+    /// memory limit: the operations that a user who set too low a memory
+    /// limit needs, to see the memory limit and raise it again.
+    pub(crate) fn shows_or_changes_the_memory_limit(&self) -> bool {
+        let memory_limit = SettingName::ResourcesMemoryLimitMb.as_str();
+        match &self.0 {
+            Operation::ListSettings { .. } => true,
+            Operation::SetSetting { name, .. } | Operation::ResetSetting { name } => {
+                name == memory_limit
+            }
+            _ => false,
         }
     }
 }
