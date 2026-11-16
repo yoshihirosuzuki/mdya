@@ -300,7 +300,9 @@ impl Workspace {
         }
     }
 
-    fn arguments(&self, args: &[&str]) -> Vec<OsString> {
+    /// The arguments that run mdya with `args` on this test's directories,
+    /// the program's name first.
+    pub fn arguments(&self, args: &[&str]) -> Vec<OsString> {
         let mut all = vec![OsString::from("mdya")];
         all.extend(self.directory_arguments());
         all.extend(args.iter().map(OsString::from));

@@ -56,8 +56,13 @@ impl StdioServer {
     /// Starts `mdya mcp` from `command`, the executable with the test's
     /// directories.
     pub(crate) fn start(mut command: Command) -> Self {
+        command.arg("mcp");
+        Self::start_as_it_is(command)
+    }
+
+    /// Starts `command` as it is, which runs the MCP server over stdio.
+    pub(crate) fn start_as_it_is(mut command: Command) -> Self {
         let mut child = command
-            .arg("mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -129,6 +134,21 @@ impl StdioServer {
                     .unwrap_or_else(|| panic!("{method} failed: {message}"))
                     .clone();
                 return (line, result);
+            }
+        }
+    }
+
+    /// Reads the lines on stdout up to the first that ends with `mark`. They
+    /// need not be JSON-RPC messages: they are what is written before the
+    /// server starts, such as what the test harness writes when the server
+    /// runs in a test's process of its own.
+    pub(crate) fn skip_past(&mut self, mark: &str) {
+        let deadline = Instant::now() + ANSWER_WAIT;
+        loop {
+            match next_line(&self.stdout, deadline) {
+                Ok(line) if line.ends_with(mark) => return,
+                Ok(_) => {}
+                Err(error) => panic!("no line ends with {mark:?}: {error}"),
             }
         }
     }
@@ -461,7 +481,7 @@ pub(crate) fn succeeded(result: &Value) -> Value {
 }
 
 /// The error of a tool's failed result, which its text content must hold too.
-fn failed(result: &Value) -> Value {
+pub(crate) fn failed(result: &Value) -> Value {
     assert_eq!(result["isError"], true, "{result}");
     assert_eq!(
         text_content(result),
