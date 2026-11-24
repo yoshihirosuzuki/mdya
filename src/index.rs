@@ -163,9 +163,13 @@ pub enum IndexError {
     CannotWrite { source: BoxError },
 }
 
-/// What gets the outcome of each document `register_stream` has written.
+/// What gets the outcome of each document `register_stream` has written, and
+/// is told when the embedding vectors of a document to write are made.
 pub trait RegistrationSink: Send + Sync {
     fn registered(&self, collection: &CollectionName, key: &Key, outcome: DocumentOutcome);
+    /// All the embedding vectors of the document are made, and it is not
+    /// written yet. A sink that has no use for this leaves it doing nothing.
+    fn vectors_made(&self, _collection: &CollectionName, _key: &Key) {}
 }
 
 #[async_trait]
@@ -174,7 +178,10 @@ pub trait Index: Send + Sync {
     /// the time of, or skips each, and passes which to `results` once the
     /// document is written. It asks `documents` for the next document only
     /// when it needs one, and makes the embedding vectors of at most
-    /// `parallelism` documents at once (one when it is 0).
+    /// `parallelism` documents at once (one when it is 0). Once all the
+    /// vectors of a document are made, before it is written, it tells
+    /// `results` so, also for a document without chunks; not for a document
+    /// it skips or updates only the time of, nor for one whose vectors fail.
     ///
     /// The documents are read and written a bulk at a time. When making a
     /// document's embedding vectors fails, it starts no other document, and
@@ -2068,9 +2075,10 @@ impl LanceDbIndex {
     /// versions at once, decides what each needs, makes the embedding vectors
     /// of those to write, and writes them together. The outcome of a document
     /// that needs nothing is passed as soon as that is decided, and the others'
-    /// once they are written. When making the vectors fails, the documents
-    /// whose vectors are made are written all the same, and the first error is
-    /// returned after.
+    /// once they are written. A document to write is told of once its vectors
+    /// are made, before the bulk is written. When making the vectors fails,
+    /// the documents whose vectors are made are written all the same, and the
+    /// first error is returned after.
     ///
     /// It holds the write lock from before it reads the versions until the
     /// documents are written, also while the vectors are made: what it decides
@@ -2342,7 +2350,8 @@ impl LanceDbIndex {
     }
 
     /// Makes the embedding vectors of the documents of the bulk to write, up
-    /// to the parallelism at a time. Once a document fails, no other one is
+    /// to the parallelism at a time, and tells `results` of each document
+    /// once all its vectors are made. Once a document fails, no other one is
     /// started, and those under way are finished. Returns the vectors made,
     /// by the document's place in the bulk, and the first error.
     async fn make_bulk_vectors(
@@ -2368,7 +2377,12 @@ impl LanceDbIndex {
                 running.push(async move { (at, embedding.await) });
             }
             match running.next().await {
-                Some((at, Ok(vectors))) => made[at] = Some(vectors),
+                Some((at, Ok(vectors))) => {
+                    let document = &decided[at].document;
+                    let results = registering.results;
+                    results.vectors_made(&document.collection, &document.key);
+                    made[at] = Some(vectors);
+                }
                 Some((_, Err(error))) => {
                     failed.get_or_insert(error);
                 }

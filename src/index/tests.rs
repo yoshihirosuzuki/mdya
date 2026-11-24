@@ -2841,10 +2841,12 @@ async fn quotes_and_wildcards_in_keys_and_collection_names_pick_only_their_own_r
 // ---------------------------------------------------------------- registering a stream of documents
 
 /// Records the outcomes passed to it, in order, each with how many times rows
-/// had been added to the document table by then.
+/// had been added to the document table by then, and the keys of the
+/// documents whose embedding vectors it was told are made, in order.
 struct RecordedOutcomes {
     hooks: Arc<TestHooks>,
     outcomes: Mutex<Vec<(String, DocumentOutcome, usize)>>,
+    told: Mutex<Vec<String>>,
 }
 
 impl RecordedOutcomes {
@@ -2852,6 +2854,7 @@ impl RecordedOutcomes {
         Self {
             hooks: hooks.clone(),
             outcomes: Mutex::default(),
+            told: Mutex::default(),
         }
     }
 
@@ -2862,6 +2865,13 @@ impl RecordedOutcomes {
             .map(|(key, outcome, _)| (key.clone(), *outcome));
         pairs.collect()
     }
+
+    /// The keys it was told of, sorted.
+    fn told(&self) -> Vec<String> {
+        let mut told = self.told.lock().unwrap().clone();
+        told.sort();
+        told
+    }
 }
 
 impl RegistrationSink for RecordedOutcomes {
@@ -2869,6 +2879,10 @@ impl RegistrationSink for RecordedOutcomes {
         let written = self.hooks.count(LanceCall::AddRows(TableName::Document));
         let mut outcomes = self.outcomes.lock().unwrap();
         outcomes.push((key.0.clone(), outcome, written));
+    }
+
+    fn vectors_made(&self, _collection: &CollectionName, key: &Key) {
+        self.told.lock().unwrap().push(key.0.clone());
     }
 }
 
@@ -2972,6 +2986,8 @@ async fn a_bulk_of_mixed_documents_is_read_once_and_written_once_per_kind_of_wri
     ];
     expected.sort_by(by_key);
     assert_eq!(recorded, expected);
+    // Once each, and only of the documents whose vectors are made.
+    assert_eq!(outcomes.told(), ["body.md", "new.md", "overwritten.md"]);
     let all: Vec<_> = documents.iter().collect();
     assert_index_holds(data_dir.path(), &all, &embedding).await;
     let calls: Vec<LanceCall> = hooks.calls().split_off(calls_before);
@@ -3130,6 +3146,40 @@ async fn outcomes_are_passed_once_the_documents_are_written() {
 }
 
 #[tokio::test]
+async fn the_documents_whose_vectors_are_made_are_told_of_before_the_bulk_is_written() {
+    prepare_full_text_search().await;
+    let embedding = embedding_of(MODEL_NAME, 8);
+    let hooks = Arc::new(TestHooks::default());
+    let (_data_dir, index) = index_with(embedding, &hooks);
+    let stored = [
+        document("unchanged.md", ASCII_BODY),
+        document("time.md", ASCII_BODY),
+        document("body.md", ASCII_BODY),
+    ];
+    register_all(&index, &stored).await;
+    let documents = [
+        stored[0].clone(),
+        DocumentToRegister {
+            time: Some(base_time() + Duration::from_secs(1)),
+            ..stored[1].clone()
+        },
+        document("body.md", MIXED_BODY),
+        document("new.md", MIXED_BODY),
+        document("empty.md", ""),
+    ];
+    // Writing the bulk begins by deleting its chunk rows.
+    hooks.plan(LanceCall::WriteRows(TableName::Chunk), Plan::Fail);
+    let outcomes = RecordedOutcomes::new(&hooks);
+
+    let stopped = register_stream_of(&index, &documents, 2, &outcomes).await;
+
+    assert!(matches!(stopped, Err(IndexError::CannotWrite { .. })));
+    assert_eq!(outcomes.told(), ["body.md", "empty.md", "new.md"]);
+    let unchanged = outcome_of("unchanged.md", DocumentOutcome::Unchanged);
+    assert_eq!(outcomes.outcomes(), [unchanged]);
+}
+
+#[tokio::test]
 async fn a_bulk_whose_model_fails_writes_the_documents_made_before_and_asks_for_no_more() {
     prepare_full_text_search().await;
     let embedding = embedding_of(MODEL_NAME, 8);
@@ -3155,6 +3205,7 @@ async fn a_bulk_whose_model_fails_writes_the_documents_made_before_and_asks_for_
         outcomes.outcomes(),
         [outcome_of("1.md", DocumentOutcome::Added)]
     );
+    assert_eq!(outcomes.told(), ["1.md"]);
     assert_index_holds(data_dir.path(), &[&documents[0]], &embedding).await;
     // Registering them again goes on.
     let again = RecordedOutcomes::new(&hooks);
