@@ -32,4 +32,14 @@ ignore = [
     # rustybuzz (unmaintained, via xtask -> krilla)
     # https://rustsec.org/advisories/RUSTSEC-2026-0206.html
     "RUSTSEC-2026-0206",
+    # humantime (unmaintained, via lancedb and lance-index)
+    # https://rustsec.org/advisories/RUSTSEC-2026-0542.html
+    "RUSTSEC-2026-0542",
+    # chrono (unmaintained, a direct dependency and also via lancedb, lance-index,
+    # arrow-array, rmcp and schemars)
+    # https://rustsec.org/advisories/RUSTSEC-2026-0543.html
+    "RUSTSEC-2026-0543",
+    # chrono-tz (unmaintained, via lancedb, lance-index and arrow-array)
+    # https://rustsec.org/advisories/RUSTSEC-2026-0555.html
+    "RUSTSEC-2026-0555",
 ]
