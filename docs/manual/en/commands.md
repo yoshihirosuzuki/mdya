@@ -173,7 +173,7 @@ Brings directory and archive collections up to date with the current contents of
 
 Documents that have not changed are skipped, so from the second time on, only the documents that have changed are ingested. The first time an embedding model is used, mdya fetches the embedding model ([Settings: Embedding model](configuration.md#embedding-model)).
 
-The progress shows the number of documents processed, the total number of documents to process, and the number of chunks whose embeddings have been made. At the end, the number of documents for each result is shown.
+The progress shows the number of documents processed and the total number of documents to process. The progress bar does not show the number of chunks; it shows a mark at the head of its line instead. The mark turns as more chunks have their embeddings made. While one document takes long to process, a turning mark shows that it is going on. When the state is written as one line, the line also shows the number of chunks whose embeddings have been made. At the end, the number of documents for each result is shown.
 
 ```
 $ mdya update notes

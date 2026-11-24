@@ -38,7 +38,9 @@ mod tests;
 /// cannot be extracted, or whose content `contents` did not hand over before
 /// it ended is warned about, counted as failed, and skipped, as is an item
 /// without a key. The others are counted when `index` passes their outcomes,
-/// that is, once they are written. When `items` asks for it, the documents of
+/// that is, once they are written. In the progress, a document is counted as
+/// done already when `index` tells that its embedding vectors are made, and
+/// not again with its outcome. When `items` asks for it, the documents of
 /// the collection other than the items with a key, and other than those under
 /// the unreadable directories, are deleted at the end.
 ///
@@ -91,11 +93,14 @@ pub async fn ingest_items(
 }
 
 /// The counts so far, reported as progress at the start and whenever a
-/// document is counted.
+/// document is counted as done.
 struct Tally<'a> {
     counts: UpdateReport,
     done: u64,
     total: u64,
+    /// The documents counted as done when `index` told that their embedding
+    /// vectors are made, and whose outcomes have not been passed.
+    told: HashSet<Key>,
     progress: &'a dyn ProgressSink,
 }
 
@@ -108,13 +113,21 @@ impl<'a> Tally<'a> {
             },
             done: 0,
             total,
+            told: HashSet::new(),
             progress,
         };
         tally.report();
         tally
     }
 
-    fn count(&mut self, outcome: DocumentOutcome) {
+    /// Counts the document as done, ahead of its outcome.
+    fn vectors_made(&mut self, key: &Key) {
+        self.told.insert(key.clone());
+        self.finish_one();
+    }
+
+    /// Counts the outcome, and the document as done unless it already is.
+    fn count(&mut self, key: &Key, outcome: DocumentOutcome) {
         let count = match outcome {
             DocumentOutcome::Added => &mut self.counts.added,
             DocumentOutcome::Changed => &mut self.counts.changed,
@@ -122,7 +135,9 @@ impl<'a> Tally<'a> {
             DocumentOutcome::Reingested => &mut self.counts.reingested,
         };
         *count += 1;
-        self.finish_one();
+        if !self.told.remove(key) {
+            self.finish_one();
+        }
     }
 
     fn failed(&mut self) {
@@ -191,7 +206,8 @@ enum Event {
 struct NoContent;
 
 /// What the stream of documents and `index` both reach: `index` passes the
-/// outcomes through a shared reference while it holds the stream.
+/// outcomes, and tells of the documents whose embedding vectors are made,
+/// through a shared reference while it holds the stream.
 struct Shared<'p> {
     tally: Mutex<Tally<'p>>,
     /// The first panic, which has to reach the caller and wins over an error.
@@ -218,6 +234,16 @@ impl<'p> Shared<'p> {
         lock(&self.panic).is_some()
     }
 
+    /// Counts with `count`. A panic while counting is one on this side, so it
+    /// ends the stream rather than unwinding through `index`, which writes
+    /// what it has finished before it returns.
+    fn count_from_index(&self, count: impl FnOnce(&mut Tally<'p>)) {
+        let counted = catch_unwind(AssertUnwindSafe(|| count(&mut self.tally())));
+        if let Err(panic) = counted {
+            self.note_panic(panic);
+        }
+    }
+
     /// The counts, unless a panic has to reach the caller instead.
     fn finish(self) -> Tally<'p> {
         let panic = self.panic.into_inner();
@@ -230,14 +256,12 @@ impl<'p> Shared<'p> {
 }
 
 impl RegistrationSink for Shared<'_> {
-    /// A panic while counting is one on this side, so it ends the stream
-    /// rather than unwinding through `index`, which writes what it has
-    /// finished before it returns.
-    fn registered(&self, _collection: &CollectionName, _key: &Key, outcome: DocumentOutcome) {
-        let counted = catch_unwind(AssertUnwindSafe(|| self.tally().count(outcome)));
-        if let Err(panic) = counted {
-            self.note_panic(panic);
-        }
+    fn registered(&self, _collection: &CollectionName, key: &Key, outcome: DocumentOutcome) {
+        self.count_from_index(|tally| tally.count(key, outcome));
+    }
+
+    fn vectors_made(&self, _collection: &CollectionName, key: &Key) {
+        self.count_from_index(|tally| tally.vectors_made(key));
     }
 }
 

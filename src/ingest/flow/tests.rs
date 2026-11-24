@@ -182,13 +182,16 @@ impl ItemContents for ScriptedContents {
 
 /// An `Index` that takes the documents of the stream, sends each key it
 /// receives, and writes a document only when `gate` has a permit, then passes
-/// `Added` for it. It can fail or panic for a key, records whether a write was
-/// dropped before it returned, and records the parallelism of each call. By
-/// default it writes each document before it asks for the next one.
+/// `Added` for it. It can tell that the embedding vectors of some keys are
+/// made as it takes their documents, before it sends the key. It can fail or
+/// panic for a key, records whether a write was dropped before it returned,
+/// and records the parallelism of each call. By default it writes each
+/// document before it asks for the next one.
 struct GatedIndex {
     gate: Arc<Semaphore>,
     started: UnboundedSender<Key>,
     registered: Mutex<Vec<Key>>,
+    tells_of: HashSet<Key>,
     fail_on: Option<Key>,
     panic_on: Option<Key>,
     dropped_before_return: Arc<AtomicBool>,
@@ -203,6 +206,7 @@ impl GatedIndex {
             gate,
             started,
             registered: Mutex::new(Vec::new()),
+            tells_of: HashSet::new(),
             fail_on: None,
             panic_on: None,
             dropped_before_return: Arc::new(AtomicBool::new(false)),
@@ -210,6 +214,13 @@ impl GatedIndex {
             writes_after_the_stream_ends: false,
         };
         (index, receiver)
+    }
+
+    /// Tells that the embedding vectors of the documents with `names` are
+    /// made, as it takes them.
+    fn telling_vectors_made_of(mut self, names: &[&str]) -> Self {
+        self.tells_of = keys(names);
+        self
     }
 
     fn failing_on(mut self, key: &str) -> Self {
@@ -267,6 +278,9 @@ impl Index for GatedIndex {
         self.parallelisms.lock().unwrap().push(parallelism);
         let mut held = Vec::new();
         while let Some(document) = documents.next().await {
+            if self.tells_of.contains(&document.key) {
+                results.vectors_made(&document.collection, &document.key);
+            }
             self.started.send(document.key.clone()).unwrap();
             if self.writes_after_the_stream_ends {
                 held.push(document);
@@ -410,6 +424,31 @@ fn spawn_flow_with(
     tokio::spawn(async move {
         let progress = TestProgressSink::new();
         ingest_items(&instruction, items, &mut contents, format, index, &progress).await
+    })
+}
+
+/// Runs the flow over the items and contents of `names` on its own task, as
+/// `spawn_flow` does, with a parallelism of one, reporting to `progress`.
+fn spawn_flow_reporting_to(
+    progress: &Arc<TestProgressSink>,
+    names: &[&str],
+    index: Arc<dyn Index>,
+) -> Flow {
+    let progress = progress.clone();
+    let items = items_for(names);
+    let mut contents = ScriptedContents::of(names);
+    tokio::spawn(async move {
+        let format = Arc::new(TestFormat::new());
+        let instruction = instruction(1);
+        ingest_items(
+            &instruction,
+            items,
+            &mut contents,
+            format,
+            index,
+            &*progress,
+        )
+        .await
     })
 }
 
@@ -1008,31 +1047,66 @@ async fn after_the_index_fails_no_new_document_starts_and_only_passed_outcomes_a
 }
 
 #[tokio::test]
-async fn the_progress_counts_only_the_documents_whose_outcome_the_index_passed() {
+async fn the_progress_does_not_count_a_document_the_index_stopped_at_before_telling_of_it() {
     let (index, _started) = GatedIndex::new(Arc::new(Semaphore::new(1)));
-    let index: Arc<dyn Index> = Arc::new(index.failing_on("b.md"));
+    let index = Arc::new(index.failing_on("b.md"));
     let progress = Arc::new(TestProgressSink::new());
-    let flow_progress = progress.clone();
     let names = ["a.md", "b.md", "c.md", "d.md"];
 
-    let flow = tokio::spawn(async move {
-        let format = Arc::new(TestFormat::new());
-        let mut contents = ScriptedContents::of(&names);
-        ingest_items(
-            &instruction(1),
-            items_for(&names),
-            &mut contents,
-            format,
-            index,
-            &*flow_progress,
-        )
-        .await
-    });
+    let flow = spawn_flow_reporting_to(&progress, &names, index);
     flow.await.unwrap().unwrap_err();
 
     let reported = |done| Progress {
         done,
         total: Some(4),
+    };
+    assert_eq!(progress.reports(), vec![reported(0), reported(1)]);
+}
+
+#[tokio::test]
+async fn a_document_is_counted_when_the_index_tells_that_its_vectors_are_made() {
+    let gate = Arc::new(Semaphore::new(0));
+    let (index, mut started) = GatedIndex::new(gate.clone());
+    let names = ["a.md", "b.md"];
+    let index = index
+        .telling_vectors_made_of(&names)
+        .writing_after_the_stream_ends();
+    let progress = Arc::new(TestProgressSink::new());
+
+    let mut flow = spawn_flow_reporting_to(&progress, &names, Arc::new(index));
+    next_start(&mut started, &mut flow).await;
+    next_start(&mut started, &mut flow).await;
+    let before_written = progress.reports();
+    gate.add_permits(2);
+    let report = flow.await.unwrap().unwrap();
+
+    let reported = |done| Progress {
+        done,
+        total: Some(2),
+    };
+    let counted = vec![reported(0), reported(1), reported(2)];
+    assert_eq!(before_written, counted);
+    // Not counted again when their outcomes are passed.
+    assert_eq!(progress.reports(), counted);
+    assert_eq!(report.added, 2);
+}
+
+#[tokio::test]
+async fn a_document_told_of_and_then_not_written_is_in_the_progress_but_not_in_the_counts() {
+    let (index, _started) = GatedIndex::new(Arc::new(Semaphore::new(1)));
+    let index = index.telling_vectors_made_of(&["a.md"]).failing_on("a.md");
+    let progress = Arc::new(TestProgressSink::new());
+
+    let flow = spawn_flow_reporting_to(&progress, &["a.md", "b.md"], Arc::new(index));
+    let result = flow.await.unwrap();
+
+    let Err(UpdateStopped { counts, .. }) = result else {
+        panic!("expected UpdateStopped, got {result:?}");
+    };
+    assert_eq!(counts, UpdateReport::default());
+    let reported = |done| Progress {
+        done,
+        total: Some(2),
     };
     assert_eq!(progress.reports(), vec![reported(0), reported(1)]);
 }
@@ -1201,6 +1275,39 @@ async fn a_panic_passing_an_outcome_ends_the_stream_and_what_was_started_is_awai
     assert!(!index_dropped.load(Ordering::SeqCst));
     assert!(!contents_dropped.load(Ordering::SeqCst));
     assert_eq!(index.registered().len(), 1);
+    assert!(started.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn a_panic_counting_a_document_told_of_ends_the_stream_and_the_index_goes_on() {
+    let gate = Arc::new(Semaphore::new(0));
+    let (index, mut started) = GatedIndex::new(gate.clone());
+    let index = Arc::new(index.telling_vectors_made_of(&["a.md"]));
+    let flow_index: Arc<dyn Index> = index.clone();
+    let (panicked, mut panic_seen) = mpsc::unbounded_channel();
+
+    let mut flow = tokio::spawn(async move {
+        let progress = PanickingProgress { panicked };
+        let mut contents = ScriptedContents::of(&["a.md", "b.md"]);
+        ingest_items(
+            &instruction(1),
+            items_for(&["a.md", "b.md"]),
+            &mut contents,
+            Arc::new(TestFormat::new()),
+            flow_index,
+            &progress,
+        )
+        .await
+    });
+    next_start(&mut started, &mut flow).await;
+    // Counted when the index told of it, before it is written.
+    panic_seen.try_recv().unwrap();
+    gate.add_permits(1);
+    let result = flow.await;
+
+    assert!(result.unwrap_err().is_panic());
+    // The panic did not unwind through the index, which wrote the document.
+    assert_eq!(index.registered(), vec![Key("a.md".to_owned())]);
     assert!(started.try_recv().is_err());
 }
 
