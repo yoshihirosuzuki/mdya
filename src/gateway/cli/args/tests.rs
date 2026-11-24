@@ -83,7 +83,7 @@ Options:
       --log-format <FORMAT>    How to write logs [default: compact] [possible values: compact, pretty, json]
       --no-color               Do not color the output
   -h, --help                   Print help
-      --version                Print the version
+  -v, --version                Print the version
 ";
 
 const SEARCH_HELP: &str = "\
@@ -107,6 +107,23 @@ Options:
 fn the_help_of_mdya_is_the_approved_one() {
     assert_eq!(help(&["--help"]), MDYA_HELP);
     assert_eq!(help(&["-h"]), MDYA_HELP);
+}
+
+#[test]
+fn mdya_without_arguments_is_its_help() {
+    assert_eq!(help(&[]), MDYA_HELP);
+}
+
+// A process can be started without even its name among its arguments.
+#[test]
+fn no_arguments_even_without_the_program_name_is_the_help_of_mdya() {
+    match read_args(Vec::new(), &TestFormat::new()) {
+        Ok(Invocation {
+            action: Action::Help(help),
+            ..
+        }) => assert_eq!(help.0, MDYA_HELP),
+        other => panic!("not the help: {other:?}"),
+    }
 }
 
 #[test]
@@ -231,10 +248,14 @@ fn a_help_flag_after_two_dashes_is_not_the_help() {
     ));
 }
 
+// Unlike no arguments at all, these options without a command are a usage error.
 #[test]
-fn no_command_is_a_usage_error() {
-    assert_eq!(usage(&[]), "no command was given");
+fn options_without_a_command_are_a_usage_error() {
     assert_eq!(usage(&["--no-color"]), "no command was given");
+    assert_eq!(
+        usage(&["--data-dir", "d", "--model-cache-dir", "m"]),
+        "no command was given"
+    );
 }
 
 #[test]
@@ -248,13 +269,33 @@ fn a_command_without_its_own_command_is_a_usage_error_without_the_help() {
 
 #[test]
 fn version_is_its_own_action() {
-    assert!(matches!(
-        read(&["--version"]),
-        Ok(Invocation {
-            action: Action::Version,
-            ..
-        })
-    ));
+    for args in [&["--version"][..], &["-v"], &["--no-color", "-v"]] {
+        assert!(
+            matches!(
+                read(args),
+                Ok(Invocation {
+                    action: Action::Version,
+                    ..
+                })
+            ),
+            "{args:?}"
+        );
+    }
+}
+
+// `-v` is taken where `--version` is, which is not after a command.
+#[test]
+fn the_version_after_a_command_is_a_usage_error() {
+    assert_eq!(
+        usage(&["status", "--version"]),
+        "unexpected argument '--version' found"
+    );
+    assert_eq!(usage(&["status", "-v"]), "unexpected argument '-v' found");
+}
+
+#[test]
+fn a_capital_v_is_not_the_version() {
+    assert_eq!(usage(&["-V"]), "unexpected argument '-V' found");
 }
 
 #[test]

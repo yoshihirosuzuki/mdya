@@ -591,7 +591,7 @@ fn a_relative_data_dir_without_a_working_directory_ends_before_anything_is_assem
 
 #[test]
 fn the_version_and_the_help_need_no_settings_and_index_directory() {
-    for args in [&["--version"][..], &["--help"][..]] {
+    for args in [&["--version"][..], &["-v"], &["--help"], &[]] {
         let mut setup = Setup::new();
         setup.dirs = test_dir_lookup(None, Err(std::io::ErrorKind::NotFound));
 
@@ -1267,7 +1267,7 @@ fn an_error_in_reading_the_arguments_is_not_colored_with_no_color() {
 
 #[test]
 fn the_version_and_the_help_create_no_component() {
-    for args in [&["--version"][..], &["--help"][..]] {
+    for args in [&["--version"][..], &["-v"], &["--help"], &[]] {
         let mut setup = Setup::new();
         // `format` would panic if it were created.
         setup.format_panics = true;

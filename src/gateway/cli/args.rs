@@ -35,7 +35,7 @@ const DEFAULT_ADDRESS: &str = "127.0.0.1:8000";
 const DEFAULT_LIMIT: u64 = 20;
 
 pub(super) fn read_args(args: Vec<OsString>, format: &dyn Format) -> Result<Invocation, CliError> {
-    if asks_for_help(&args) {
+    if has_no_arguments(&args) || asks_for_help(&args) {
         return help_for_commands(&args);
     }
     let matches = Cli::command()
@@ -130,6 +130,12 @@ fn help(text: String) -> Invocation {
         options: GlobalOptions::default(),
         action: Action::Help(CliHelp(text)),
     }
+}
+
+/// Whether nothing follows the program's name, as when `mdya` alone is
+/// typed, which shows the help of mdya even without `--help`.
+fn has_no_arguments(args: &[OsString]) -> bool {
+    args.len() <= 1
 }
 
 /// Whether `--help` or `-h` is among the arguments before `--`.
@@ -521,7 +527,8 @@ struct Cli {
     // above, would be.
     #[arg(short = 'h', long = "help", global = true, action = clap::ArgAction::Help, help = "Print help")]
     help: Option<bool>,
-    #[arg(long, help = "Print the version")]
+    // `-v`, not clap's own `-V`, which is turned off above.
+    #[arg(short = 'v', long, help = "Print the version")]
     version: bool,
     #[command(subcommand)]
     command: Option<Command>,

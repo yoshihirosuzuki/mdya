@@ -22,7 +22,7 @@ This page shows how to write the commands of mdya's CLI, and what they output. I
 | Rebuild the embeddings | [`mdya embedding rebuild`](#rebuilding-the-embeddings-mdya-embedding-rebuild) |
 | Maintain the index | [`mdya optimize`](#maintaining-the-index-mdya-optimize) |
 | Start the MCP server | [`mdya mcp`](#starting-the-mcp-server-mdya-mcp) |
-| Show the mdya version | [`mdya --version`](#showing-the-mdya-version-mdya---version) |
+| Show the mdya version | [`mdya --version`, `mdya -v`](#showing-the-mdya-version-mdya---version-mdya--v) |
 | Show help | [`--help`, `-h`](#showing-help---help--h) |
 
 ## Common to all commands
@@ -506,12 +506,14 @@ Starts the MCP server, which MCP clients such as AI assistants use. How to use i
 
 Possible errors: [The address to listen on cannot be used](errors.md#the-address-to-listen-on-cannot-be-used), [The connection with the MCP client cannot be started](errors.md#the-connection-with-the-mcp-client-cannot-be-started)
 
-## Showing the mdya version (`mdya --version`)
+## Showing the mdya version (`mdya --version`, `mdya -v`)
 
 ```
 $ mdya --version
 mdya X.Y.Z
 ```
+
+`mdya -v` is the same as `mdya --version`.
 
 ## Showing help (`--help`, `-h`)
 
@@ -519,4 +521,4 @@ You can add `--help` or `-h` to any command. `mdya --help` writes the list of co
 
 When `--help` is given, help is shown without checking the other arguments (`mdya search --help` shows help even without a query). When the command name is not valid (`mdya nosuchcmd --help`), it is an argument error (exit code 2).
 
-`mdya` with no arguments, and a command given without the command under it (`mdya collection`), do not show help; they are argument errors (exit code 2).
+`mdya` with no arguments is the same as `mdya --help`. A command given without the command under it (`mdya collection`) does not show help; it is an argument error (exit code 2).
