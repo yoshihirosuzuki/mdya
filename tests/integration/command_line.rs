@@ -56,14 +56,17 @@ fn names_in(dir: &std::path::Path) -> Vec<String> {
 fn the_version_is_written_on_stdout_as_mdya_and_its_version() {
     let workspace = Workspace::new();
 
-    let version = workspace.run(&["--version"]);
+    for args in [&["--version"][..], &["-v"]] {
+        let version = workspace.run(args);
 
-    assert_success(&version);
-    assert_eq!(
-        version.stdout,
-        format!("mdya {}\n", env!("CARGO_PKG_VERSION"))
-    );
-    assert_eq!(version.stderr, "");
+        assert_success(&version);
+        assert_eq!(
+            version.stdout,
+            format!("mdya {}\n", env!("CARGO_PKG_VERSION")),
+            "{args:?}"
+        );
+        assert_eq!(version.stderr, "", "{args:?}");
+    }
     assert!(!workspace.data_dir().try_exists().unwrap());
 }
 
@@ -114,9 +117,27 @@ fn the_help_of_a_command_is_written_on_stdout_whatever_the_other_arguments() {
 }
 
 #[test]
+#[cfg(unix)]
 #[ignore = "left out of the default tests to keep them few; run it with `just integration`"]
-fn no_command_or_a_command_that_does_not_exist_fails_with_exit_code_2_and_points_to_the_help() {
+fn mdya_without_arguments_writes_the_help_of_mdya_on_stdout() {
     let workspace = Workspace::new();
+    let home = workspace.dir("home");
+
+    // Without the directories that `Workspace` gives, as a user types it.
+    let bare = executable_at_home(&home).output().unwrap();
+
+    assert_eq!(bare.status.code(), Some(0), "{}", stderr(&bare));
+    assert_eq!(stdout(&bare), workspace.run(&["--help"]).stdout);
+    assert_eq!(stderr(&bare), "");
+    assert!(names_in(&home).is_empty(), "{:?}", names_in(&home));
+}
+
+#[test]
+#[ignore = "left out of the default tests to keep them few; run it with `just integration`"]
+fn options_without_a_command_or_a_command_that_does_not_exist_fail_with_exit_code_2_and_point_to_the_help()
+ {
+    let workspace = Workspace::new();
+    // `run` gives the directories, so the first is those options alone.
     let refused: [&[&str]; 3] = [&[], &["collection"], &["nosuchcmd", "--help"]];
 
     for args in refused {

@@ -22,7 +22,7 @@ mdya の CLI のコマンドの書き方と、出力です。例の出力の場�
 | 埋め込みベクトルを作り直す | [`mdya embedding rebuild`](#埋め込みベクトルを作り直す-mdya-embedding-rebuild) |
 | インデックスを保守する | [`mdya optimize`](#インデックスを保守する-mdya-optimize) |
 | MCP のサーバーを始める | [`mdya mcp`](#mcp-のサーバーを始める-mdya-mcp) |
-| mdya のバージョンを見る | [`mdya --version`](#mdya-のバージョンを見る-mdya---version) |
+| mdya のバージョンを見る | [`mdya --version`、`mdya -v`](#mdya-のバージョンを見る-mdya---versionmdya--v) |
 | ヘルプを見る | [`--help`、`-h`](#ヘルプを見る---help-h) |
 
 ## どのコマンドにも共通のこと
@@ -506,12 +506,14 @@ AI アシスタントなどの MCP のクライアントから使う MCP のサ�
 
 起こりうるエラー: [待ち受けるアドレスを使えない](errors.md#待ち受けるアドレスを使えない)、[MCP のクライアントとのやりとりを始められない](errors.md#mcp-のクライアントとのやりとりを始められない)
 
-## mdya のバージョンを見る (`mdya --version`)
+## mdya のバージョンを見る (`mdya --version`、`mdya -v`)
 
 ```
 $ mdya --version
 mdya X.Y.Z
 ```
+
+`mdya -v` も、`mdya --version` と同じです。
 
 ## ヘルプを見る (`--help`、`-h`)
 
@@ -519,4 +521,4 @@ mdya X.Y.Z
 
 `--help` があるときは、ほかの引数を確かめずにヘルプを出します (`mdya search --help` はクエリがなくてもヘルプを出します)。コマンドの名前が正しくないとき (`mdya nosuchcmd --help`) は、引数の使い方のエラー (終了コード 2) です。
 
-引数のない `mdya` と、下のコマンドが足りないとき (`mdya collection`) は、ヘルプを出さず、引数の使い方のエラー (終了コード 2) になります。
+引数のない `mdya` は、`mdya --help` と同じです。下のコマンドが足りないとき (`mdya collection`) は、ヘルプを出さず、引数の使い方のエラー (終了コード 2) になります。
