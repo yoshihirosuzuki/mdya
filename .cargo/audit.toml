@@ -17,4 +17,16 @@ ignore = [
     # unsafe-libyaml (unmaintained, via lindera -> serde_yaml_ng; lance uses
     # lindera for full-text search). Remove when lindera no longer depends on it.
     "RUSTSEC-2024-0449",
+
+    # humantime (unmaintained, via lancedb and lance-index). Remove when they no
+    # longer depend on it.
+    "RUSTSEC-2026-0542",
+
+    # chrono (unmaintained, via lancedb, lance-index, rmcp, schemars and unpdf,
+    # and via arrow-array in the tests). Remove when none of them depends on it.
+    "RUSTSEC-2026-0543",
+
+    # chrono-tz (unmaintained, via lancedb and lance-index, and via arrow-array
+    # in the tests). Remove when none of them depends on it.
+    "RUSTSEC-2026-0555",
 ]
