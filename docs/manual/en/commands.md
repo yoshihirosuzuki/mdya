@@ -35,7 +35,7 @@ Write the following options right after `mdya`, before the command name (`mdya -
 |---|---|---|
 | `--data-dir <directory>` | The settings and index directory ([Settings: Directories](configuration.md#directories)) | `~/.mdya` |
 | `--model-cache-dir <directory>` | The embedding model cache directory | `~/.mdya-models` |
-| `--log-level <level>` | The log level from which logs are written ([Settings: Logs and color](configuration.md#logs-and-color)) | `warn` |
+| `--log-level <level>` | The log level from which logs are written ([Settings: Logs and color](configuration.md#logs-and-color)) | `warn` (`error` for one part) |
 | `--log-format <format>` | The format of the logs (`compact`, `pretty`, `json`) | `compact` |
 | `--no-color` | Do not color the output | Color the output only when it goes to a terminal |
 

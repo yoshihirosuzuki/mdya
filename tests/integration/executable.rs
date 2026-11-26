@@ -133,7 +133,8 @@ fn rust_log_keeps_its_valid_directives_which_can_name_a_target() {
     let workspace = Workspace::new();
 
     for (rust_log, warned) in [
-        // No valid directive is left, so the default level, `warn`, applies.
+        // No valid directive is left, so the default directives, which write
+        // the warnings of mdya, apply.
         ("mdya=bogus", true),
         ("mdya=bogus,error", false),
         ("mdya::gateway=warn,mdya=bogus", true),

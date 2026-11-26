@@ -8,9 +8,15 @@ use tracing_subscriber::filter::{Directive, LevelFilter};
 
 use super::{IgnoredDirective, InvalidLogLevel, LogFilter};
 
-/// The directive used without `--log-level` and without a valid directive in
-/// `RUST_LOG`.
-const DEFAULT_DIRECTIVE: &str = "warn";
+/// The directives used without `--log-level` and without a valid directive in
+/// `RUST_LOG`: the logs from `warn` up, but only the errors of lance's
+/// `lance::index::vector::builder`. In lance 14.0.2, when the maintenance
+/// splits a partition of a vector index, that module warns that it skips
+/// loading the new partitions from the parts of the index that were there,
+/// which lance's source says is safe. The module's other warnings are left
+/// out by default too. If a newer lance warns this from another target, the
+/// warning shows again by default.
+const DEFAULT_DIRECTIVES: &str = "warn,lance::index::vector::builder=error";
 
 pub(super) fn log_filter(
     flag: Option<&str>,
@@ -100,11 +106,11 @@ fn check(directive: &str) -> Result<(), String> {
 }
 
 impl LogFilter {
-    /// The filter of the given valid directives, or of the default one if
+    /// The filter of the given valid directives, or of the default ones if
     /// there are none.
     fn of(directives: &[&str]) -> Self {
         let directives = match directives {
-            [] => DEFAULT_DIRECTIVE.to_owned(),
+            [] => DEFAULT_DIRECTIVES.to_owned(),
             directives => directives.join(","),
         };
         Self { directives }
@@ -113,12 +119,12 @@ impl LogFilter {
     /// The `EnvFilter` of the directives.
     #[expect(
         clippy::expect_used,
-        reason = "every directive was parsed by itself when it was checked"
+        reason = "every directive was parsed by itself when it was checked, and the tests parse the default ones"
     )]
     pub(super) fn env_filter(&self) -> EnvFilter {
-        EnvFilter::builder()
-            .parse(&self.directives)
-            .expect("`log_filter` checked every directive, and none has a comma in it")
+        EnvFilter::builder().parse(&self.directives).expect(
+            "`log_filter` checked every directive, none has a comma in it, and the tests parse the default ones",
+        )
     }
 }
 
@@ -140,15 +146,18 @@ mod tests {
     }
 
     #[test]
-    fn without_the_flag_and_rust_log_the_logs_from_warn_up_are_written() {
-        assert_eq!(log_filter(None, None).unwrap(), (filter("warn"), vec![]));
+    fn without_the_flag_and_rust_log_the_default_directives_are_used() {
+        assert_eq!(
+            log_filter(None, None).unwrap(),
+            (filter(DEFAULT_DIRECTIVES), vec![])
+        );
     }
 
     #[test]
     fn an_empty_rust_log_is_the_same_as_none() {
         assert_eq!(
             log_filter(None, Some(OsStr::new(""))).unwrap(),
-            (filter("warn"), vec![])
+            (filter(DEFAULT_DIRECTIVES), vec![])
         );
     }
 
@@ -277,11 +286,11 @@ mod tests {
     }
 
     #[test]
-    fn without_a_valid_directive_in_rust_log_the_logs_from_warn_up_are_written() {
+    fn without_a_valid_directive_in_rust_log_the_default_directives_are_used() {
         let (filter_used, ignored) =
             log_filter(None, Some(OsStr::new("wran,mdya,mdya=verbose"))).unwrap();
 
-        assert_eq!(filter_used, filter("warn"));
+        assert_eq!(filter_used, filter(DEFAULT_DIRECTIVES));
         assert_eq!(
             ignored_directives(&ignored),
             ["wran", "mdya", "mdya=verbose"]

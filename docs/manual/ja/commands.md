@@ -35,7 +35,7 @@ mdya の CLI のコマンドの書き方と、出力です。例の出力の場�
 |---|---|---|
 | `--data-dir <ディレクトリ>` | 設定とインデックスのディレクトリ ([設定の「ディレクトリ」](configuration.md#ディレクトリ)) | `~/.mdya` |
 | `--model-cache-dir <ディレクトリ>` | 埋め込みモデルのキャッシュのディレクトリ | `~/.mdya-models` |
-| `--log-level <ログレベル>` | どのログレベルからログを出すか ([設定の「ログと色」](configuration.md#ログと色)) | `warn` |
+| `--log-level <ログレベル>` | どのログレベルからログを出すか ([設定の「ログと色」](configuration.md#ログと色)) | `warn` (一部は `error`) |
 | `--log-format <形式>` | ログの出力形式 (`compact`、`pretty`、`json`) | `compact` |
 | `--no-color` | 出力に色を付けない | 出力先が端末のときだけ色を付ける |
 

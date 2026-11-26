@@ -116,14 +116,16 @@ impl Write for LogLine {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::sync::Arc;
 
     use tracing::{debug, info, warn};
+    use tracing_log::log::Level as LogLevel;
 
     use super::*;
     use crate::gateway::cli::LogFormat;
     use crate::gateway::log_progress::lock;
-    use crate::gateway::log_progress::{SharedStderr, log_filter, shared_stderr};
+    use crate::gateway::log_progress::{LogFilter, SharedStderr, log_filter, shared_stderr};
     use crate::gateway::test_double::captured::CapturedOutput;
 
     struct Receiver {
@@ -147,6 +149,29 @@ mod tests {
             make_logs: impl FnOnce(),
         ) -> String {
             let (filter, _) = log_filter(Some(level), None).unwrap();
+            self.written_through(filter, format, color, make_logs)
+        }
+
+        /// What the receiver writes in the compact format for the logs that
+        /// `make_logs` makes, through the filter that `--log-level` (`flag`)
+        /// and `RUST_LOG` (`env`) give.
+        fn written_for(
+            &self,
+            flag: Option<&str>,
+            env: Option<&str>,
+            make_logs: impl FnOnce(),
+        ) -> String {
+            let (filter, _) = log_filter(flag, env.map(OsStr::new)).unwrap();
+            self.written_through(filter, LogFormat::Compact, false, make_logs)
+        }
+
+        fn written_through(
+            &self,
+            filter: LogFilter,
+            format: LogFormat,
+            color: bool,
+            make_logs: impl FnOnce(),
+        ) -> String {
             let settings = LogSettings {
                 filter,
                 format,
@@ -192,13 +217,13 @@ mod tests {
         assert!(text.contains(": opened\n"), "{text:?}");
     }
 
-    /// A record of the `log` crate, at warn, from `target`, handed to the
+    /// A record of the `log` crate, at `level`, from `target`, handed to the
     /// receiver as `LogTracer` would.
-    fn log_record(target: &str) {
+    fn log_record(target: &str, level: LogLevel) {
         tracing_log::format_trace(
             &tracing_log::log::Record::builder()
                 .target(target)
-                .level(tracing_log::log::Level::Warn)
+                .level(level)
                 .args(format_args!("opened"))
                 .build(),
         )
@@ -208,12 +233,70 @@ mod tests {
     #[test]
     fn a_log_of_the_log_crate_is_picked_by_its_own_target() {
         let text = receiver().written(LogFormat::Compact, false, "warn,lance=off", || {
-            log_record("lance::io");
-            log_record("datafusion::sql");
+            log_record("lance::io", LogLevel::Warn);
+            log_record("datafusion::sql", LogLevel::Warn);
         });
 
         assert!(!text.contains("lance::io"), "{text:?}");
         assert!(text.contains("datafusion::sql: opened"), "{text:?}");
+    }
+
+    /// The target of lance's warning that it skips loading a partition while
+    /// it splits the partitions of a vector index.
+    const INDEX_BUILDER: &str = "lance::index::vector::builder";
+
+    #[test]
+    fn by_default_only_the_errors_of_the_index_builder_of_lance_are_written() {
+        let text = receiver().written_for(None, None, || {
+            log_record(INDEX_BUILDER, LogLevel::Warn);
+            log_record(INDEX_BUILDER, LogLevel::Error);
+        });
+
+        assert!(!text.contains(" WARN "), "{text:?}");
+        assert!(
+            text.contains(&format!(" ERROR {INDEX_BUILDER}: opened")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn by_default_the_warnings_of_the_other_targets_are_written() {
+        let text = receiver().written_for(None, None, || {
+            log_record("lance::index::vector::ivf", LogLevel::Warn);
+            warn!("skipped");
+        });
+
+        assert!(
+            text.contains(" WARN lance::index::vector::ivf: opened"),
+            "{text:?}"
+        );
+        assert!(
+            text.contains(" WARN mdya::gateway::log_progress::receiver::tests: skipped"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn without_a_valid_directive_in_rust_log_the_warnings_of_the_index_builder_are_left_out() {
+        let text = receiver().written_for(None, Some("wran"), || {
+            log_record(INDEX_BUILDER, LogLevel::Warn);
+        });
+
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn the_warnings_of_the_index_builder_are_written_when_the_flag_or_rust_log_asks_for_them() {
+        for (flag, env) in [(Some("warn"), None), (None, Some("warn"))] {
+            let text = receiver().written_for(flag, env, || {
+                log_record(INDEX_BUILDER, LogLevel::Warn);
+            });
+
+            assert!(
+                text.contains(&format!(" WARN {INDEX_BUILDER}: opened")),
+                "{flag:?} {env:?}: {text:?}"
+            );
+        }
     }
 
     #[test]

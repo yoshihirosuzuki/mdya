@@ -80,7 +80,8 @@ pub(crate) struct InvalidLogLevel {
 /// (`env`). An invalid `--log-level` is an error; the invalid directives of
 /// `RUST_LOG` are ignored and returned, so that they can be logged as a
 /// warning once the log receiver is set. Without `--log-level` and without a
-/// valid directive in `RUST_LOG`, the logs from `warn` up are written.
+/// valid directive in `RUST_LOG`, the logs from `warn` up are written, but
+/// only the errors of lance's `lance::index::vector::builder`.
 ///
 /// The directives are separated by commas, and each is in the syntax of
 /// `tracing-subscriber`'s `EnvFilter`, with spaces around it allowed. A
