@@ -510,7 +510,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "LEVEL",
-        help = "Write logs from this level: error, warn, info, debug, or trace, or per target such as mdya=debug [default: warn]"
+        help = "Write logs from this level: error, warn, info, debug, or trace, or per target such as mdya=debug [default: warn,lance::index::vector::builder=error]"
     )]
     log_level: Option<String>,
     #[arg(

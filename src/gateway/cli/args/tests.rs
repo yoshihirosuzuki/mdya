@@ -79,7 +79,7 @@ Commands:
 Options:
       --data-dir <DIR>         The settings and index directory (default: ~/.mdya)
       --model-cache-dir <DIR>  The embedding model cache directory (default: ~/.mdya-models)
-      --log-level <LEVEL>      Write logs from this level: error, warn, info, debug, or trace, or per target such as mdya=debug [default: warn]
+      --log-level <LEVEL>      Write logs from this level: error, warn, info, debug, or trace, or per target such as mdya=debug [default: warn,lance::index::vector::builder=error]
       --log-format <FORMAT>    How to write logs [default: compact] [possible values: compact, pretty, json]
       --no-color               Do not color the output
   -h, --help                   Print help

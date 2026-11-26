@@ -138,9 +138,11 @@ mdya writes logs only to stderr. Messages (such as that an operation succeeded, 
 
 | What you set | How to set it | Default |
 |---|---|---|
-| Log level | Give one of `error`, `warn`, `info`, `debug`, or `trace` with `--log-level`. You can also set it for each target that writes logs (`mdya=debug`). Without `--log-level`, the `RUST_LOG` environment variable is used | `warn` (warnings and above) |
+| Log level | Give one of `error`, `warn`, `info`, `debug`, or `trace` with `--log-level`. You can also set it for each target that writes logs (`mdya=debug`). Without `--log-level`, the `RUST_LOG` environment variable is used | `warn` (warnings and above). For the part of a library mdya uses that builds the index for fast vector search, `error` (errors only) |
 | Log format | Give one of `compact` (one entry per line), `pretty` (formatted for reading), or `json` with `--log-format` | `compact` |
 | Color | With `--no-color`, or when the `NO_COLOR` environment variable is present, output is not colored | Each of stdout and stderr is colored only when it is a terminal |
+
+When you set the log level with `--log-level` or `RUST_LOG`, your setting is used instead of the default. For example, with `--log-level warn`, the warnings from the part that builds the index are written too.
 
 If part of `RUST_LOG` is not valid, only that part is ignored, and a warning saying so is written.
 
